@@ -1,0 +1,8 @@
+name: sp1-bf16
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pytorch
+  - safetensors
+  - transformers
