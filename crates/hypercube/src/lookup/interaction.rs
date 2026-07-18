@@ -33,6 +33,9 @@ pub enum InteractionKind {
     /// Interaction with the byte lookup table for byte operations.
     Byte = 5,
 
+    /// Interaction with the 16-bit `VeriLLM` BF16 lookup table.
+    Bf16 = 6,
+
     /// Interaction with the current CPU state.
     State = 7,
 
@@ -87,6 +90,7 @@ impl InteractionKind {
             InteractionKind::Memory,
             InteractionKind::Program,
             InteractionKind::Byte,
+            InteractionKind::Bf16,
             InteractionKind::State,
             InteractionKind::Syscall,
             InteractionKind::Global,
@@ -116,6 +120,7 @@ impl InteractionKind {
             InteractionKind::Syscall => 9,
             InteractionKind::Program => 16,
             InteractionKind::Byte => 4,
+            InteractionKind::Bf16 => 5,
             InteractionKind::Global => 11,
 
             InteractionKind::ShaCompress => 25,
@@ -222,6 +227,7 @@ impl Display for InteractionKind {
             InteractionKind::Memory => write!(f, "Memory"),
             InteractionKind::Program => write!(f, "Program"),
             InteractionKind::Byte => write!(f, "Byte"),
+            InteractionKind::Bf16 => write!(f, "Bf16"),
             InteractionKind::State => write!(f, "State"),
             InteractionKind::Syscall => write!(f, "Syscall"),
             InteractionKind::Global => write!(f, "Global"),

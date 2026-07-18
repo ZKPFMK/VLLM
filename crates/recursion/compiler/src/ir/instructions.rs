@@ -135,6 +135,9 @@ pub enum DslIr<C: Config> {
     /// input, second input)
     Select(Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>),
 
+    /// Multiplies two raw 16-bit BF16 values with the `VeriLLM` recursion chip.
+    Bf16Mul(Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>),
+
     // Assertions.
     /// Assert that two variables are equal (var == var).
     AssertEqV(Var<C::N>, Var<C::N>),

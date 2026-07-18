@@ -1,6 +1,7 @@
 use slop_algebra::PrimeField;
 
 mod arithmetic;
+mod bf16;
 mod bits;
 mod builder;
 mod instructions;

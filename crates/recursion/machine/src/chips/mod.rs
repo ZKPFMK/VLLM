@@ -1,5 +1,6 @@
 pub mod alu_base;
 pub mod alu_ext;
+pub mod bf16;
 pub mod mem;
 pub mod poseidon2_helper;
 pub mod poseidon2_wide;

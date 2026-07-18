@@ -67,6 +67,7 @@ impl<F> RawProgram<Instruction<F>> {
                                     incr(&mut counts.poseidon2_sbox_events, 1)
                                 }
                                 Instruction::Select(_) => incr(&mut counts.select_events, 1),
+                                Instruction::Bf16Mul(_) => incr(&mut counts.bf16_mul_events, 1),
                                 Instruction::Hint(HintInstr { output_addrs_mults })
                                 | Instruction::HintBits(HintBitsInstr {
                                     output_addrs_mults,

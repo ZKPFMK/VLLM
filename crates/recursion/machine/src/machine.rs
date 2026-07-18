@@ -7,6 +7,7 @@ use sp1_recursion_executor::{ExecutionRecord, RecursionAirEventCount, RecursionP
 use crate::chips::{
     alu_base::{BaseAluChip, NUM_BASE_ALU_ENTRIES_PER_ROW},
     alu_ext::{ExtAluChip, NUM_EXT_ALU_ENTRIES_PER_ROW},
+    bf16::{Bf16LookupChip, Bf16MulChip},
     mem::{constant::NUM_CONST_MEM_ENTRIES_PER_ROW, MemoryConstChip, MemoryVarChip},
     poseidon2_helper::{
         convert::{ConvertChip, NUM_CONVERT_ENTRIES_PER_ROW},
@@ -43,6 +44,8 @@ pub enum RecursionAir<
     Select(SelectChip),
     PrefixSumChecks(PrefixSumChecksChip),
     PublicValues(PublicValuesChip),
+    Bf16Lookup(Bf16LookupChip),
+    Bf16Mul(Bf16MulChip),
 }
 
 impl<
@@ -75,6 +78,8 @@ impl<
             RecursionAir::ExtFeltConvert(ConvertChip),
             RecursionAir::PrefixSumChecks(PrefixSumChecksChip),
             RecursionAir::Select(SelectChip),
+            RecursionAir::Bf16Lookup(Bf16LookupChip),
+            RecursionAir::Bf16Mul(Bf16MulChip),
             RecursionAir::PublicValues(PublicValuesChip),
         ]
         .map(Chip::new)
@@ -95,6 +100,30 @@ impl<
             RecursionAir::Poseidon2Wide(Poseidon2WideChip::<DEGREE>),
             RecursionAir::PrefixSumChecks(PrefixSumChecksChip),
             RecursionAir::Select(SelectChip),
+            RecursionAir::PublicValues(PublicValuesChip),
+        ]
+        .map(Chip::new)
+        .into_iter()
+        .collect::<Vec<_>>();
+        let shape = MachineShape::all(&chips);
+        Machine::new(chips, PROOF_MAX_NUM_PVS, shape)
+    }
+
+    /// The compression machine extended with the opt-in `VeriLLM` BF16 lookup and arithmetic chips.
+    ///
+    /// Keeping these chips out of [`Self::compress_machine`] avoids imposing a fixed 2^16-row
+    /// lookup trace on recursion programs that do not use floating-point operations.
+    pub fn verillm_machine() -> Machine<F, Self> {
+        let chips = [
+            RecursionAir::MemoryConst(MemoryConstChip::default()),
+            RecursionAir::MemoryVar(MemoryVarChip::<F, VAR_EVENTS_PER_ROW>::default()),
+            RecursionAir::BaseAlu(BaseAluChip),
+            RecursionAir::ExtAlu(ExtAluChip),
+            RecursionAir::Poseidon2Wide(Poseidon2WideChip::<DEGREE>),
+            RecursionAir::PrefixSumChecks(PrefixSumChecksChip),
+            RecursionAir::Select(SelectChip),
+            RecursionAir::Bf16Lookup(Bf16LookupChip),
+            RecursionAir::Bf16Mul(Bf16MulChip),
             RecursionAir::PublicValues(PublicValuesChip),
         ]
         .map(Chip::new)

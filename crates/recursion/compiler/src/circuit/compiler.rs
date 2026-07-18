@@ -379,6 +379,14 @@ where
         })
     }
 
+    #[inline(always)]
+    fn bf16_mul(&mut self, dst: impl Reg, lhs: impl Reg, rhs: impl Reg) -> Instruction<SP1Field> {
+        Instruction::Bf16Mul(Bf16MulInstr {
+            addrs: Bf16MulIo { output: dst.write(self), lhs: lhs.read(self), rhs: rhs.read(self) },
+            mult: SP1Field::zero(),
+        })
+    }
+
     fn hint_bit_decomposition(
         &mut self,
         value: impl Reg,
@@ -567,6 +575,7 @@ where
             DslIr::InvE(dst, src) => f(self.ext_alu(DivE, dst, Imm::F(SP1Field::one()), src)),
 
             DslIr::Select(bit, dst1, dst2, lhs, rhs) => f(self.select(bit, dst1, dst2, lhs, rhs)),
+            DslIr::Bf16Mul(dst, lhs, rhs) => f(self.bf16_mul(dst, lhs, rhs)),
 
             DslIr::AssertEqV(lhs, rhs) => self.base_assert_eq(lhs, rhs, f),
             DslIr::AssertEqF(lhs, rhs) => self.base_assert_eq(lhs, rhs, f),
@@ -758,6 +767,10 @@ where
                     backfill((mult1, addr1));
                     backfill((mult2, addr2));
                 }
+                Instruction::Bf16Mul(Bf16MulInstr {
+                    addrs: Bf16MulIo { output: ref addr, .. },
+                    mult,
+                }) => backfill((mult, addr)),
                 Instruction::HintBits(HintBitsInstr { output_addrs_mults, .. })
                 | Instruction::Hint(HintInstr { output_addrs_mults, .. }) => {
                     output_addrs_mults.iter_mut().for_each(|(addr, mult)| backfill((mult, addr)));
@@ -879,6 +892,7 @@ const fn instr_name<F>(instr: &Instruction<F>) -> &'static str {
         Instruction::Poseidon2LinearLayer(_) => "Poseidon2LinearLayer",
         Instruction::Poseidon2SBox(_) => "Poseidon2SBox",
         Instruction::Select(_) => "Select",
+        Instruction::Bf16Mul(_) => "Bf16Mul",
         Instruction::HintBits(_) => "HintBits",
         Instruction::PrefixSumChecks(_) => "PrefixSumChecks",
         Instruction::Print(_) => "Print",
