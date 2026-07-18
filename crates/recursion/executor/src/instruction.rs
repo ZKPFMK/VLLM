@@ -27,6 +27,7 @@ pub enum Instruction<F> {
     Hint(HintInstr<F>),
     DebugBacktrace(Backtrace),
     Bf16Mul(Bf16MulInstr<F>),
+    Bf16Div(Bf16DivInstr<F>),
 }
 
 impl<F: Copy> Instruction<F> {
@@ -72,6 +73,9 @@ impl<F: Copy> Instruction<F> {
             }) => (svec![bit, in1, in2], svec![out1, out2]),
             Instruction::Bf16Mul(Bf16MulInstr {
                 addrs: Bf16MulIo { output, lhs, rhs }, ..
+            }) => (svec![lhs, rhs], svec![output]),
+            Instruction::Bf16Div(Bf16DivInstr {
+                addrs: Bf16DivIo { output, lhs, rhs }, ..
             }) => (svec![lhs, rhs], svec![output]),
             Instruction::HintBits(HintBitsInstr { ref output_addrs_mults, input_addr }) => {
                 (svec![input_addr], output_addrs_mults.iter().map(|(a, _)| *a).collect())
@@ -284,6 +288,18 @@ pub fn select<F: AbstractField>(
 pub fn bf16_mul<F: AbstractField>(mult: u32, output: u32, lhs: u32, rhs: u32) -> Instruction<F> {
     Instruction::Bf16Mul(Bf16MulInstr {
         addrs: Bf16MulIo {
+            output: Address(F::from_canonical_u32(output)),
+            lhs: Address(F::from_canonical_u32(lhs)),
+            rhs: Address(F::from_canonical_u32(rhs)),
+        },
+        mult: F::from_canonical_u32(mult),
+    })
+}
+
+/// Construct a raw 16-bit BF16 division instruction.
+pub fn bf16_div<F: AbstractField>(mult: u32, output: u32, lhs: u32, rhs: u32) -> Instruction<F> {
+    Instruction::Bf16Div(Bf16DivInstr {
+        addrs: Bf16DivIo {
             output: Address(F::from_canonical_u32(output)),
             lhs: Address(F::from_canonical_u32(lhs)),
             rhs: Address(F::from_canonical_u32(rhs)),

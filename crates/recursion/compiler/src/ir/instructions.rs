@@ -137,6 +137,8 @@ pub enum DslIr<C: Config> {
 
     /// Multiplies two raw 16-bit BF16 values with the `VeriLLM` recursion chip.
     Bf16Mul(Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>),
+    /// Divides two raw 16-bit BF16 values with Algorithm 2 from `VeriLLM`.
+    Bf16Div(Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>),
 
     // Assertions.
     /// Assert that two variables are equal (var == var).

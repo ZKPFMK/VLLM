@@ -7,8 +7,8 @@ use sp1_hypercube::{
     InteractionKind,
 };
 use sp1_recursion_executor::{
-    Address, Block, BF16_LOOKUP_INIT, BF16_LOOKUP_MUL, BF16_LOOKUP_SHARED, BF16_LSHIFT_PREFIX,
-    BF16_MANTISSA_BITS, BF16_ROUND_PREFIX, BF16_RSHIFT_PREFIX,
+    Address, Block, BF16_LOOKUP_DIV, BF16_LOOKUP_INIT, BF16_LOOKUP_MUL, BF16_LOOKUP_SHARED,
+    BF16_LSHIFT_PREFIX, BF16_MANTISSA_BITS, BF16_ROUND_PREFIX, BF16_RSHIFT_PREFIX,
 };
 
 /// A trait which contains all helper methods for building SP1 recursion machine AIRs.
@@ -87,6 +87,31 @@ pub trait RecursionAirBuilder: BaseAirBuilder {
             Self::Expr::from_canonical_u8(BF16_LOOKUP_MUL),
             input,
             product,
+            Self::Expr::zero(),
+            Self::Expr::zero(),
+            mult,
+        );
+    }
+
+    /// Look up `Div(lhs_mantissa || rhs_mantissa)`.
+    fn send_bf16_div<Lhs, Rhs, Quotient>(
+        &mut self,
+        lhs_mantissa: Lhs,
+        rhs_mantissa: Rhs,
+        quotient: Quotient,
+        mult: impl Into<Self::Expr>,
+    ) where
+        Lhs: Into<Self::Expr>,
+        Rhs: Into<Self::Expr>,
+        Quotient: Into<Self::Expr>,
+    {
+        let input = lhs_mantissa.into()
+            * Self::Expr::from_canonical_u16(1 << (BF16_MANTISSA_BITS + 1))
+            + rhs_mantissa.into();
+        self.send_bf16_lookup(
+            Self::Expr::from_canonical_u8(BF16_LOOKUP_DIV),
+            input,
+            quotient,
             Self::Expr::zero(),
             Self::Expr::zero(),
             mult,

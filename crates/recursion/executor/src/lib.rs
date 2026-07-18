@@ -271,6 +271,26 @@ pub struct Bf16MulInstr<F> {
 
 // -------------------------------------------------------------------------------------------------
 
+/// The inputs and output of a raw 16-bit BF16 division.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(C)]
+pub struct Bf16DivIo<V> {
+    pub output: V,
+    pub lhs: V,
+    pub rhs: V,
+}
+
+/// An instruction invoking the Algorithm 2 `VeriLLM` BF16 division chip.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[repr(C)]
+pub struct Bf16DivInstr<F> {
+    pub addrs: Bf16DivIo<Address<F>>,
+    /// Multiplicity with which the output is consumed from recursion memory.
+    pub mult: F,
+}
+
+// -------------------------------------------------------------------------------------------------
+
 /// The inputs and outputs to the operations for prefix sum checks.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrefixSumChecksIo<V> {
@@ -649,6 +669,20 @@ where
                 let witness = Bf16MulWitness::new(lhs_raw as u16, rhs_raw as u16);
                 memory.mw_unchecked(output, Block::from(F::from_canonical_u16(witness.output.raw)));
                 UnsafeCell::raw_get(record.bf16_mul_events[offset].as_ptr())
+                    .write(witness.as_event());
+            }
+            Instruction::Bf16Div(Bf16DivInstr {
+                addrs: Bf16DivIo { output, lhs, rhs },
+                mult: _,
+            }) => {
+                let lhs_raw = memory.mr_unchecked(lhs).val[0].as_canonical_u32();
+                let rhs_raw = memory.mr_unchecked(rhs).val[0].as_canonical_u32();
+                assert!(lhs_raw < (1 << BF16_BITS), "left BF16 input is not a 16-bit value");
+                assert!(rhs_raw < (1 << BF16_BITS), "right BF16 input is not a 16-bit value");
+
+                let witness = Bf16DivWitness::new(lhs_raw as u16, rhs_raw as u16);
+                memory.mw_unchecked(output, Block::from(F::from_canonical_u16(witness.output.raw)));
+                UnsafeCell::raw_get(record.bf16_div_events[offset].as_ptr())
                     .write(witness.as_event());
             }
             Instruction::HintBits(HintBitsInstr { ref output_addrs_mults, input_addr }) => {

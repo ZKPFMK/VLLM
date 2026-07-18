@@ -7,8 +7,9 @@ use slop_matrix::Matrix;
 use sp1_derive::AlignedBorrow;
 use sp1_hypercube::air::MachineAir;
 use sp1_recursion_executor::{
-    bf16_i32_to_field, bf16_lookup_row, ExecutionRecord, RecursionProgram, BF16_LOOKUP_INIT,
-    BF16_LOOKUP_MUL, BF16_LOOKUP_SHARED, BF16_LOOKUP_TABLE_ROWS, NUM_BF16_LOOKUP_OPS,
+    bf16_i32_to_field, bf16_lookup_row, ExecutionRecord, RecursionProgram, BF16_LOOKUP_DIV,
+    BF16_LOOKUP_INIT, BF16_LOOKUP_MUL, BF16_LOOKUP_SHARED, BF16_LOOKUP_TABLE_ROWS,
+    NUM_BF16_LOOKUP_OPS,
 };
 
 use crate::builder::SP1RecursionAirBuilder;
@@ -30,6 +31,7 @@ pub struct Bf16LookupPreprocessedCols<T: Copy> {
     pub init_mantissa: T,
     pub shared: T,
     pub mul: T,
+    pub div: T,
 }
 
 /// Multiplicities for the initialization, shared, and multiplication columns.
@@ -101,6 +103,7 @@ impl<F: PrimeField32> MachineAir<F> for Bf16LookupChip {
                 init_mantissa: F::from_canonical_u16(initialized.mantissa),
                 shared: bf16_i32_to_field(lookup.shared),
                 mul: F::from_canonical_u16(lookup.mul),
+                div: F::from_canonical_u16(lookup.div),
             };
         }
     }
@@ -136,6 +139,15 @@ impl<F: PrimeField32> MachineAir<F> for Bf16LookupChip {
                 increment(BF16_LOOKUP_SHARED, row);
             }
             increment(BF16_LOOKUP_MUL, event.lookup_rows.mul);
+        }
+        for event in &input.bf16_div_events {
+            for row in event.lookup_rows.init {
+                increment(BF16_LOOKUP_INIT, row);
+            }
+            for row in event.lookup_rows.shared {
+                increment(BF16_LOOKUP_SHARED, row);
+            }
+            increment(BF16_LOOKUP_DIV, event.lookup_rows.div);
         }
     }
 
@@ -180,6 +192,14 @@ where
             AB::F::zero(),
             AB::F::zero(),
             local.multiplicities[BF16_LOOKUP_MUL as usize],
+        );
+        builder.receive_bf16_lookup(
+            AB::F::from_canonical_u8(BF16_LOOKUP_DIV),
+            table.input,
+            table.div,
+            AB::F::zero(),
+            AB::F::zero(),
+            local.multiplicities[BF16_LOOKUP_DIV as usize],
         );
     }
 }

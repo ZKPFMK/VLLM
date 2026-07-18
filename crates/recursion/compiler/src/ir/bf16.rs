@@ -12,6 +12,16 @@ impl<C: Config> Builder<C> {
         self.push_op(DslIr::Bf16Mul(output, lhs, rhs));
         output
     }
+
+    /// Divide two raw 16-bit BF16 encodings using Algorithm 2 from `VeriLLM`.
+    ///
+    /// Both operands and the returned value are stored as `Felt<SP1Field>`, but the BF16 lookup
+    /// relation constrains each of them to a valid 16-bit encoding.
+    pub fn bf16_div(&mut self, lhs: Felt<SP1Field>, rhs: Felt<SP1Field>) -> Felt<SP1Field> {
+        let output = self.uninit();
+        self.push_op(DslIr::Bf16Div(output, lhs, rhs));
+        output
+    }
 }
 
 #[cfg(test)]
@@ -42,5 +52,22 @@ mod tests {
             Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
         executor.run().unwrap();
         assert_eq!(executor.record.bf16_mul_events.len(), 1);
+    }
+
+    #[test]
+    fn compiles_and_executes_bf16_div() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let lhs: Felt<_> = builder.constant(SP1Field::from_canonical_u16(0x4040));
+        let rhs: Felt<_> = builder.constant(SP1Field::from_canonical_u16(0xc000));
+        let output = builder.bf16_div(lhs, rhs);
+        builder.assert_felt_eq(output, SP1Field::from_canonical_u16(0xbfc0));
+
+        let mut compiler = AsmCompiler::default();
+        let program =
+            Arc::new(compiler.compile_inner(builder.into_root_block()).validate().unwrap());
+        let mut executor =
+            Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
+        executor.run().unwrap();
+        assert_eq!(executor.record.bf16_div_events.len(), 1);
     }
 }

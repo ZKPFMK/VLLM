@@ -29,8 +29,10 @@ pub const BF16_LOOKUP_INIT: u8 = 0;
 pub const BF16_LOOKUP_SHARED: u8 = 1;
 /// Lookup opcode for BF16 mantissa multiplication.
 pub const BF16_LOOKUP_MUL: u8 = 2;
+/// Lookup opcode for BF16 mantissa division.
+pub const BF16_LOOKUP_DIV: u8 = 3;
 /// Number of lookup operations currently supplied by the BF16 table.
-pub const NUM_BF16_LOOKUP_OPS: usize = 3;
+pub const NUM_BF16_LOOKUP_OPS: usize = 4;
 
 /// Prefix used by the shared lookup for `Round`.
 pub const BF16_ROUND_PREFIX: u16 = 0x4000;
@@ -118,12 +120,13 @@ impl Bf16CircuitValueInt {
     }
 }
 
-/// One row of the executor-side copy of the three BF16 lookup columns.
+/// One row of the executor-side copy of the BF16 lookup columns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bf16LookupTableRow {
     pub init: Bf16CircuitValueInt,
     pub shared: i32,
     pub mul: u16,
+    pub div: u16,
 }
 
 /// The BF16 lookup table is generated once and shared by witness and trace generation.
@@ -133,6 +136,7 @@ static BF16_LOOKUP_TABLE: LazyLock<Box<[Bf16LookupTableRow]>> = LazyLock::new(||
             init: evaluate_bf16_init(input),
             shared: evaluate_bf16_shared(input),
             mul: evaluate_bf16_mul(input),
+            div: evaluate_bf16_div(input),
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
@@ -250,11 +254,141 @@ impl Bf16MulWitness {
     }
 }
 
+/// Rows queried by one BF16 division event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Bf16DivLookupRows {
+    /// Initialization rows for the numerator, denominator, and output.
+    pub init: [u16; 3],
+    /// Shared rows for the two `RShift` queries, `Exp`, `Clamp`, and `Round`.
+    pub shared: [u16; 5],
+    /// Mantissa division row.
+    pub div: u16,
+}
+
+/// Complete witness for one BF16 division event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(C)]
+pub struct Bf16DivEvent<F> {
+    pub lhs: Bf16CircuitValue<F>,
+    pub rhs: Bf16CircuitValue<F>,
+    pub output: Bf16CircuitValue<F>,
+    /// Packed `quotient_shift || normalized_mantissa` returned by the `Div` lookup.
+    pub quotient: F,
+    pub quotient_shift: F,
+    pub normalized_mantissa: F,
+    pub denominator_is_zero: F,
+    pub intermediate_exponent: F,
+    /// Packed `abnormal || precision_shift` returned by `Clamp`.
+    pub clamp: F,
+    pub lookup_rows: Bf16DivLookupRows,
+}
+
+/// Integer witness for Algorithm 2, the lookup-based `VeriLLM` BF16 division.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bf16DivWitness {
+    pub lhs: Bf16CircuitValueInt,
+    pub rhs: Bf16CircuitValueInt,
+    pub output: Bf16CircuitValueInt,
+    pub quotient: u16,
+    pub quotient_shift: u8,
+    pub normalized_mantissa: u16,
+    pub denominator_is_zero: u8,
+    pub intermediate_exponent: i32,
+    pub clamp: u16,
+    pub lookup_rows: Bf16DivLookupRows,
+}
+
+impl Bf16DivWitness {
+    /// Execute Algorithm 2 from the `VeriLLM` paper.
+    #[must_use]
+    pub fn new(lhs_raw: u16, rhs_raw: u16) -> Self {
+        let lhs = Bf16CircuitValueInt::decode(lhs_raw);
+        let rhs = Bf16CircuitValueInt::decode(rhs_raw);
+
+        let div_row = (lhs.mantissa << 8) | rhs.mantissa;
+        let quotient = bf16_div_lookup(div_row);
+
+        let quotient_rshift_row = bf16_encode_rshift(1, quotient);
+        let quotient_shift = bf16_shared_lookup(quotient_rshift_row) as u8;
+        let normalized_mantissa =
+            quotient - (1 << (BF16_MANTISSA_BITS + 1)) * quotient_shift as u16;
+
+        let denominator_rshift_row = bf16_encode_rshift(0, rhs.mantissa);
+        let denominator_is_nonzero = bf16_shared_lookup(denominator_rshift_row) as u8;
+        let denominator_is_zero = 1 - denominator_is_nonzero;
+
+        let intermediate_exponent = lhs.exponent - rhs.exponent - quotient_shift as i32
+            + 2 * BF16_ABNORMAL_EXPONENT * denominator_is_zero as i32;
+        let exp_row = bf16_encode_exp(intermediate_exponent);
+        let output_exponent = bf16_shared_lookup(exp_row);
+        let clamp_row = bf16_encode_clamp(intermediate_exponent);
+        let clamp = bf16_shared_lookup(clamp_row) as u16;
+
+        let sign = lhs.sign ^ rhs.sign;
+        let round_row = bf16_encode_round(clamp, normalized_mantissa);
+        let output_mantissa = bf16_shared_lookup(round_row) as u16;
+        let output_raw = Bf16CircuitValueInt::encode(sign, output_exponent, output_mantissa);
+        let output = Bf16CircuitValueInt::decode(output_raw);
+
+        debug_assert!(quotient_shift <= 1);
+        debug_assert!(denominator_is_nonzero <= 1);
+        debug_assert_eq!(output.sign, sign);
+        debug_assert_eq!(output.exponent, output_exponent);
+        debug_assert_eq!(output.mantissa, output_mantissa);
+
+        Self {
+            lhs,
+            rhs,
+            output,
+            quotient,
+            quotient_shift,
+            normalized_mantissa,
+            denominator_is_zero,
+            intermediate_exponent,
+            clamp,
+            lookup_rows: Bf16DivLookupRows {
+                init: [lhs_raw, rhs_raw, output_raw],
+                shared: [
+                    quotient_rshift_row,
+                    denominator_rshift_row,
+                    exp_row,
+                    clamp_row,
+                    round_row,
+                ],
+                div: div_row,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn as_event<F: AbstractField>(self) -> Bf16DivEvent<F> {
+        Bf16DivEvent {
+            lhs: self.lhs.as_field(),
+            rhs: self.rhs.as_field(),
+            output: self.output.as_field(),
+            quotient: F::from_canonical_u16(self.quotient),
+            quotient_shift: F::from_canonical_u8(self.quotient_shift),
+            normalized_mantissa: F::from_canonical_u16(self.normalized_mantissa),
+            denominator_is_zero: F::from_canonical_u8(self.denominator_is_zero),
+            intermediate_exponent: bf16_i32_to_field(self.intermediate_exponent),
+            clamp: F::from_canonical_u16(self.clamp),
+            lookup_rows: self.lookup_rows,
+        }
+    }
+}
+
 /// Look up the `VeriLLM` mantissa-multiplication column.
 #[must_use]
 #[inline]
 pub fn bf16_mul_lookup(input: u16) -> u16 {
     bf16_lookup_row(input).mul
+}
+
+/// Look up the `VeriLLM` mantissa-division column.
+#[must_use]
+#[inline]
+pub fn bf16_div_lookup(input: u16) -> u16 {
+    bf16_lookup_row(input).div
 }
 
 fn evaluate_bf16_init(raw: u16) -> Bf16CircuitValueInt {
@@ -288,6 +422,21 @@ fn evaluate_bf16_mul(input: u16) -> u16 {
         (0, product >> BF16_MANTISSA_BITS)
     };
     ((carry << (BF16_MANTISSA_BITS + 1)) | normalized) as u16
+}
+
+fn evaluate_bf16_div(input: u16) -> u16 {
+    let lhs = (input >> 8) as u32;
+    let rhs = (input & 0xff) as u32;
+    if lhs == 0 || rhs == 0 {
+        return 0;
+    }
+
+    let (quotient_shift, normalized) = if lhs >= rhs {
+        (0, (lhs << BF16_MANTISSA_BITS) / rhs)
+    } else {
+        (1, (lhs << (BF16_MANTISSA_BITS + 1)) / rhs)
+    };
+    ((quotient_shift << (BF16_MANTISSA_BITS + 1)) | normalized) as u16
 }
 
 /// Look up the shared 16-bit column from the `VeriLLM` paper.
@@ -381,6 +530,7 @@ mod tests {
             assert_eq!(row.init, evaluate_bf16_init(input));
             assert_eq!(row.shared, evaluate_bf16_shared(input));
             assert_eq!(row.mul, evaluate_bf16_mul(input));
+            assert_eq!(row.div, evaluate_bf16_div(input));
         }
     }
 
@@ -405,5 +555,17 @@ mod tests {
         assert_eq!(Bf16MulWitness::new(0x0001, 0x3f80).output.raw, 0x0001);
         // Overflow is represented canonically as infinity.
         assert_eq!(Bf16MulWitness::new(0x7f7f, 0x4000).output.raw, 0x7f80);
+    }
+
+    #[test]
+    fn division_examples() {
+        // 3.0 / -2.0 = -1.5.
+        assert_eq!(Bf16DivWitness::new(0x4040, 0xc000).output.raw, 0xbfc0);
+        // Smallest subnormal divided by one remains unchanged.
+        assert_eq!(Bf16DivWitness::new(0x0001, 0x3f80).output.raw, 0x0001);
+        // A finite nonzero value divided by zero is abnormal.
+        assert_eq!(Bf16DivWitness::new(0x3f80, 0x0000).output.raw, 0x7f80);
+        // Zero divided by zero is abnormal.
+        assert_eq!(Bf16DivWitness::new(0x0000, 0x0000).output.raw, 0x7f80);
     }
 }

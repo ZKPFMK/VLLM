@@ -68,6 +68,7 @@ impl<F> RawProgram<Instruction<F>> {
                                 }
                                 Instruction::Select(_) => incr(&mut counts.select_events, 1),
                                 Instruction::Bf16Mul(_) => incr(&mut counts.bf16_mul_events, 1),
+                                Instruction::Bf16Div(_) => incr(&mut counts.bf16_div_events, 1),
                                 Instruction::Hint(HintInstr { output_addrs_mults })
                                 | Instruction::HintBits(HintBitsInstr {
                                     output_addrs_mults,
