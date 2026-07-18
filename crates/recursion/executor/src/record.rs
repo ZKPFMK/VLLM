@@ -13,8 +13,8 @@ use sp1_hypercube::{air::SP1AirBuilder, InteractionKind, MachineRecord, PROOF_MA
 use crate::{
     instruction::{HintBitsInstr, HintExt2FeltsInstr, HintInstr},
     public_values::RecursionPublicValues,
-    Bf16DivEvent, Bf16MulEvent, ExtFeltEvent, Instruction, Poseidon2LinearLayerEvent,
-    Poseidon2SBoxEvent, PrefixSumChecksEvent,
+    Bf16AddSubEvent, Bf16DivEvent, Bf16MulEvent, ExtFeltEvent, Instruction,
+    Poseidon2LinearLayerEvent, Poseidon2SBoxEvent, PrefixSumChecksEvent,
 };
 
 use super::{
@@ -42,6 +42,7 @@ pub struct ExecutionRecord<F> {
     pub select_events: Vec<SelectEvent<F>>,
     pub bf16_mul_events: Vec<Bf16MulEvent<F>>,
     pub bf16_div_events: Vec<Bf16DivEvent<F>>,
+    pub bf16_add_sub_events: Vec<Bf16AddSubEvent<F>>,
     pub prefix_sum_checks_events: Vec<PrefixSumChecksEvent<F>>,
     pub commit_pv_hash_events: Vec<CommitPublicValuesEvent<F>>,
 }
@@ -63,6 +64,7 @@ pub struct UnsafeRecord<F> {
     pub select_events: Vec<MaybeUninit<UnsafeCell<SelectEvent<F>>>>,
     pub bf16_mul_events: Vec<MaybeUninit<UnsafeCell<Bf16MulEvent<F>>>>,
     pub bf16_div_events: Vec<MaybeUninit<UnsafeCell<Bf16DivEvent<F>>>>,
+    pub bf16_add_sub_events: Vec<MaybeUninit<UnsafeCell<Bf16AddSubEvent<F>>>>,
     pub prefix_sum_checks_events: Vec<MaybeUninit<UnsafeCell<PrefixSumChecksEvent<F>>>>,
     pub commit_pv_hash_events: Vec<MaybeUninit<UnsafeCell<CommitPublicValuesEvent<F>>>>,
 }
@@ -94,6 +96,7 @@ impl<F> UnsafeRecord<F> {
             select_events: std::mem::transmute(self.select_events),
             bf16_mul_events: std::mem::transmute(self.bf16_mul_events),
             bf16_div_events: std::mem::transmute(self.bf16_div_events),
+            bf16_add_sub_events: std::mem::transmute(self.bf16_add_sub_events),
             prefix_sum_checks_events: std::mem::transmute(self.prefix_sum_checks_events),
             commit_pv_hash_events: std::mem::transmute(self.commit_pv_hash_events),
         }
@@ -127,6 +130,7 @@ impl<F> UnsafeRecord<F> {
             select_events: create_uninit_vec(event_counts.select_events),
             bf16_mul_events: create_uninit_vec(event_counts.bf16_mul_events),
             bf16_div_events: create_uninit_vec(event_counts.bf16_div_events),
+            bf16_add_sub_events: create_uninit_vec(event_counts.bf16_add_sub_events),
             prefix_sum_checks_events: create_uninit_vec(event_counts.prefix_sum_checks_events),
             commit_pv_hash_events: create_uninit_vec(event_counts.commit_pv_hash_events),
         }
@@ -149,6 +153,7 @@ impl<F: PrimeField32> MachineRecord for ExecutionRecord<F> {
             ("select_events", self.select_events.len()),
             ("bf16_mul_events", self.bf16_mul_events.len()),
             ("bf16_div_events", self.bf16_div_events.len()),
+            ("bf16_add_sub_events", self.bf16_add_sub_events.len()),
             ("prefix_sum_checks_events", self.prefix_sum_checks_events.len()),
             ("commit_pv_hash_events", self.commit_pv_hash_events.len()),
         ]
@@ -174,6 +179,7 @@ impl<F: PrimeField32> MachineRecord for ExecutionRecord<F> {
             select_events,
             bf16_mul_events,
             bf16_div_events,
+            bf16_add_sub_events,
             prefix_sum_checks_events,
             commit_pv_hash_events,
         } = self;
@@ -188,6 +194,7 @@ impl<F: PrimeField32> MachineRecord for ExecutionRecord<F> {
         select_events.append(&mut other.select_events);
         bf16_mul_events.append(&mut other.bf16_mul_events);
         bf16_div_events.append(&mut other.bf16_div_events);
+        bf16_add_sub_events.append(&mut other.bf16_add_sub_events);
         prefix_sum_checks_events.append(&mut other.prefix_sum_checks_events);
         commit_pv_hash_events.append(&mut other.commit_pv_hash_events);
     }
@@ -235,6 +242,7 @@ pub struct RecursionAirEventCount {
     pub select_events: usize,
     pub bf16_mul_events: usize,
     pub bf16_div_events: usize,
+    pub bf16_add_sub_events: usize,
     pub prefix_sum_checks_events: usize,
     pub commit_pv_hash_events: usize,
 }
@@ -253,6 +261,7 @@ impl<F> AddAssign<&Instruction<F>> for RecursionAirEventCount {
             Instruction::Select(_) => self.select_events += 1,
             Instruction::Bf16Mul(_) => self.bf16_mul_events += 1,
             Instruction::Bf16Div(_) => self.bf16_div_events += 1,
+            Instruction::Bf16AddSub(_) => self.bf16_add_sub_events += 1,
             Instruction::Hint(HintInstr { output_addrs_mults })
             | Instruction::HintBits(HintBitsInstr {
                 output_addrs_mults,

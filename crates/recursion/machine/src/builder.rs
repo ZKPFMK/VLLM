@@ -7,8 +7,9 @@ use sp1_hypercube::{
     InteractionKind,
 };
 use sp1_recursion_executor::{
-    Address, Block, BF16_LOOKUP_DIV, BF16_LOOKUP_INIT, BF16_LOOKUP_MUL, BF16_LOOKUP_SHARED,
-    BF16_LSHIFT_PREFIX, BF16_MANTISSA_BITS, BF16_ROUND_PREFIX, BF16_RSHIFT_PREFIX,
+    Address, Block, BF16_LOOKUP_ADD, BF16_LOOKUP_DIV, BF16_LOOKUP_INIT, BF16_LOOKUP_MUL,
+    BF16_LOOKUP_SHARED, BF16_LSHIFT_PREFIX, BF16_MANTISSA_BITS, BF16_ROUND_PREFIX,
+    BF16_RSHIFT_PREFIX,
 };
 
 /// A trait which contains all helper methods for building SP1 recursion machine AIRs.
@@ -112,6 +113,26 @@ pub trait RecursionAirBuilder: BaseAirBuilder {
             Self::Expr::from_canonical_u8(BF16_LOOKUP_DIV),
             input,
             quotient,
+            Self::Expr::zero(),
+            Self::Expr::zero(),
+            mult,
+        );
+    }
+
+    /// Look up the Algorithm 3 `Add(unsigned_sum)` normalization result.
+    fn send_bf16_add<Input, Output>(
+        &mut self,
+        input: Input,
+        output: Output,
+        mult: impl Into<Self::Expr>,
+    ) where
+        Input: Into<Self::Expr>,
+        Output: Into<Self::Expr>,
+    {
+        self.send_bf16_lookup(
+            Self::Expr::from_canonical_u8(BF16_LOOKUP_ADD),
+            input,
+            output,
             Self::Expr::zero(),
             Self::Expr::zero(),
             mult,

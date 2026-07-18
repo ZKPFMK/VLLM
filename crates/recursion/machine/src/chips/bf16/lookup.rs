@@ -7,8 +7,8 @@ use slop_matrix::Matrix;
 use sp1_derive::AlignedBorrow;
 use sp1_hypercube::air::MachineAir;
 use sp1_recursion_executor::{
-    bf16_i32_to_field, bf16_lookup_row, ExecutionRecord, RecursionProgram, BF16_LOOKUP_DIV,
-    BF16_LOOKUP_INIT, BF16_LOOKUP_MUL, BF16_LOOKUP_SHARED, BF16_LOOKUP_TABLE_ROWS,
+    bf16_i32_to_field, bf16_lookup_row, ExecutionRecord, RecursionProgram, BF16_LOOKUP_ADD,
+    BF16_LOOKUP_DIV, BF16_LOOKUP_INIT, BF16_LOOKUP_MUL, BF16_LOOKUP_SHARED, BF16_LOOKUP_TABLE_ROWS,
     NUM_BF16_LOOKUP_OPS,
 };
 
@@ -32,6 +32,7 @@ pub struct Bf16LookupPreprocessedCols<T: Copy> {
     pub shared: T,
     pub mul: T,
     pub div: T,
+    pub add: T,
 }
 
 /// Multiplicities for the initialization, shared, and multiplication columns.
@@ -104,6 +105,7 @@ impl<F: PrimeField32> MachineAir<F> for Bf16LookupChip {
                 shared: bf16_i32_to_field(lookup.shared),
                 mul: F::from_canonical_u16(lookup.mul),
                 div: F::from_canonical_u16(lookup.div),
+                add: F::from_canonical_u16(lookup.add),
             };
         }
     }
@@ -148,6 +150,15 @@ impl<F: PrimeField32> MachineAir<F> for Bf16LookupChip {
                 increment(BF16_LOOKUP_SHARED, row);
             }
             increment(BF16_LOOKUP_DIV, event.lookup_rows.div);
+        }
+        for event in &input.bf16_add_sub_events {
+            for row in event.lookup_rows.init {
+                increment(BF16_LOOKUP_INIT, row);
+            }
+            for row in event.lookup_rows.shared {
+                increment(BF16_LOOKUP_SHARED, row);
+            }
+            increment(BF16_LOOKUP_ADD, event.lookup_rows.add);
         }
     }
 
@@ -200,6 +211,14 @@ where
             AB::F::zero(),
             AB::F::zero(),
             local.multiplicities[BF16_LOOKUP_DIV as usize],
+        );
+        builder.receive_bf16_lookup(
+            AB::F::from_canonical_u8(BF16_LOOKUP_ADD),
+            table.input,
+            table.add,
+            AB::F::zero(),
+            AB::F::zero(),
+            local.multiplicities[BF16_LOOKUP_ADD as usize],
         );
     }
 }

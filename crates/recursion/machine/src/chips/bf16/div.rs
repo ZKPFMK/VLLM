@@ -27,9 +27,7 @@ pub struct Bf16DivCols<T: Copy> {
     pub output: Bf16CircuitValue<T>,
     pub quotient: T,
     pub quotient_shift: T,
-    pub normalized_mantissa: T,
     pub denominator_is_zero: T,
-    pub intermediate_exponent: T,
     pub clamp: T,
 }
 
@@ -171,9 +169,7 @@ impl<F: PrimeField32> MachineAir<F> for Bf16DivChip {
                     output: event.output,
                     quotient: event.quotient,
                     quotient_shift: event.quotient_shift,
-                    normalized_mantissa: event.normalized_mantissa,
                     denominator_is_zero: event.denominator_is_zero,
-                    intermediate_exponent: event.intermediate_exponent,
                     clamp: event.clamp,
                 };
             },
@@ -230,10 +226,7 @@ where
 
         // q_0 := RShift(1, q); u := q - 2^(M+1) q_0.
         builder.send_bf16_rshift(1, local.quotient, local.quotient_shift, program.is_real);
-        builder.assert_eq(
-            local.normalized_mantissa,
-            local.quotient - local.quotient_shift * mantissa_base,
-        );
+        let normalized_mantissa = local.quotient - local.quotient_shift * mantissa_base;
 
         // b := 1 - RShift(0, m_rhs).
         builder.send_bf16_rshift(
@@ -244,14 +237,15 @@ where
         );
 
         // e := e_lhs - e_rhs - q_0 + 2 E_abnormal b.
-        builder.assert_eq(
-            local.intermediate_exponent,
-            local.lhs.exponent - local.rhs.exponent - local.quotient_shift
-                + local.denominator_is_zero * twice_abnormal,
-        );
+        let intermediate_exponent = local.lhs.exponent - local.rhs.exponent - local.quotient_shift
+            + local.denominator_is_zero * twice_abnormal;
 
-        builder.send_bf16_exp(local.intermediate_exponent, local.output.exponent, program.is_real);
-        builder.send_bf16_clamp(local.intermediate_exponent, local.clamp, program.is_real);
+        builder.send_bf16_exp(
+            intermediate_exponent.clone(),
+            local.output.exponent,
+            program.is_real,
+        );
+        builder.send_bf16_clamp(intermediate_exponent, local.clamp, program.is_real);
 
         builder.assert_eq(
             local.output.sign,
@@ -260,7 +254,7 @@ where
 
         builder.send_bf16_round(
             local.clamp,
-            local.normalized_mantissa,
+            normalized_mantissa,
             local.output.mantissa,
             program.is_real,
         );

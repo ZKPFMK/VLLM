@@ -27,8 +27,6 @@ pub struct Bf16MulCols<T: Copy> {
     pub output: Bf16CircuitValue<T>,
     pub product: T,
     pub carry: T,
-    pub normalized_mantissa: T,
-    pub intermediate_exponent: T,
     pub clamp: T,
 }
 
@@ -170,8 +168,6 @@ impl<F: PrimeField32> MachineAir<F> for Bf16MulChip {
                     output: event.output,
                     product: event.product,
                     carry: event.carry,
-                    normalized_mantissa: event.normalized_mantissa,
-                    intermediate_exponent: event.intermediate_exponent,
                     clamp: event.clamp,
                 };
             },
@@ -228,19 +224,20 @@ where
 
         // carry := RShift(1, p); u := p - 2^(M+1) carry.
         builder.send_bf16_rshift(1, local.product, local.carry, program.is_real);
-        builder.assert_eq(local.normalized_mantissa, local.product - local.carry * mantissa_base);
+        let normalized_mantissa = local.product - local.carry * mantissa_base;
 
         // e := e_lhs + e_rhs + carry.
-        builder.assert_eq(
-            local.intermediate_exponent,
-            local.lhs.exponent + local.rhs.exponent + local.carry,
-        );
+        let intermediate_exponent = local.lhs.exponent + local.rhs.exponent + local.carry;
 
         // output.exponent := Exp(e).
-        builder.send_bf16_exp(local.intermediate_exponent, local.output.exponent, program.is_real);
+        builder.send_bf16_exp(
+            intermediate_exponent.clone(),
+            local.output.exponent,
+            program.is_real,
+        );
 
         // clamp := Clamp(e).
-        builder.send_bf16_clamp(local.intermediate_exponent, local.clamp, program.is_real);
+        builder.send_bf16_clamp(intermediate_exponent, local.clamp, program.is_real);
 
         // output.sign := lhs.sign XOR rhs.sign.
         builder.assert_eq(
@@ -251,7 +248,7 @@ where
         // output.mantissa := Round(clamp || u).
         builder.send_bf16_round(
             local.clamp,
-            local.normalized_mantissa,
+            normalized_mantissa,
             local.output.mantissa,
             program.is_real,
         );

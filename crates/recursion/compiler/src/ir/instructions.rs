@@ -139,6 +139,10 @@ pub enum DslIr<C: Config> {
     Bf16Mul(Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>),
     /// Divides two raw 16-bit BF16 values with Algorithm 2 from `VeriLLM`.
     Bf16Div(Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>),
+    /// Adds two raw 16-bit BF16 values with Algorithm 3 from `VeriLLM`.
+    Bf16Add(Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>),
+    /// Subtracts two raw 16-bit BF16 values with the unified Algorithm 3 chip.
+    Bf16Sub(Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>),
 
     // Assertions.
     /// Assert that two variables are equal (var == var).

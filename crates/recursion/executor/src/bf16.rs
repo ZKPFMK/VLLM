@@ -31,8 +31,10 @@ pub const BF16_LOOKUP_SHARED: u8 = 1;
 pub const BF16_LOOKUP_MUL: u8 = 2;
 /// Lookup opcode for BF16 mantissa division.
 pub const BF16_LOOKUP_DIV: u8 = 3;
+/// Lookup opcode for BF16 mantissa addition and normalization.
+pub const BF16_LOOKUP_ADD: u8 = 4;
 /// Number of lookup operations currently supplied by the BF16 table.
-pub const NUM_BF16_LOOKUP_OPS: usize = 4;
+pub const NUM_BF16_LOOKUP_OPS: usize = 5;
 
 /// Prefix used by the shared lookup for `Round`.
 pub const BF16_ROUND_PREFIX: u16 = 0x4000;
@@ -127,6 +129,7 @@ pub struct Bf16LookupTableRow {
     pub shared: i32,
     pub mul: u16,
     pub div: u16,
+    pub add: u16,
 }
 
 /// The BF16 lookup table is generated once and shared by witness and trace generation.
@@ -137,6 +140,7 @@ static BF16_LOOKUP_TABLE: LazyLock<Box<[Bf16LookupTableRow]>> = LazyLock::new(||
             shared: evaluate_bf16_shared(input),
             mul: evaluate_bf16_mul(input),
             div: evaluate_bf16_div(input),
+            add: evaluate_bf16_add(input),
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
@@ -170,8 +174,6 @@ pub struct Bf16MulEvent<F> {
     /// Packed `carry || normalized_mantissa` returned by the `Mul` lookup.
     pub product: F,
     pub carry: F,
-    pub normalized_mantissa: F,
-    pub intermediate_exponent: F,
     /// Packed `abnormal || precision_shift` returned by `Clamp`.
     pub clamp: F,
     pub lookup_rows: Bf16MulLookupRows,
@@ -185,8 +187,6 @@ pub struct Bf16MulWitness {
     pub output: Bf16CircuitValueInt,
     pub product: u16,
     pub carry: u8,
-    pub normalized_mantissa: u16,
-    pub intermediate_exponent: i32,
     pub clamp: u16,
     pub lookup_rows: Bf16MulLookupRows,
 }
@@ -227,8 +227,6 @@ impl Bf16MulWitness {
             output,
             product,
             carry,
-            normalized_mantissa,
-            intermediate_exponent,
             clamp,
             lookup_rows: Bf16MulLookupRows {
                 init: [lhs_raw, rhs_raw, output_raw],
@@ -246,8 +244,6 @@ impl Bf16MulWitness {
             output: self.output.as_field(),
             product: F::from_canonical_u16(self.product),
             carry: F::from_canonical_u8(self.carry),
-            normalized_mantissa: F::from_canonical_u16(self.normalized_mantissa),
-            intermediate_exponent: bf16_i32_to_field(self.intermediate_exponent),
             clamp: F::from_canonical_u16(self.clamp),
             lookup_rows: self.lookup_rows,
         }
@@ -275,9 +271,7 @@ pub struct Bf16DivEvent<F> {
     /// Packed `quotient_shift || normalized_mantissa` returned by the `Div` lookup.
     pub quotient: F,
     pub quotient_shift: F,
-    pub normalized_mantissa: F,
     pub denominator_is_zero: F,
-    pub intermediate_exponent: F,
     /// Packed `abnormal || precision_shift` returned by `Clamp`.
     pub clamp: F,
     pub lookup_rows: Bf16DivLookupRows,
@@ -291,9 +285,7 @@ pub struct Bf16DivWitness {
     pub output: Bf16CircuitValueInt,
     pub quotient: u16,
     pub quotient_shift: u8,
-    pub normalized_mantissa: u16,
     pub denominator_is_zero: u8,
-    pub intermediate_exponent: i32,
     pub clamp: u16,
     pub lookup_rows: Bf16DivLookupRows,
 }
@@ -342,9 +334,7 @@ impl Bf16DivWitness {
             output,
             quotient,
             quotient_shift,
-            normalized_mantissa,
             denominator_is_zero,
-            intermediate_exponent,
             clamp,
             lookup_rows: Bf16DivLookupRows {
                 init: [lhs_raw, rhs_raw, output_raw],
@@ -368,10 +358,240 @@ impl Bf16DivWitness {
             output: self.output.as_field(),
             quotient: F::from_canonical_u16(self.quotient),
             quotient_shift: F::from_canonical_u8(self.quotient_shift),
-            normalized_mantissa: F::from_canonical_u16(self.normalized_mantissa),
             denominator_is_zero: F::from_canonical_u8(self.denominator_is_zero),
-            intermediate_exponent: bf16_i32_to_field(self.intermediate_exponent),
             clamp: F::from_canonical_u16(self.clamp),
+            lookup_rows: self.lookup_rows,
+        }
+    }
+}
+
+/// Operation selected by the unified Algorithm 3 BF16 addition/subtraction chip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum Bf16AddSubOpcode {
+    Add = 0,
+    Sub = 1,
+}
+
+impl Bf16AddSubOpcode {
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    #[must_use]
+    pub const fn effective_rhs_sign(self, rhs_sign: u8) -> u8 {
+        rhs_sign ^ self.as_u8()
+    }
+}
+
+/// Rows queried by one BF16 addition or subtraction event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Bf16AddSubLookupRows {
+    /// Initialization rows for the left input, right input, and output.
+    pub init: [u16; 3],
+    /// Shared rows for exponent ordering, alignment, shifts, exponent mapping, and abnormality.
+    pub shared: [u16; 9],
+    /// Mantissa addition and normalization row.
+    pub add: u16,
+}
+
+/// Complete event for Algorithm 3 BF16 addition/subtraction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(C)]
+pub struct Bf16AddSubEvent<F> {
+    pub lhs: Bf16CircuitValue<F>,
+    pub rhs: Bf16CircuitValue<F>,
+    pub output: Bf16CircuitValue<F>,
+    pub effective_rhs_sign: F,
+    pub exponent_order: F,
+    pub larger_sign: F,
+    pub larger_exponent: F,
+    pub larger_mantissa: F,
+    pub alignment: F,
+    pub smaller_nonzero: F,
+    pub max_alignment: F,
+    pub selected_smaller: F,
+    pub shifted_larger: F,
+    pub signed_smaller: F,
+    pub unsigned_sum: F,
+    pub add_result: F,
+    pub normalization_shift: F,
+    pub normalized_nonzero: F,
+    pub abnormal: F,
+    pub lookup_rows: Bf16AddSubLookupRows,
+}
+
+/// Integer witness for Algorithm 3 BF16 addition/subtraction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bf16AddSubWitness {
+    pub lhs: Bf16CircuitValueInt,
+    pub rhs: Bf16CircuitValueInt,
+    pub output: Bf16CircuitValueInt,
+    pub effective_rhs_sign: u8,
+    pub exponent_order: u8,
+    pub larger_sign: u8,
+    pub larger_exponent: i32,
+    pub larger_mantissa: u16,
+    pub alignment: u16,
+    pub smaller_nonzero: u8,
+    pub max_alignment: u8,
+    pub selected_smaller: u16,
+    pub shifted_larger: i32,
+    pub signed_smaller: i32,
+    pub unsigned_sum: u16,
+    pub add_result: u16,
+    pub normalization_shift: u8,
+    pub normalized_nonzero: u8,
+    pub abnormal: u8,
+    pub lookup_rows: Bf16AddSubLookupRows,
+}
+
+impl Bf16AddSubWitness {
+    /// Execute Algorithm 3 from the `VeriLLM` paper.
+    #[must_use]
+    pub fn new(lhs_raw: u16, rhs_raw: u16, opcode: Bf16AddSubOpcode) -> Self {
+        let lhs = Bf16CircuitValueInt::decode(lhs_raw);
+        let rhs = Bf16CircuitValueInt::decode(rhs_raw);
+        let effective_rhs_sign = opcode.effective_rhs_sign(rhs.sign);
+
+        let exponent_order_input = (1 << 10) + (rhs.exponent - lhs.exponent - 1);
+        let exponent_order_row = bf16_encode_rshift(3, exponent_order_input as u16);
+        let exponent_order = bf16_shared_lookup(exponent_order_row) as u8;
+
+        let (
+            larger_sign,
+            smaller_sign,
+            larger_exponent,
+            smaller_exponent,
+            larger_mantissa,
+            smaller_mantissa,
+        ) = if exponent_order == 1 {
+            (effective_rhs_sign, lhs.sign, rhs.exponent, lhs.exponent, rhs.mantissa, lhs.mantissa)
+        } else {
+            (lhs.sign, effective_rhs_sign, lhs.exponent, rhs.exponent, lhs.mantissa, rhs.mantissa)
+        };
+
+        let alignment_input = BF16_MIN_NORMAL_EXPONENT - larger_exponent + smaller_exponent;
+        let alignment_row = bf16_encode_clamp(alignment_input);
+        let alignment = bf16_shared_lookup(alignment_row) as u16;
+
+        let smaller_nonzero_row = bf16_encode_rshift(0, smaller_mantissa);
+        let smaller_nonzero = bf16_shared_lookup(smaller_nonzero_row) as u8;
+        let max_alignment_input = (1 << (BF16_MANTISSA_BITS - 4)) * (alignment + 7);
+        let max_alignment_row = bf16_encode_rshift(0, max_alignment_input);
+        let max_alignment = bf16_shared_lookup(max_alignment_row) as u8;
+
+        let selected_smaller =
+            if max_alignment == 1 { smaller_nonzero as u16 } else { smaller_mantissa };
+        let shift = alignment - max_alignment as u16;
+
+        let shifted_larger_row = bf16_encode_lshift(shift, larger_sign, larger_mantissa);
+        let shifted_larger = bf16_shared_lookup(shifted_larger_row);
+        let signed_smaller =
+            if smaller_sign == 1 { -(selected_smaller as i32) } else { selected_smaller as i32 };
+        let signed_sum = shifted_larger + signed_smaller;
+
+        // IEEE roundTowardZero chooses +0 for exact cancellation, except when both effective
+        // operands are negative zero.
+        let output_sign = u8::from(
+            signed_sum < 0 || (signed_sum == 0 && lhs.sign == 1 && effective_rhs_sign == 1),
+        );
+        let unsigned_sum = signed_sum.unsigned_abs() as u16;
+
+        let add_row = unsigned_sum;
+        let add_result = bf16_add_lookup(add_row);
+        let normalization_shift_row = bf16_encode_rshift(1, add_result);
+        let normalization_shift = bf16_shared_lookup(normalization_shift_row) as u8;
+        let normalized_mantissa =
+            add_result - (1 << (BF16_MANTISSA_BITS + 1)) * normalization_shift as u16;
+
+        let normalized_nonzero_row = bf16_encode_rshift(0, normalized_mantissa);
+        let normalized_nonzero = bf16_shared_lookup(normalized_nonzero_row) as u8;
+        let intermediate_exponent = larger_exponent + BF16_MANTISSA_BITS as i32 + 1
+            - normalization_shift as i32
+            - shift as i32
+            + BF16_ZERO_EXPONENT * (1 - normalized_nonzero as i32);
+
+        let exp_row = bf16_encode_exp(intermediate_exponent);
+        let output_exponent = bf16_shared_lookup(exp_row);
+        let abnormal_row = bf16_encode_rshift(2, (output_exponent - BF16_ZERO_EXPONENT) as u16);
+        let abnormal = bf16_shared_lookup(abnormal_row) as u8;
+        let output_mantissa = normalized_mantissa * (1 - abnormal as u16);
+        let output_raw = Bf16CircuitValueInt::encode(output_sign, output_exponent, output_mantissa);
+        let output = Bf16CircuitValueInt::decode(output_raw);
+
+        debug_assert!(exponent_order <= 1);
+        debug_assert!(alignment <= BF16_MANTISSA_BITS as u16 + 2);
+        debug_assert!(smaller_nonzero <= 1);
+        debug_assert!(max_alignment <= 1);
+        debug_assert!(normalization_shift <= 2 * BF16_MANTISSA_BITS as u8 + 1);
+        debug_assert!(normalized_nonzero <= 1);
+        debug_assert!(abnormal <= 1);
+        debug_assert_eq!(output.sign, output_sign);
+        debug_assert_eq!(output.exponent, output_exponent);
+        debug_assert_eq!(output.mantissa, output_mantissa);
+
+        Self {
+            lhs,
+            rhs,
+            output,
+            effective_rhs_sign,
+            exponent_order,
+            larger_sign,
+            larger_exponent,
+            larger_mantissa,
+            alignment,
+            smaller_nonzero,
+            max_alignment,
+            selected_smaller,
+            shifted_larger,
+            signed_smaller,
+            unsigned_sum,
+            add_result,
+            normalization_shift,
+            normalized_nonzero,
+            abnormal,
+            lookup_rows: Bf16AddSubLookupRows {
+                init: [lhs_raw, rhs_raw, output_raw],
+                shared: [
+                    exponent_order_row,
+                    alignment_row,
+                    smaller_nonzero_row,
+                    max_alignment_row,
+                    shifted_larger_row,
+                    normalization_shift_row,
+                    normalized_nonzero_row,
+                    exp_row,
+                    abnormal_row,
+                ],
+                add: add_row,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn as_event<F: AbstractField>(self) -> Bf16AddSubEvent<F> {
+        Bf16AddSubEvent {
+            lhs: self.lhs.as_field(),
+            rhs: self.rhs.as_field(),
+            output: self.output.as_field(),
+            effective_rhs_sign: F::from_canonical_u8(self.effective_rhs_sign),
+            exponent_order: F::from_canonical_u8(self.exponent_order),
+            larger_sign: F::from_canonical_u8(self.larger_sign),
+            larger_exponent: bf16_i32_to_field(self.larger_exponent),
+            larger_mantissa: F::from_canonical_u16(self.larger_mantissa),
+            alignment: F::from_canonical_u16(self.alignment),
+            smaller_nonzero: F::from_canonical_u8(self.smaller_nonzero),
+            max_alignment: F::from_canonical_u8(self.max_alignment),
+            selected_smaller: F::from_canonical_u16(self.selected_smaller),
+            shifted_larger: bf16_i32_to_field(self.shifted_larger),
+            signed_smaller: bf16_i32_to_field(self.signed_smaller),
+            unsigned_sum: F::from_canonical_u16(self.unsigned_sum),
+            add_result: F::from_canonical_u16(self.add_result),
+            normalization_shift: F::from_canonical_u8(self.normalization_shift),
+            normalized_nonzero: F::from_canonical_u8(self.normalized_nonzero),
+            abnormal: F::from_canonical_u8(self.abnormal),
             lookup_rows: self.lookup_rows,
         }
     }
@@ -389,6 +609,13 @@ pub fn bf16_mul_lookup(input: u16) -> u16 {
 #[inline]
 pub fn bf16_div_lookup(input: u16) -> u16 {
     bf16_lookup_row(input).div
+}
+
+/// Look up the Algorithm 3 mantissa-addition and normalization column.
+#[must_use]
+#[inline]
+pub fn bf16_add_lookup(input: u16) -> u16 {
+    bf16_lookup_row(input).add
 }
 
 fn evaluate_bf16_init(raw: u16) -> Bf16CircuitValueInt {
@@ -437,6 +664,17 @@ fn evaluate_bf16_div(input: u16) -> u16 {
         (1, (lhs << (BF16_MANTISSA_BITS + 1)) / rhs)
     };
     ((quotient_shift << (BF16_MANTISSA_BITS + 1)) | normalized) as u16
+}
+
+fn evaluate_bf16_add(input: u16) -> u16 {
+    if input == 0 {
+        return ((2 * BF16_MANTISSA_BITS + 1) << (BF16_MANTISSA_BITS + 1)) as u16;
+    }
+
+    let floor_log2 = u16::BITS - 1 - input.leading_zeros();
+    let normalization_shift = 2 * BF16_MANTISSA_BITS + 1 - floor_log2;
+    let normalized = ((input as u32) << normalization_shift) >> (BF16_MANTISSA_BITS + 1);
+    ((normalization_shift << (BF16_MANTISSA_BITS + 1)) | normalized) as u16
 }
 
 /// Look up the shared 16-bit column from the `VeriLLM` paper.
@@ -518,6 +756,14 @@ pub fn bf16_encode_rshift(offset: u16, value: u16) -> u16 {
     BF16_RSHIFT_PREFIX | (offset << 12) | value
 }
 
+#[must_use]
+pub fn bf16_encode_lshift(shift: u16, sign: u8, mantissa: u16) -> u16 {
+    debug_assert!(shift < 16);
+    debug_assert!(sign <= 1);
+    debug_assert!(mantissa < 512);
+    BF16_LSHIFT_PREFIX | (shift << 10) | ((sign as u16) << 9) | mantissa
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,6 +777,7 @@ mod tests {
             assert_eq!(row.shared, evaluate_bf16_shared(input));
             assert_eq!(row.mul, evaluate_bf16_mul(input));
             assert_eq!(row.div, evaluate_bf16_div(input));
+            assert_eq!(row.add, evaluate_bf16_add(input));
         }
     }
 
@@ -567,5 +814,29 @@ mod tests {
         assert_eq!(Bf16DivWitness::new(0x3f80, 0x0000).output.raw, 0x7f80);
         // Zero divided by zero is abnormal.
         assert_eq!(Bf16DivWitness::new(0x0000, 0x0000).output.raw, 0x7f80);
+    }
+
+    #[test]
+    fn addition_and_subtraction_examples() {
+        assert_eq!(
+            Bf16AddSubWitness::new(0x3fc0, 0x4000, Bf16AddSubOpcode::Add).output.raw,
+            0x4060
+        );
+        assert_eq!(
+            Bf16AddSubWitness::new(0x4040, 0xc000, Bf16AddSubOpcode::Add).output.raw,
+            0x3f80
+        );
+        assert_eq!(
+            Bf16AddSubWitness::new(0x4040, 0x4000, Bf16AddSubOpcode::Sub).output.raw,
+            0x3f80
+        );
+        assert_eq!(
+            Bf16AddSubWitness::new(0x3f80, 0xbf80, Bf16AddSubOpcode::Add).output.raw,
+            0x0000
+        );
+        assert_eq!(
+            Bf16AddSubWitness::new(0x8000, 0x8000, Bf16AddSubOpcode::Add).output.raw,
+            0x8000
+        );
     }
 }

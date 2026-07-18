@@ -28,6 +28,7 @@ pub enum Instruction<F> {
     DebugBacktrace(Backtrace),
     Bf16Mul(Bf16MulInstr<F>),
     Bf16Div(Bf16DivInstr<F>),
+    Bf16AddSub(Bf16AddSubInstr<F>),
 }
 
 impl<F: Copy> Instruction<F> {
@@ -76,6 +77,10 @@ impl<F: Copy> Instruction<F> {
             }) => (svec![lhs, rhs], svec![output]),
             Instruction::Bf16Div(Bf16DivInstr {
                 addrs: Bf16DivIo { output, lhs, rhs }, ..
+            }) => (svec![lhs, rhs], svec![output]),
+            Instruction::Bf16AddSub(Bf16AddSubInstr {
+                addrs: Bf16AddSubIo { output, lhs, rhs },
+                ..
             }) => (svec![lhs, rhs], svec![output]),
             Instruction::HintBits(HintBitsInstr { ref output_addrs_mults, input_addr }) => {
                 (svec![input_addr], output_addrs_mults.iter().map(|(a, _)| *a).collect())
@@ -306,6 +311,34 @@ pub fn bf16_div<F: AbstractField>(mult: u32, output: u32, lhs: u32, rhs: u32) ->
         },
         mult: F::from_canonical_u32(mult),
     })
+}
+
+fn bf16_add_sub<F: AbstractField>(
+    opcode: Bf16AddSubOpcode,
+    mult: u32,
+    output: u32,
+    lhs: u32,
+    rhs: u32,
+) -> Instruction<F> {
+    Instruction::Bf16AddSub(Bf16AddSubInstr {
+        opcode,
+        addrs: Bf16AddSubIo {
+            output: Address(F::from_canonical_u32(output)),
+            lhs: Address(F::from_canonical_u32(lhs)),
+            rhs: Address(F::from_canonical_u32(rhs)),
+        },
+        mult: F::from_canonical_u32(mult),
+    })
+}
+
+/// Construct a raw 16-bit BF16 addition instruction.
+pub fn bf16_add<F: AbstractField>(mult: u32, output: u32, lhs: u32, rhs: u32) -> Instruction<F> {
+    bf16_add_sub(Bf16AddSubOpcode::Add, mult, output, lhs, rhs)
+}
+
+/// Construct a raw 16-bit BF16 subtraction instruction.
+pub fn bf16_sub<F: AbstractField>(mult: u32, output: u32, lhs: u32, rhs: u32) -> Instruction<F> {
+    bf16_add_sub(Bf16AddSubOpcode::Sub, mult, output, lhs, rhs)
 }
 
 #[allow(clippy::too_many_arguments)]
