@@ -12,6 +12,7 @@ mod utils;
 mod var;
 
 pub(crate) use arithmetic::*;
+pub use bf16::{Bf16Gpt2BlockOutput, Bf16Gpt2BlockParams, Bf16KvCache};
 pub use builder::*;
 pub use instructions::*;
 pub use iter::*;

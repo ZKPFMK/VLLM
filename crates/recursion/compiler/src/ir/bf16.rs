@@ -3,6 +3,54 @@ use sp1_primitives::SP1Field;
 
 use super::{Builder, Config, DslIr, Felt};
 
+/// Per-head key/value cache for one GPT-2 transformer layer.
+#[derive(Clone, Debug, Default)]
+pub struct Bf16KvCache {
+    /// Each entry is a flattened `[cached_tokens, head_dimension]` key matrix for one head.
+    pub keys: Vec<Vec<Felt<SP1Field>>>,
+    /// Each entry is a flattened `[cached_tokens, head_dimension]` value matrix for one head.
+    pub values: Vec<Vec<Felt<SP1Field>>>,
+}
+
+impl Bf16KvCache {
+    /// Create an empty cache with one key and value vector per attention head.
+    #[must_use]
+    pub fn empty(num_heads: usize) -> Self {
+        Self { keys: vec![Vec::new(); num_heads], values: vec![Vec::new(); num_heads] }
+    }
+}
+
+/// Borrowed BF16 parameters for one GPT-2 transformer layer.
+#[derive(Clone, Copy, Debug)]
+pub struct Bf16Gpt2BlockParams<'a> {
+    pub layer_norm_1_weight: &'a [Felt<SP1Field>],
+    pub layer_norm_1_bias: &'a [Felt<SP1Field>],
+    /// GPT-2 `attn.c_attn.weight`, laid out as `[hidden_size, 3 * hidden_size]`.
+    pub attention_qkv_weight: &'a [Felt<SP1Field>],
+    pub attention_qkv_bias: &'a [Felt<SP1Field>],
+    /// GPT-2 `attn.c_proj.weight`, laid out as `[hidden_size, hidden_size]`.
+    pub attention_projection_weight: &'a [Felt<SP1Field>],
+    pub attention_projection_bias: &'a [Felt<SP1Field>],
+    pub layer_norm_2_weight: &'a [Felt<SP1Field>],
+    pub layer_norm_2_bias: &'a [Felt<SP1Field>],
+    /// GPT-2 `mlp.c_fc.weight`, laid out as `[hidden_size, inner_size]`.
+    pub mlp_expansion_weight: &'a [Felt<SP1Field>],
+    pub mlp_expansion_bias: &'a [Felt<SP1Field>],
+    /// GPT-2 `mlp.c_proj.weight`, laid out as `[inner_size, hidden_size]`.
+    pub mlp_projection_weight: &'a [Felt<SP1Field>],
+    pub mlp_projection_bias: &'a [Felt<SP1Field>],
+    pub layer_norm_epsilon: Felt<SP1Field>,
+    pub attention_scale: Felt<SP1Field>,
+    pub num_heads: usize,
+}
+
+/// Output of one autoregressive GPT-2 transformer layer.
+#[derive(Clone, Debug)]
+pub struct Bf16Gpt2BlockOutput {
+    pub hidden_state: Vec<Felt<SP1Field>>,
+    pub cache: Bf16KvCache,
+}
+
 /// Encode a positive integer as BF16 using the same round-toward-zero policy as the arithmetic
 /// chips. The common GPT-2 dimensions (including 768 and 3072) are represented exactly.
 fn usize_to_bf16_raw(value: usize) -> u16 {
@@ -377,6 +425,168 @@ impl<C: Config> Builder<C> {
         self.bf16_vector_add(residual, &projected)
     }
 
+    /// Evaluate one autoregressive GPT-2 transformer layer and update its KV cache.
+    ///
+    /// The input represents one token. The method performs pre-attention layer normalization, QKV
+    /// projection, per-head causal attention over the supplied cache plus the current token,
+    /// attention projection and residual addition, followed by [`Self::bf16_gpt2_mlp`].
+    pub fn bf16_gpt2_block(
+        &mut self,
+        hidden_state: &[Felt<SP1Field>],
+        cache: &Bf16KvCache,
+        params: &Bf16Gpt2BlockParams<'_>,
+    ) -> Bf16Gpt2BlockOutput {
+        assert!(!hidden_state.is_empty(), "BF16 GPT-2 block requires a non-empty hidden state");
+        assert!(params.num_heads > 0, "BF16 GPT-2 block requires at least one attention head");
+
+        let hidden_size = hidden_state.len();
+        assert_eq!(
+            hidden_size % params.num_heads,
+            0,
+            "BF16 GPT-2 hidden size must be divisible by head count"
+        );
+        let head_dimension = hidden_size / params.num_heads;
+        assert_eq!(
+            params.layer_norm_1_weight.len(),
+            hidden_size,
+            "BF16 GPT-2 ln_1 weight length mismatch"
+        );
+        assert_eq!(
+            params.layer_norm_1_bias.len(),
+            hidden_size,
+            "BF16 GPT-2 ln_1 bias length mismatch"
+        );
+
+        let qkv_size = hidden_size.checked_mul(3).expect("BF16 GPT-2 QKV dimensions overflow");
+        assert_eq!(
+            params.attention_qkv_bias.len(),
+            qkv_size,
+            "BF16 GPT-2 QKV bias length mismatch"
+        );
+        let expected_qkv_weight_len =
+            hidden_size.checked_mul(qkv_size).expect("BF16 GPT-2 QKV weight dimensions overflow");
+        assert_eq!(
+            params.attention_qkv_weight.len(),
+            expected_qkv_weight_len,
+            "BF16 GPT-2 QKV weight shape mismatch"
+        );
+        assert_eq!(
+            params.attention_projection_bias.len(),
+            hidden_size,
+            "BF16 GPT-2 attention projection bias length mismatch"
+        );
+        let expected_attention_projection_weight_len = hidden_size
+            .checked_mul(hidden_size)
+            .expect("BF16 GPT-2 attention projection dimensions overflow");
+        assert_eq!(
+            params.attention_projection_weight.len(),
+            expected_attention_projection_weight_len,
+            "BF16 GPT-2 attention projection weight shape mismatch"
+        );
+
+        assert_eq!(
+            params.layer_norm_2_weight.len(),
+            hidden_size,
+            "BF16 GPT-2 ln_2 weight length mismatch"
+        );
+        assert_eq!(
+            params.layer_norm_2_bias.len(),
+            hidden_size,
+            "BF16 GPT-2 ln_2 bias length mismatch"
+        );
+        let inner_size = params.mlp_expansion_bias.len();
+        assert!(inner_size > 0, "BF16 GPT-2 block requires a non-empty MLP expansion bias");
+        let expected_mlp_expansion_weight_len = hidden_size
+            .checked_mul(inner_size)
+            .expect("BF16 GPT-2 MLP expansion dimensions overflow");
+        assert_eq!(
+            params.mlp_expansion_weight.len(),
+            expected_mlp_expansion_weight_len,
+            "BF16 GPT-2 MLP expansion weight shape mismatch"
+        );
+        assert_eq!(
+            params.mlp_projection_bias.len(),
+            hidden_size,
+            "BF16 GPT-2 MLP projection bias length mismatch"
+        );
+        let expected_mlp_projection_weight_len = inner_size
+            .checked_mul(hidden_size)
+            .expect("BF16 GPT-2 MLP projection dimensions overflow");
+        assert_eq!(
+            params.mlp_projection_weight.len(),
+            expected_mlp_projection_weight_len,
+            "BF16 GPT-2 MLP projection weight shape mismatch"
+        );
+
+        assert_eq!(cache.keys.len(), params.num_heads, "BF16 GPT-2 key cache head count mismatch");
+        assert_eq!(
+            cache.values.len(),
+            params.num_heads,
+            "BF16 GPT-2 value cache head count mismatch"
+        );
+        let cached_tokens = cache.keys[0].len() / head_dimension;
+        for head in 0..params.num_heads {
+            assert_eq!(
+                cache.keys[head].len() % head_dimension,
+                0,
+                "BF16 GPT-2 key cache shape mismatch"
+            );
+            assert_eq!(
+                cache.values[head].len(),
+                cache.keys[head].len(),
+                "BF16 GPT-2 value cache shape mismatch"
+            );
+            assert_eq!(
+                cache.keys[head].len() / head_dimension,
+                cached_tokens,
+                "BF16 GPT-2 cache token count mismatch"
+            );
+        }
+
+        let normalized = self.bf16_layer_norm(
+            hidden_state,
+            params.layer_norm_1_weight,
+            params.layer_norm_1_bias,
+            params.layer_norm_epsilon,
+        );
+        let qkv =
+            self.bf16_linear(&normalized, params.attention_qkv_weight, params.attention_qkv_bias);
+        let (queries, current_keys, current_values) =
+            self.bf16_split_qkv_heads(&qkv, params.num_heads);
+
+        let mut updated_cache = cache.clone();
+        let mut heads = Vec::with_capacity(params.num_heads);
+        for head in 0..params.num_heads {
+            updated_cache.keys[head].extend_from_slice(&current_keys[head]);
+            updated_cache.values[head].extend_from_slice(&current_values[head]);
+            heads.push(self.bf16_attention_head(
+                &queries[head],
+                &updated_cache.keys[head],
+                &updated_cache.values[head],
+                params.attention_scale,
+            ));
+        }
+
+        let attention_output = self.bf16_attention_output(
+            &heads,
+            params.attention_projection_weight,
+            params.attention_projection_bias,
+            hidden_state,
+        );
+        let hidden_state = self.bf16_gpt2_mlp(
+            &attention_output,
+            params.layer_norm_2_weight,
+            params.layer_norm_2_bias,
+            params.layer_norm_epsilon,
+            params.mlp_expansion_weight,
+            params.mlp_expansion_bias,
+            params.mlp_projection_weight,
+            params.mlp_projection_bias,
+        );
+
+        Bf16Gpt2BlockOutput { hidden_state, cache: updated_cache }
+    }
+
     /// Compute the mean of a non-empty BF16 vector.
     ///
     /// Values are added from left to right, and the final sum is divided by the BF16 encoding of
@@ -472,6 +682,13 @@ mod tests {
             .lines()
             .map(|value| u16::from_str_radix(value, 16).unwrap())
             .collect()
+    }
+
+    fn bf16_constants(
+        builder: &mut Builder<crate::circuit::AsmConfig>,
+        values: &[u16],
+    ) -> Vec<Felt<SP1Field>> {
+        values.iter().map(|&value| builder.constant(SP1Field::from_canonical_u16(value))).collect()
     }
 
     fn reference_bf16_add(lhs: u16, rhs: u16) -> u16 {
@@ -1100,6 +1317,81 @@ mod tests {
             raw_expansion_bias.len()
         );
         assert_eq!(executor.record.bf16_div_events.len(), 2);
+    }
+
+    #[test]
+    fn compiles_and_executes_bf16_gpt2_block() {
+        let raw_hidden_state = [0x3f80, 0xbf80];
+        let raw_layer_norm_weight = [0x3f80, 0x3f80];
+        let raw_layer_norm_bias = [0x0000, 0x0000];
+        let raw_attention_qkv_weight = [
+            0x3f80, 0x0000, 0x3f80, 0x0000, 0x0000, 0x0000, // hidden feature 0
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, // hidden feature 1
+        ];
+        let raw_attention_qkv_bias = [0x0000; 6];
+        let raw_identity_weight = [0x3f80, 0x0000, 0x0000, 0x3f80];
+        let raw_zero_bias = [0x0000, 0x0000];
+
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let hidden_state = bf16_constants(&mut builder, &raw_hidden_state);
+        let layer_norm_1_weight = bf16_constants(&mut builder, &raw_layer_norm_weight);
+        let layer_norm_1_bias = bf16_constants(&mut builder, &raw_layer_norm_bias);
+        let attention_qkv_weight = bf16_constants(&mut builder, &raw_attention_qkv_weight);
+        let attention_qkv_bias = bf16_constants(&mut builder, &raw_attention_qkv_bias);
+        let attention_projection_weight = bf16_constants(&mut builder, &raw_identity_weight);
+        let attention_projection_bias = bf16_constants(&mut builder, &raw_zero_bias);
+        let layer_norm_2_weight = bf16_constants(&mut builder, &raw_layer_norm_weight);
+        let layer_norm_2_bias = bf16_constants(&mut builder, &raw_layer_norm_bias);
+        let mlp_expansion_weight = bf16_constants(&mut builder, &raw_identity_weight);
+        let mlp_expansion_bias = bf16_constants(&mut builder, &raw_zero_bias);
+        let mlp_projection_weight = bf16_constants(&mut builder, &raw_identity_weight);
+        let mlp_projection_bias = bf16_constants(&mut builder, &raw_zero_bias);
+        let layer_norm_epsilon = builder.constant(SP1Field::from_canonical_u16(0x0000));
+        let attention_scale = builder.constant(SP1Field::from_canonical_u16(0x3f80));
+        let params = Bf16Gpt2BlockParams {
+            layer_norm_1_weight: &layer_norm_1_weight,
+            layer_norm_1_bias: &layer_norm_1_bias,
+            attention_qkv_weight: &attention_qkv_weight,
+            attention_qkv_bias: &attention_qkv_bias,
+            attention_projection_weight: &attention_projection_weight,
+            attention_projection_bias: &attention_projection_bias,
+            layer_norm_2_weight: &layer_norm_2_weight,
+            layer_norm_2_bias: &layer_norm_2_bias,
+            mlp_expansion_weight: &mlp_expansion_weight,
+            mlp_expansion_bias: &mlp_expansion_bias,
+            mlp_projection_weight: &mlp_projection_weight,
+            mlp_projection_bias: &mlp_projection_bias,
+            layer_norm_epsilon,
+            attention_scale,
+            num_heads: 1,
+        };
+        let output =
+            builder.bf16_gpt2_block(&hidden_state, &Bf16KvCache::empty(params.num_heads), &params);
+        assert_eq!(output.hidden_state.len(), raw_hidden_state.len());
+        for (&output, expected) in output.hidden_state.iter().zip([0x3feb, 0xbf94]) {
+            builder.assert_felt_eq(output, SP1Field::from_canonical_u16(expected));
+        }
+        assert_eq!(output.cache.keys.len(), 1);
+        assert_eq!(output.cache.values.len(), 1);
+        assert_eq!(output.cache.keys[0].len(), 2);
+        assert_eq!(output.cache.values[0].len(), 2);
+        for (&key, expected) in output.cache.keys[0].iter().zip([0x3f80, 0x0000]) {
+            builder.assert_felt_eq(key, SP1Field::from_canonical_u16(expected));
+        }
+        for (&value, expected) in output.cache.values[0].iter().zip([0x0000, 0x0000]) {
+            builder.assert_felt_eq(value, SP1Field::from_canonical_u16(expected));
+        }
+
+        let mut compiler = AsmCompiler::default();
+        let program =
+            Arc::new(compiler.compile_inner(builder.into_root_block()).validate().unwrap());
+        let mut executor =
+            Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
+        executor.run().unwrap();
+        assert_eq!(executor.record.bf16_mul_events.len(), 37);
+        assert_eq!(executor.record.bf16_add_sub_events.len(), 43);
+        assert_eq!(executor.record.bf16_unary_events.len(), 9);
+        assert_eq!(executor.record.bf16_div_events.len(), 5);
     }
 
     #[test]
