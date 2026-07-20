@@ -28,8 +28,12 @@ vec_map = { workspace = true }
 cfg-if = { workspace = true }
 
 [dev-dependencies]
+bincode = { workspace = true }
+slop-basefold = { workspace = true }
 sp1-recursion-executor = { workspace = true, features = ["program_validation"] }
+sp1-recursion-machine = { workspace = true }
 rand = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [features]
 # Enables cycle tracking and adds backtraces for circuit IR assertions.

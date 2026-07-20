@@ -18,6 +18,34 @@ impl Bf16KvCache {
     pub fn empty(num_heads: usize) -> Self {
         Self { keys: vec![Vec::new(); num_heads], values: vec![Vec::new(); num_heads] }
     }
+
+    fn validate_shape(&self, num_heads: usize, head_dimension: usize) -> usize {
+        assert!(num_heads > 0, "BF16 GPT-2 cache requires at least one attention head");
+        assert!(head_dimension > 0, "BF16 GPT-2 cache requires a nonzero head dimension");
+        assert_eq!(self.keys.len(), num_heads, "BF16 GPT-2 key cache head count mismatch");
+        assert_eq!(self.values.len(), num_heads, "BF16 GPT-2 value cache head count mismatch");
+
+        let cached_tokens = self.keys[0].len() / head_dimension;
+        for head in 0..num_heads {
+            assert_eq!(
+                self.keys[head].len() % head_dimension,
+                0,
+                "BF16 GPT-2 key cache shape mismatch"
+            );
+            assert_eq!(
+                self.values[head].len(),
+                self.keys[head].len(),
+                "BF16 GPT-2 value cache shape mismatch"
+            );
+            assert_eq!(
+                self.keys[head].len() / head_dimension,
+                cached_tokens,
+                "BF16 GPT-2 cache token count mismatch"
+            );
+        }
+
+        cached_tokens
+    }
 }
 
 /// Borrowed BF16 parameters for one GPT-2 transformer layer.
@@ -49,6 +77,63 @@ pub struct Bf16Gpt2BlockParams<'a> {
 pub struct Bf16Gpt2BlockOutput {
     pub hidden_state: Vec<Felt<SP1Field>>,
     pub cache: Bf16KvCache,
+}
+
+/// Key/value caches for every layer in a GPT-2 transformer stack.
+#[derive(Clone, Debug, Default)]
+pub struct Bf16Gpt2Cache {
+    pub layers: Vec<Bf16KvCache>,
+}
+
+impl Bf16Gpt2Cache {
+    /// Create an empty cache for a transformer whose layers all use the same head count.
+    #[must_use]
+    pub fn empty(num_layers: usize, num_heads: usize) -> Self {
+        Self { layers: vec![Bf16KvCache::empty(num_heads); num_layers] }
+    }
+}
+
+/// Externally supplied attention-score maxima for one autoregressive token.
+///
+/// `layers[layer][head]` contains one BF16 `max_hint`. The circuit uses it as a common softmax
+/// shift for that head, but deliberately does not prove that it is the actual maximum score.
+#[derive(Clone, Debug, Default)]
+pub struct Bf16Gpt2AttentionMaxHints {
+    pub layers: Vec<Vec<Felt<SP1Field>>>,
+}
+
+/// Borrowed BF16 parameters for the GPT-2 transformer blocks and final layer normalization.
+#[derive(Clone, Copy, Debug)]
+pub struct Bf16Gpt2TransformerParams<'a> {
+    pub blocks: &'a [Bf16Gpt2BlockParams<'a>],
+    pub final_layer_norm_weight: &'a [Felt<SP1Field>],
+    pub final_layer_norm_bias: &'a [Felt<SP1Field>],
+    pub final_layer_norm_epsilon: Felt<SP1Field>,
+}
+
+/// Output of one token passing through every GPT-2 transformer block and `ln_f`.
+#[derive(Clone, Debug)]
+pub struct Bf16Gpt2TransformerOutput {
+    pub hidden_state: Vec<Felt<SP1Field>>,
+    pub cache: Bf16Gpt2Cache,
+}
+
+/// Borrowed BF16 parameters for GPT-2 inference starting after token/position embedding.
+#[derive(Clone, Copy, Debug)]
+pub struct Bf16Gpt2ModelParams<'a> {
+    pub transformer: Bf16Gpt2TransformerParams<'a>,
+    /// GPT-2's tied `wte.weight`, laid out as `[vocab_size, hidden_size]`.
+    pub lm_head_weight: &'a [Felt<SP1Field>],
+}
+
+/// GPT-2 output for one autoregressive token.
+#[derive(Clone, Debug)]
+pub struct Bf16Gpt2ModelOutput {
+    /// Hidden state after all transformer blocks and `ln_f`.
+    pub hidden_state: Vec<Felt<SP1Field>>,
+    /// One BF16 logit per vocabulary entry.
+    pub logits: Vec<Felt<SP1Field>>,
+    pub cache: Bf16Gpt2Cache,
 }
 
 /// Encode a positive integer as BF16 using the same round-toward-zero policy as the arithmetic
@@ -237,16 +322,24 @@ impl<C: Config> Builder<C> {
             .collect()
     }
 
-    /// Compute a basic BF16 softmax, rounding every intermediate operation toward zero.
+    /// Compute BF16 softmax after subtracting one externally supplied maximum hint.
     ///
-    /// Exponential values and their left-to-right sum remain in BF16. This version deliberately
-    /// does not subtract the maximum score; a numerically stable softmax will additionally require
-    /// a constrained BF16 comparison/maximum operation.
-    pub fn bf16_softmax(&mut self, values: &[Felt<SP1Field>]) -> Vec<Felt<SP1Field>> {
+    /// The same `max_hint` is subtracted from every input before the exponential lookup. The hint
+    /// is not compared with the inputs and is not constrained to equal their actual maximum.
+    pub fn bf16_softmax(
+        &mut self,
+        values: &[Felt<SP1Field>],
+        max_hint: Felt<SP1Field>,
+    ) -> Vec<Felt<SP1Field>> {
         assert!(!values.is_empty(), "BF16 softmax requires at least one value");
 
-        let exponential_values =
-            values.iter().map(|&value| self.bf16_exponential(value)).collect::<Vec<_>>();
+        let exponential_values = values
+            .iter()
+            .map(|&value| {
+                let shifted = self.bf16_sub(value, max_hint);
+                self.bf16_exponential(shifted)
+            })
+            .collect::<Vec<_>>();
         let mut sum = exponential_values[0];
         for &value in &exponential_values[1..] {
             sum = self.bf16_add(sum, value);
@@ -298,6 +391,7 @@ impl<C: Config> Builder<C> {
         keys: &[Felt<SP1Field>],
         values: &[Felt<SP1Field>],
         scale: Felt<SP1Field>,
+        max_hint: Felt<SP1Field>,
     ) -> Vec<Felt<SP1Field>> {
         assert!(!query.is_empty(), "BF16 attention head requires a non-empty query");
         assert!(!keys.is_empty(), "BF16 attention head requires at least one key");
@@ -305,7 +399,7 @@ impl<C: Config> Builder<C> {
         assert_eq!(values.len(), keys.len(), "BF16 attention value cache shape mismatch");
 
         let scores = self.bf16_attention_scores(query, keys, scale);
-        let probabilities = self.bf16_softmax(&scores);
+        let probabilities = self.bf16_softmax(&scores, max_hint);
         self.bf16_attention_weighted_sum(&probabilities, values, query.len())
     }
 
@@ -434,10 +528,16 @@ impl<C: Config> Builder<C> {
         &mut self,
         hidden_state: &[Felt<SP1Field>],
         cache: &Bf16KvCache,
+        attention_max_hints: &[Felt<SP1Field>],
         params: &Bf16Gpt2BlockParams<'_>,
     ) -> Bf16Gpt2BlockOutput {
         assert!(!hidden_state.is_empty(), "BF16 GPT-2 block requires a non-empty hidden state");
         assert!(params.num_heads > 0, "BF16 GPT-2 block requires at least one attention head");
+        assert_eq!(
+            attention_max_hints.len(),
+            params.num_heads,
+            "BF16 GPT-2 attention max hint head count mismatch"
+        );
 
         let hidden_size = hidden_state.len();
         assert_eq!(
@@ -518,30 +618,7 @@ impl<C: Config> Builder<C> {
             "BF16 GPT-2 MLP projection weight shape mismatch"
         );
 
-        assert_eq!(cache.keys.len(), params.num_heads, "BF16 GPT-2 key cache head count mismatch");
-        assert_eq!(
-            cache.values.len(),
-            params.num_heads,
-            "BF16 GPT-2 value cache head count mismatch"
-        );
-        let cached_tokens = cache.keys[0].len() / head_dimension;
-        for head in 0..params.num_heads {
-            assert_eq!(
-                cache.keys[head].len() % head_dimension,
-                0,
-                "BF16 GPT-2 key cache shape mismatch"
-            );
-            assert_eq!(
-                cache.values[head].len(),
-                cache.keys[head].len(),
-                "BF16 GPT-2 value cache shape mismatch"
-            );
-            assert_eq!(
-                cache.keys[head].len() / head_dimension,
-                cached_tokens,
-                "BF16 GPT-2 cache token count mismatch"
-            );
-        }
+        cache.validate_shape(params.num_heads, head_dimension);
 
         let normalized = self.bf16_layer_norm(
             hidden_state,
@@ -564,6 +641,7 @@ impl<C: Config> Builder<C> {
                 &updated_cache.keys[head],
                 &updated_cache.values[head],
                 params.attention_scale,
+                attention_max_hints[head],
             ));
         }
 
@@ -585,6 +663,140 @@ impl<C: Config> Builder<C> {
         );
 
         Bf16Gpt2BlockOutput { hidden_state, cache: updated_cache }
+    }
+
+    /// Evaluate one token through all GPT-2 transformer blocks and the final `ln_f`.
+    ///
+    /// Each block consumes and updates only its own KV cache. All layers must have the same head
+    /// count and cached-token count, matching GPT-2's autoregressive cache layout.
+    pub fn bf16_gpt2_transformer(
+        &mut self,
+        hidden_state: &[Felt<SP1Field>],
+        cache: &Bf16Gpt2Cache,
+        attention_max_hints: &Bf16Gpt2AttentionMaxHints,
+        params: &Bf16Gpt2TransformerParams<'_>,
+    ) -> Bf16Gpt2TransformerOutput {
+        assert!(!hidden_state.is_empty(), "BF16 GPT-2 transformer requires a hidden state");
+        assert!(!params.blocks.is_empty(), "BF16 GPT-2 transformer requires at least one block");
+        assert_eq!(
+            cache.layers.len(),
+            params.blocks.len(),
+            "BF16 GPT-2 transformer cache layer count mismatch"
+        );
+        assert_eq!(
+            attention_max_hints.layers.len(),
+            params.blocks.len(),
+            "BF16 GPT-2 attention max hint layer count mismatch"
+        );
+        assert_eq!(
+            params.final_layer_norm_weight.len(),
+            hidden_state.len(),
+            "BF16 GPT-2 final layer norm weight length mismatch"
+        );
+        assert_eq!(
+            params.final_layer_norm_bias.len(),
+            hidden_state.len(),
+            "BF16 GPT-2 final layer norm bias length mismatch"
+        );
+
+        let num_heads = params.blocks[0].num_heads;
+        assert!(num_heads > 0, "BF16 GPT-2 transformer requires at least one attention head");
+        assert_eq!(
+            hidden_state.len() % num_heads,
+            0,
+            "BF16 GPT-2 hidden size must be divisible by head count"
+        );
+        let head_dimension = hidden_state.len() / num_heads;
+        let cached_tokens = cache.layers[0].validate_shape(num_heads, head_dimension);
+        for (layer, (block, layer_hints)) in
+            params.blocks.iter().zip(&attention_max_hints.layers).enumerate()
+        {
+            assert_eq!(
+                layer_hints.len(),
+                block.num_heads,
+                "BF16 GPT-2 attention max hint head count mismatch at layer {layer}"
+            );
+        }
+        for (layer, (block, layer_cache)) in
+            params.blocks.iter().zip(&cache.layers).enumerate().skip(1)
+        {
+            assert_eq!(
+                block.num_heads, num_heads,
+                "BF16 GPT-2 head count mismatch at layer {layer}"
+            );
+            assert_eq!(
+                layer_cache.validate_shape(num_heads, head_dimension),
+                cached_tokens,
+                "BF16 GPT-2 cached-token count mismatch at layer {layer}"
+            );
+        }
+
+        let mut hidden_state = hidden_state.to_vec();
+        let mut updated_layers = Vec::with_capacity(params.blocks.len());
+        for ((block, layer_cache), layer_hints) in
+            params.blocks.iter().zip(&cache.layers).zip(&attention_max_hints.layers)
+        {
+            let output = self.bf16_gpt2_block(&hidden_state, layer_cache, layer_hints, block);
+            hidden_state = output.hidden_state;
+            updated_layers.push(output.cache);
+        }
+        let hidden_state = self.bf16_layer_norm(
+            &hidden_state,
+            params.final_layer_norm_weight,
+            params.final_layer_norm_bias,
+            params.final_layer_norm_epsilon,
+        );
+
+        Bf16Gpt2TransformerOutput { hidden_state, cache: Bf16Gpt2Cache { layers: updated_layers } }
+    }
+
+    /// Project one final GPT-2 hidden state to vocabulary logits using the tied token embedding.
+    ///
+    /// Unlike GPT-2's internal `Conv1D` matrices, `wte.weight` is row-major
+    /// `[vocab_size, hidden_size]`. GPT-2 has no LM Head bias, so every output is exactly one BF16
+    /// dot product accumulated from left to right.
+    pub fn bf16_gpt2_lm_head(
+        &mut self,
+        hidden_state: &[Felt<SP1Field>],
+        weight: &[Felt<SP1Field>],
+    ) -> Vec<Felt<SP1Field>> {
+        assert!(!hidden_state.is_empty(), "BF16 GPT-2 LM Head requires a hidden state");
+        assert!(!weight.is_empty(), "BF16 GPT-2 LM Head requires at least one vocabulary row");
+        assert_eq!(
+            weight.len() % hidden_state.len(),
+            0,
+            "BF16 GPT-2 LM Head weight shape mismatch"
+        );
+
+        weight
+            .chunks_exact(hidden_state.len())
+            .map(|vocabulary_row| self.bf16_dot(hidden_state, vocabulary_row))
+            .collect()
+    }
+
+    /// Evaluate GPT-2 from an already embedded single-token hidden state through vocabulary logits.
+    ///
+    /// Token and position embedding are intentionally outside this circuit-facing interface.
+    pub fn bf16_gpt2_model(
+        &mut self,
+        hidden_state: &[Felt<SP1Field>],
+        cache: &Bf16Gpt2Cache,
+        attention_max_hints: &Bf16Gpt2AttentionMaxHints,
+        params: &Bf16Gpt2ModelParams<'_>,
+    ) -> Bf16Gpt2ModelOutput {
+        let transformer = self.bf16_gpt2_transformer(
+            hidden_state,
+            cache,
+            attention_max_hints,
+            &params.transformer,
+        );
+        let logits = self.bf16_gpt2_lm_head(&transformer.hidden_state, params.lm_head_weight);
+
+        Bf16Gpt2ModelOutput {
+            hidden_state: transformer.hidden_state,
+            logits,
+            cache: transformer.cache,
+        }
     }
 
     /// Compute the mean of a non-empty BF16 vector.
@@ -732,8 +944,10 @@ mod tests {
         Bf16MulWitness::new(dot, scale).output.raw
     }
 
-    fn reference_bf16_softmax(values: &[u16]) -> Vec<u16> {
-        let exponential_values = values
+    fn reference_bf16_softmax(values: &[u16], max_hint: u16) -> Vec<u16> {
+        let shifted_values =
+            values.iter().map(|&value| reference_bf16_sub(value, max_hint)).collect::<Vec<_>>();
+        let exponential_values = shifted_values
             .iter()
             .map(|&value| Bf16UnaryWitness::new(Bf16UnaryOpcode::Exponential, value).output)
             .collect::<Vec<_>>();
@@ -767,12 +981,13 @@ mod tests {
         keys: &[u16],
         values: &[u16],
         scale: u16,
+        max_hint: u16,
     ) -> Vec<u16> {
         let scores = keys
             .chunks_exact(query.len())
             .map(|key| reference_bf16_scaled_attention_score(query, key, scale))
             .collect::<Vec<_>>();
-        let probabilities = reference_bf16_softmax(&scores);
+        let probabilities = reference_bf16_softmax(&scores, max_hint);
         reference_bf16_attention_weighted_sum(&probabilities, values, query.len())
     }
 
@@ -1084,7 +1299,8 @@ mod tests {
     #[test]
     fn compiles_and_executes_bf16_softmax() {
         let raw_values = [0xbf80, 0x0000];
-        let expected = reference_bf16_softmax(&raw_values);
+        let raw_max_hint = 0x0000;
+        let expected = reference_bf16_softmax(&raw_values, raw_max_hint);
         assert_eq!(expected, [0x3e89, 0x3f3b]);
 
         let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
@@ -1092,7 +1308,8 @@ mod tests {
             .iter()
             .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
             .collect::<Vec<_>>();
-        let output = builder.bf16_softmax(&values);
+        let max_hint = builder.constant(SP1Field::from_canonical_u16(raw_max_hint));
+        let output = builder.bf16_softmax(&values, max_hint);
         assert_eq!(output.len(), expected.len());
         for (&output, &expected) in output.iter().zip(&expected) {
             builder.assert_felt_eq(output, SP1Field::from_canonical_u16(expected));
@@ -1110,7 +1327,7 @@ mod tests {
             .bf16_unary_events
             .iter()
             .all(|event| event.opcode == Bf16UnaryOpcode::Exponential));
-        assert_eq!(executor.record.bf16_add_sub_events.len(), raw_values.len() - 1);
+        assert_eq!(executor.record.bf16_add_sub_events.len(), raw_values.len() * 2 - 1);
         assert_eq!(executor.record.bf16_div_events.len(), raw_values.len());
     }
 
@@ -1126,7 +1343,14 @@ mod tests {
             0x4040, 0x4080, // cached value 1
         ];
         let raw_scale = 0x3f80;
-        let expected = reference_bf16_attention_head(&raw_query, &raw_keys, &raw_values, raw_scale);
+        let raw_max_hint = 0x0000;
+        let expected = reference_bf16_attention_head(
+            &raw_query,
+            &raw_keys,
+            &raw_values,
+            raw_scale,
+            raw_max_hint,
+        );
         assert_eq!(expected, [0x401d, 0x405d]);
 
         let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
@@ -1143,7 +1367,8 @@ mod tests {
             .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
             .collect::<Vec<_>>();
         let scale = builder.constant(SP1Field::from_canonical_u16(raw_scale));
-        let output = builder.bf16_attention_head(&query, &keys, &values, scale);
+        let max_hint = builder.constant(SP1Field::from_canonical_u16(raw_max_hint));
+        let output = builder.bf16_attention_head(&query, &keys, &values, scale, max_hint);
         assert_eq!(output.len(), raw_query.len());
         for (&output, &expected) in output.iter().zip(&expected) {
             builder.assert_felt_eq(output, SP1Field::from_canonical_u16(expected));
@@ -1156,7 +1381,7 @@ mod tests {
             Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
         executor.run().unwrap();
         assert_eq!(executor.record.bf16_mul_events.len(), 10);
-        assert_eq!(executor.record.bf16_add_sub_events.len(), 5);
+        assert_eq!(executor.record.bf16_add_sub_events.len(), 7);
         assert_eq!(executor.record.bf16_unary_events.len(), 2);
         assert!(executor
             .record
@@ -1348,6 +1573,7 @@ mod tests {
         let mlp_projection_bias = bf16_constants(&mut builder, &raw_zero_bias);
         let layer_norm_epsilon = builder.constant(SP1Field::from_canonical_u16(0x0000));
         let attention_scale = builder.constant(SP1Field::from_canonical_u16(0x3f80));
+        let attention_max_hint = builder.constant(SP1Field::from_canonical_u16(0x3f80));
         let params = Bf16Gpt2BlockParams {
             layer_norm_1_weight: &layer_norm_1_weight,
             layer_norm_1_bias: &layer_norm_1_bias,
@@ -1365,8 +1591,12 @@ mod tests {
             attention_scale,
             num_heads: 1,
         };
-        let output =
-            builder.bf16_gpt2_block(&hidden_state, &Bf16KvCache::empty(params.num_heads), &params);
+        let output = builder.bf16_gpt2_block(
+            &hidden_state,
+            &Bf16KvCache::empty(params.num_heads),
+            &[attention_max_hint],
+            &params,
+        );
         assert_eq!(output.hidden_state.len(), raw_hidden_state.len());
         for (&output, expected) in output.hidden_state.iter().zip([0x3feb, 0xbf94]) {
             builder.assert_felt_eq(output, SP1Field::from_canonical_u16(expected));
@@ -1389,9 +1619,113 @@ mod tests {
             Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
         executor.run().unwrap();
         assert_eq!(executor.record.bf16_mul_events.len(), 37);
-        assert_eq!(executor.record.bf16_add_sub_events.len(), 43);
+        assert_eq!(executor.record.bf16_add_sub_events.len(), 44);
         assert_eq!(executor.record.bf16_unary_events.len(), 9);
         assert_eq!(executor.record.bf16_div_events.len(), 5);
+    }
+
+    #[test]
+    fn compiles_and_executes_bf16_gpt2_model_with_cache() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let hidden_state = bf16_constants(&mut builder, &[0x3f80, 0xbf80]);
+        let layer_norm_weight = bf16_constants(&mut builder, &[0x3f80, 0x3f80]);
+        let layer_norm_bias = bf16_constants(&mut builder, &[0x0000, 0x0000]);
+        let attention_qkv_weight = bf16_constants(&mut builder, &[0x0000; 12]);
+        let attention_qkv_bias = bf16_constants(&mut builder, &[0x0000; 6]);
+        let attention_projection_weight = bf16_constants(&mut builder, &[0x0000; 4]);
+        let attention_projection_bias = bf16_constants(&mut builder, &[0x3f00, 0x0000]);
+        let mlp_expansion_weight = bf16_constants(&mut builder, &[0x0000; 4]);
+        let mlp_expansion_bias = bf16_constants(&mut builder, &[0x0000, 0x0000]);
+        let mlp_projection_weight = bf16_constants(&mut builder, &[0x0000; 4]);
+        let mlp_projection_bias = bf16_constants(&mut builder, &[0x0000, 0x3f00]);
+        let final_layer_norm_weight = bf16_constants(&mut builder, &[0x4000, 0x3f00]);
+        let final_layer_norm_bias = bf16_constants(&mut builder, &[0x3f00, 0xbf00]);
+        let lm_head_weight =
+            bf16_constants(&mut builder, &[0x3f80, 0x0000, 0x0000, 0x3f80, 0x3f80, 0x3f80]);
+        let epsilon = builder.constant(SP1Field::from_canonical_u16(0x0000));
+        let attention_scale = builder.constant(SP1Field::from_canonical_u16(0x3f80));
+        let block = Bf16Gpt2BlockParams {
+            layer_norm_1_weight: &layer_norm_weight,
+            layer_norm_1_bias: &layer_norm_bias,
+            attention_qkv_weight: &attention_qkv_weight,
+            attention_qkv_bias: &attention_qkv_bias,
+            attention_projection_weight: &attention_projection_weight,
+            attention_projection_bias: &attention_projection_bias,
+            layer_norm_2_weight: &layer_norm_weight,
+            layer_norm_2_bias: &layer_norm_bias,
+            mlp_expansion_weight: &mlp_expansion_weight,
+            mlp_expansion_bias: &mlp_expansion_bias,
+            mlp_projection_weight: &mlp_projection_weight,
+            mlp_projection_bias: &mlp_projection_bias,
+            layer_norm_epsilon: epsilon,
+            attention_scale,
+            num_heads: 1,
+        };
+        let blocks = [block; 2];
+        let transformer = Bf16Gpt2TransformerParams {
+            blocks: &blocks,
+            final_layer_norm_weight: &final_layer_norm_weight,
+            final_layer_norm_bias: &final_layer_norm_bias,
+            final_layer_norm_epsilon: epsilon,
+        };
+        let params = Bf16Gpt2ModelParams { transformer, lm_head_weight: &lm_head_weight };
+        let attention_max_hints =
+            Bf16Gpt2AttentionMaxHints { layers: vec![vec![epsilon]; blocks.len()] };
+
+        let first = builder.bf16_gpt2_model(
+            &hidden_state,
+            &Bf16Gpt2Cache::empty(blocks.len(), block.num_heads),
+            &attention_max_hints,
+            &params,
+        );
+        for (&output, expected) in first.hidden_state.iter().zip([0x4020, 0xbf80]) {
+            builder.assert_felt_eq(output, SP1Field::from_canonical_u16(expected));
+        }
+        assert_eq!(first.logits.len(), 3);
+        for (&logit, expected) in first.logits.iter().zip([0x4020, 0xbf80, 0x3fc0]) {
+            builder.assert_felt_eq(logit, SP1Field::from_canonical_u16(expected));
+        }
+        assert_eq!(first.cache.layers.len(), blocks.len());
+        for layer in &first.cache.layers {
+            assert_eq!(layer.keys.len(), block.num_heads);
+            assert_eq!(layer.values.len(), block.num_heads);
+            assert_eq!(layer.keys[0].len(), 2);
+            assert_eq!(layer.values[0].len(), 2);
+            for &value in layer.keys[0].iter().chain(&layer.values[0]) {
+                builder.assert_felt_eq(value, SP1Field::zero());
+            }
+        }
+
+        let second =
+            builder.bf16_gpt2_model(&hidden_state, &first.cache, &attention_max_hints, &params);
+        for (&output, expected) in second.hidden_state.iter().zip([0x4020, 0xbf80]) {
+            builder.assert_felt_eq(output, SP1Field::from_canonical_u16(expected));
+        }
+        assert_eq!(second.logits.len(), 3);
+        for (&logit, expected) in second.logits.iter().zip([0x4020, 0xbf80, 0x3fc0]) {
+            builder.assert_felt_eq(logit, SP1Field::from_canonical_u16(expected));
+        }
+        assert_eq!(second.cache.layers.len(), blocks.len());
+        for layer in &second.cache.layers {
+            assert_eq!(layer.keys.len(), block.num_heads);
+            assert_eq!(layer.values.len(), block.num_heads);
+            assert_eq!(layer.keys[0].len(), 4);
+            assert_eq!(layer.values[0].len(), 4);
+            for &value in layer.keys[0].iter().chain(&layer.values[0]) {
+                builder.assert_felt_eq(value, SP1Field::zero());
+            }
+        }
+
+        let mut compiler = AsmCompiler::default();
+        let program =
+            Arc::new(compiler.compile_inner(builder.into_root_block()).validate().unwrap());
+        let mut executor =
+            Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
+        executor.run().unwrap();
+        assert_eq!(executor.record.bf16_mul_events.len(), 178);
+        assert_eq!(executor.record.bf16_add_sub_events.len(), 206);
+        assert_eq!(executor.record.bf16_unary_events.len(), 44);
+        assert_eq!(executor.record.bf16_div_events.len(), 26);
     }
 
     #[test]
@@ -1537,6 +1871,14 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "BF16 GPT-2 LM Head weight shape mismatch")]
+    fn rejects_mismatched_bf16_gpt2_lm_head_weight() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let value = builder.constant(SP1Field::zero());
+        builder.bf16_gpt2_lm_head(&[value; 2], &[value; 3]);
+    }
+
+    #[test]
     #[should_panic(expected = "BF16 QKV hidden size must be divisible by head count")]
     fn rejects_mismatched_bf16_qkv_heads() {
         let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
@@ -1556,7 +1898,8 @@ mod tests {
     #[should_panic(expected = "BF16 softmax requires at least one value")]
     fn rejects_empty_bf16_softmax() {
         let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
-        builder.bf16_softmax(&[]);
+        let max_hint = builder.constant(SP1Field::zero());
+        builder.bf16_softmax(&[], max_hint);
     }
 
     #[test]
@@ -1564,7 +1907,7 @@ mod tests {
     fn rejects_mismatched_bf16_attention_value_cache() {
         let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
         let value = builder.constant(SP1Field::zero());
-        builder.bf16_attention_head(&[value; 2], &[value; 4], &[value; 3], value);
+        builder.bf16_attention_head(&[value; 2], &[value; 4], &[value; 3], value, value);
     }
 
     #[test]

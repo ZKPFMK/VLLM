@@ -8145,17 +8145,21 @@ name = "sp1-recursion-compiler"
 version = "6.3.1"
 dependencies = [
  "backtrace",
+ "bincode",
  "cfg-if",
  "itertools 0.14.0",
  "rand 0.8.6",
  "serde",
  "slop-algebra 6.3.1",
+ "slop-basefold",
  "slop-bn254 6.3.1",
  "slop-symmetric 6.3.1",
  "sp1-core-machine",
  "sp1-hypercube",
  "sp1-primitives 6.3.1",
  "sp1-recursion-executor",
+ "sp1-recursion-machine",
+ "tokio",
  "tracing",
  "vec_map",
 ]
