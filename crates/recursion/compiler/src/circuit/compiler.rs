@@ -415,6 +415,15 @@ where
     }
 
     #[inline(always)]
+    fn bf16_gelu_new(&mut self, dst: impl Reg, input: impl Reg) -> Instruction<SP1Field> {
+        Instruction::Bf16Unary(Bf16UnaryInstr {
+            opcode: Bf16UnaryOpcode::GeluNew,
+            addrs: Bf16UnaryIo { output: dst.write(self), input: input.read(self) },
+            mult: SP1Field::zero(),
+        })
+    }
+
+    #[inline(always)]
     fn bf16_div(&mut self, dst: impl Reg, lhs: impl Reg, rhs: impl Reg) -> Instruction<SP1Field> {
         Instruction::Bf16Div(Bf16DivInstr {
             addrs: Bf16DivIo { output: dst.write(self), lhs: lhs.read(self), rhs: rhs.read(self) },
@@ -633,6 +642,7 @@ where
             DslIr::Bf16Square(dst, input) => f(self.bf16_square(dst, input)),
             DslIr::Bf16Rsqrt(dst, input) => f(self.bf16_rsqrt(dst, input)),
             DslIr::Bf16Exponential(dst, input) => f(self.bf16_exponential(dst, input)),
+            DslIr::Bf16GeluNew(dst, input) => f(self.bf16_gelu_new(dst, input)),
             DslIr::Bf16Div(dst, lhs, rhs) => f(self.bf16_div(dst, lhs, rhs)),
             DslIr::Bf16Add(dst, lhs, rhs) => {
                 f(self.bf16_add_sub(Bf16AddSubOpcode::Add, dst, lhs, rhs))

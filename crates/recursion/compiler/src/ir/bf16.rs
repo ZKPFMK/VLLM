@@ -47,6 +47,13 @@ impl<C: Config> Builder<C> {
         output
     }
 
+    /// Apply GPT-2's tanh-approximated GELU with a single raw-to-raw BF16 lookup.
+    pub fn bf16_gelu_new(&mut self, input: Felt<SP1Field>) -> Felt<SP1Field> {
+        let output = self.uninit();
+        self.push_op(DslIr::Bf16GeluNew(output, input));
+        output
+    }
+
     /// Divide two raw 16-bit BF16 encodings using Algorithm 2 from `VeriLLM`.
     ///
     /// Both operands and the returned value are stored as `Felt<SP1Field>`, but the BF16 lookup
@@ -198,6 +205,176 @@ impl<C: Config> Builder<C> {
         }
 
         exponential_values.into_iter().map(|value| self.bf16_div(value, sum)).collect()
+    }
+
+    /// Compute one attention head's BF16 weighted sum over a flattened value cache.
+    ///
+    /// `values` has row-major layout `[value_count, head_dimension]`. For each output feature, the
+    /// products are accumulated in value-cache order by [`Self::bf16_dot`].
+    pub fn bf16_attention_weighted_sum(
+        &mut self,
+        probabilities: &[Felt<SP1Field>],
+        values: &[Felt<SP1Field>],
+        head_dimension: usize,
+    ) -> Vec<Felt<SP1Field>> {
+        assert!(
+            !probabilities.is_empty(),
+            "BF16 attention weighted sum requires at least one probability"
+        );
+        assert!(
+            head_dimension > 0,
+            "BF16 attention weighted sum requires a nonzero head dimension"
+        );
+        let expected_value_len = probabilities
+            .len()
+            .checked_mul(head_dimension)
+            .expect("BF16 attention value cache dimensions overflow");
+        assert_eq!(values.len(), expected_value_len, "BF16 attention value cache shape mismatch");
+
+        let mut output = Vec::with_capacity(head_dimension);
+        for feature in 0..head_dimension {
+            let value_column =
+                values.chunks_exact(head_dimension).map(|value| value[feature]).collect::<Vec<_>>();
+            output.push(self.bf16_dot(probabilities, &value_column));
+        }
+        output
+    }
+
+    /// Evaluate one BF16 autoregressive attention head through score, softmax, and value mixing.
+    ///
+    /// `keys` and `values` both use row-major `[cache_count, query.len()]` layout. Passing only past
+    /// and current cache entries enforces causality without inserting an explicit mask.
+    pub fn bf16_attention_head(
+        &mut self,
+        query: &[Felt<SP1Field>],
+        keys: &[Felt<SP1Field>],
+        values: &[Felt<SP1Field>],
+        scale: Felt<SP1Field>,
+    ) -> Vec<Felt<SP1Field>> {
+        assert!(!query.is_empty(), "BF16 attention head requires a non-empty query");
+        assert!(!keys.is_empty(), "BF16 attention head requires at least one key");
+        assert_eq!(keys.len() % query.len(), 0, "BF16 attention key cache shape mismatch");
+        assert_eq!(values.len(), keys.len(), "BF16 attention value cache shape mismatch");
+
+        let scores = self.bf16_attention_scores(query, keys, scale);
+        let probabilities = self.bf16_softmax(&scores);
+        self.bf16_attention_weighted_sum(&probabilities, values, query.len())
+    }
+
+    /// Concatenate equally sized attention heads in head-major order.
+    ///
+    /// This only rearranges existing circuit variables and emits no instructions or lookup events.
+    pub fn bf16_merge_attention_heads(&self, heads: &[Vec<Felt<SP1Field>>]) -> Vec<Felt<SP1Field>> {
+        assert!(!heads.is_empty(), "BF16 attention merge requires at least one head");
+        let head_dimension = heads[0].len();
+        assert!(head_dimension > 0, "BF16 attention merge requires a nonzero head dimension");
+        assert!(
+            heads.iter().all(|head| head.len() == head_dimension),
+            "BF16 attention head dimension mismatch"
+        );
+
+        heads.iter().flatten().copied().collect()
+    }
+
+    /// Add two non-empty BF16 vectors element by element.
+    pub fn bf16_vector_add(
+        &mut self,
+        lhs: &[Felt<SP1Field>],
+        rhs: &[Felt<SP1Field>],
+    ) -> Vec<Felt<SP1Field>> {
+        assert!(!lhs.is_empty(), "BF16 vector addition requires at least one value");
+        assert_eq!(lhs.len(), rhs.len(), "BF16 vector addition length mismatch");
+        lhs.iter().zip(rhs).map(|(&lhs, &rhs)| self.bf16_add(lhs, rhs)).collect()
+    }
+
+    /// Merge attention heads, apply GPT-2's `c_proj`, and add the residual connection.
+    ///
+    /// The projection weight uses GPT-2's row-major `[merged_size, output_size]` `Conv1D` layout.
+    /// Dropout is omitted because it is disabled during inference.
+    pub fn bf16_attention_output(
+        &mut self,
+        heads: &[Vec<Felt<SP1Field>>],
+        projection_weight: &[Felt<SP1Field>],
+        projection_bias: &[Felt<SP1Field>],
+        residual: &[Felt<SP1Field>],
+    ) -> Vec<Felt<SP1Field>> {
+        let merged = self.bf16_merge_attention_heads(heads);
+        assert_eq!(
+            residual.len(),
+            projection_bias.len(),
+            "BF16 attention residual length mismatch"
+        );
+        let projected = self.bf16_linear(&merged, projection_weight, projection_bias);
+        self.bf16_vector_add(residual, &projected)
+    }
+
+    /// Apply GPT-2's `gelu_new` activation element by element.
+    pub fn bf16_gelu_new_vector(&mut self, values: &[Felt<SP1Field>]) -> Vec<Felt<SP1Field>> {
+        assert!(!values.is_empty(), "BF16 GELU requires at least one value");
+        values.iter().map(|&value| self.bf16_gelu_new(value)).collect()
+    }
+
+    /// Evaluate GPT-2's pre-normalized MLP sub-block and residual connection.
+    ///
+    /// This applies `ln_2`, `c_fc`, `gelu_new`, `c_proj`, then adds the original `residual`.
+    /// Expansion weights use `[hidden_size, inner_size]`; projection weights use
+    /// `[inner_size, hidden_size]`, matching GPT-2's `Conv1D` layout. Dropout is disabled during
+    /// inference and is therefore omitted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bf16_gpt2_mlp(
+        &mut self,
+        residual: &[Felt<SP1Field>],
+        layer_norm_weight: &[Felt<SP1Field>],
+        layer_norm_bias: &[Felt<SP1Field>],
+        epsilon: Felt<SP1Field>,
+        expansion_weight: &[Felt<SP1Field>],
+        expansion_bias: &[Felt<SP1Field>],
+        projection_weight: &[Felt<SP1Field>],
+        projection_bias: &[Felt<SP1Field>],
+    ) -> Vec<Felt<SP1Field>> {
+        assert!(!residual.is_empty(), "BF16 GPT-2 MLP requires a non-empty residual");
+        let hidden_size = residual.len();
+        assert_eq!(
+            layer_norm_weight.len(),
+            hidden_size,
+            "BF16 GPT-2 MLP layer norm weight length mismatch"
+        );
+        assert_eq!(
+            layer_norm_bias.len(),
+            hidden_size,
+            "BF16 GPT-2 MLP layer norm bias length mismatch"
+        );
+
+        let inner_size = expansion_bias.len();
+        assert!(inner_size > 0, "BF16 GPT-2 MLP requires a non-empty expansion bias");
+        let expected_expansion_weight_len = hidden_size
+            .checked_mul(inner_size)
+            .expect("BF16 GPT-2 MLP expansion dimensions overflow");
+        assert_eq!(
+            expansion_weight.len(),
+            expected_expansion_weight_len,
+            "BF16 GPT-2 MLP expansion weight shape mismatch"
+        );
+        assert_eq!(
+            projection_bias.len(),
+            hidden_size,
+            "BF16 GPT-2 MLP projection bias length mismatch"
+        );
+        let expected_projection_weight_len = inner_size
+            .checked_mul(hidden_size)
+            .expect("BF16 GPT-2 MLP projection dimensions overflow");
+        assert_eq!(
+            projection_weight.len(),
+            expected_projection_weight_len,
+            "BF16 GPT-2 MLP projection weight shape mismatch"
+        );
+
+        let normalized =
+            self.bf16_layer_norm(residual, layer_norm_weight, layer_norm_bias, epsilon);
+        let expanded = self.bf16_linear(&normalized, expansion_weight, expansion_bias);
+        let activated = self.bf16_gelu_new_vector(&expanded);
+        let projected = self.bf16_linear(&activated, projection_weight, projection_bias);
+        self.bf16_vector_add(residual, &projected)
     }
 
     /// Compute the mean of a non-empty BF16 vector.
@@ -352,6 +529,77 @@ mod tests {
             .collect()
     }
 
+    fn reference_bf16_attention_weighted_sum(
+        probabilities: &[u16],
+        values: &[u16],
+        head_dimension: usize,
+    ) -> Vec<u16> {
+        (0..head_dimension)
+            .map(|feature| {
+                let value_column = values
+                    .chunks_exact(head_dimension)
+                    .map(|value| value[feature])
+                    .collect::<Vec<_>>();
+                reference_bf16_dot(probabilities, &value_column)
+            })
+            .collect()
+    }
+
+    fn reference_bf16_attention_head(
+        query: &[u16],
+        keys: &[u16],
+        values: &[u16],
+        scale: u16,
+    ) -> Vec<u16> {
+        let scores = keys
+            .chunks_exact(query.len())
+            .map(|key| reference_bf16_scaled_attention_score(query, key, scale))
+            .collect::<Vec<_>>();
+        let probabilities = reference_bf16_softmax(&scores);
+        reference_bf16_attention_weighted_sum(&probabilities, values, query.len())
+    }
+
+    fn reference_bf16_attention_output(
+        heads: &[Vec<u16>],
+        projection_weight: &[u16],
+        projection_bias: &[u16],
+        residual: &[u16],
+    ) -> Vec<u16> {
+        let merged = heads.iter().flatten().copied().collect::<Vec<_>>();
+        let projected = reference_bf16_linear(&merged, projection_weight, projection_bias);
+        residual
+            .iter()
+            .zip(projected)
+            .map(|(&residual, projected)| reference_bf16_add(residual, projected))
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reference_bf16_gpt2_mlp(
+        residual: &[u16],
+        layer_norm_weight: &[u16],
+        layer_norm_bias: &[u16],
+        epsilon: u16,
+        expansion_weight: &[u16],
+        expansion_bias: &[u16],
+        projection_weight: &[u16],
+        projection_bias: &[u16],
+    ) -> Vec<u16> {
+        let normalized =
+            reference_bf16_layer_norm(residual, layer_norm_weight, layer_norm_bias, epsilon);
+        let expanded = reference_bf16_linear(&normalized, expansion_weight, expansion_bias);
+        let activated = expanded
+            .into_iter()
+            .map(|value| Bf16UnaryWitness::new(Bf16UnaryOpcode::GeluNew, value).output)
+            .collect::<Vec<_>>();
+        let projected = reference_bf16_linear(&activated, projection_weight, projection_bias);
+        residual
+            .iter()
+            .zip(projected)
+            .map(|(&residual, projected)| reference_bf16_add(residual, projected))
+            .collect()
+    }
+
     fn reference_bf16_layer_norm(
         values: &[u16],
         weight: &[u16],
@@ -448,6 +696,23 @@ mod tests {
         executor.run().unwrap();
         assert_eq!(executor.record.bf16_unary_events.len(), 1);
         assert_eq!(executor.record.bf16_unary_events[0].opcode, Bf16UnaryOpcode::Exponential);
+    }
+
+    #[test]
+    fn compiles_and_executes_bf16_gelu_new() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let input: Felt<_> = builder.constant(SP1Field::from_canonical_u16(0xbf80));
+        let output = builder.bf16_gelu_new(input);
+        builder.assert_felt_eq(output, SP1Field::from_canonical_u16(0xbe22));
+
+        let mut compiler = AsmCompiler::default();
+        let program =
+            Arc::new(compiler.compile_inner(builder.into_root_block()).validate().unwrap());
+        let mut executor =
+            Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
+        executor.run().unwrap();
+        assert_eq!(executor.record.bf16_unary_events.len(), 1);
+        assert_eq!(executor.record.bf16_unary_events[0].opcode, Bf16UnaryOpcode::GeluNew);
     }
 
     #[test]
@@ -633,6 +898,211 @@ mod tests {
     }
 
     #[test]
+    fn compiles_and_executes_bf16_attention_head() {
+        let raw_query = [0x3f80, 0x0000];
+        let raw_keys = [
+            0xbf80, 0x0000, // cached key 0
+            0x0000, 0x3f80, // cached key 1
+        ];
+        let raw_values = [
+            0x3f80, 0x4000, // cached value 0
+            0x4040, 0x4080, // cached value 1
+        ];
+        let raw_scale = 0x3f80;
+        let expected = reference_bf16_attention_head(&raw_query, &raw_keys, &raw_values, raw_scale);
+        assert_eq!(expected, [0x401d, 0x405d]);
+
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let query = raw_query
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let keys = raw_keys
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let values = raw_values
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let scale = builder.constant(SP1Field::from_canonical_u16(raw_scale));
+        let output = builder.bf16_attention_head(&query, &keys, &values, scale);
+        assert_eq!(output.len(), raw_query.len());
+        for (&output, &expected) in output.iter().zip(&expected) {
+            builder.assert_felt_eq(output, SP1Field::from_canonical_u16(expected));
+        }
+
+        let mut compiler = AsmCompiler::default();
+        let program =
+            Arc::new(compiler.compile_inner(builder.into_root_block()).validate().unwrap());
+        let mut executor =
+            Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
+        executor.run().unwrap();
+        assert_eq!(executor.record.bf16_mul_events.len(), 10);
+        assert_eq!(executor.record.bf16_add_sub_events.len(), 5);
+        assert_eq!(executor.record.bf16_unary_events.len(), 2);
+        assert!(executor
+            .record
+            .bf16_unary_events
+            .iter()
+            .all(|event| event.opcode == Bf16UnaryOpcode::Exponential));
+        assert_eq!(executor.record.bf16_div_events.len(), 2);
+    }
+
+    #[test]
+    fn compiles_and_executes_bf16_attention_output() {
+        let raw_heads = [vec![0x3f80, 0x4000], vec![0x4040, 0x4080]];
+        let raw_projection_weight = [
+            0x3f80, 0x0000, // merged feature 0
+            0x0000, 0x3f80, // merged feature 1
+            0x3f80, 0x0000, // merged feature 2
+            0x0000, 0x3f80, // merged feature 3
+        ];
+        let raw_projection_bias = [0x3f00, 0xbf80];
+        let raw_residual = [0x4120, 0x41a0];
+        let expected = reference_bf16_attention_output(
+            &raw_heads,
+            &raw_projection_weight,
+            &raw_projection_bias,
+            &raw_residual,
+        );
+        assert_eq!(expected, [0x4168, 0x41c8]);
+
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let heads = raw_heads
+            .iter()
+            .map(|head| {
+                head.iter()
+                    .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let projection_weight = raw_projection_weight
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let projection_bias = raw_projection_bias
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let residual = raw_residual
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let output =
+            builder.bf16_attention_output(&heads, &projection_weight, &projection_bias, &residual);
+        assert_eq!(output.len(), raw_residual.len());
+        for (&output, &expected) in output.iter().zip(&expected) {
+            builder.assert_felt_eq(output, SP1Field::from_canonical_u16(expected));
+        }
+
+        let mut compiler = AsmCompiler::default();
+        let program =
+            Arc::new(compiler.compile_inner(builder.into_root_block()).validate().unwrap());
+        let mut executor =
+            Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
+        executor.run().unwrap();
+        assert_eq!(executor.record.bf16_mul_events.len(), 8);
+        assert_eq!(executor.record.bf16_add_sub_events.len(), 10);
+        assert!(executor.record.bf16_unary_events.is_empty());
+        assert!(executor.record.bf16_div_events.is_empty());
+    }
+
+    #[test]
+    fn compiles_and_executes_bf16_gpt2_mlp() {
+        let raw_residual = [0x3f80, 0xbf80];
+        let raw_layer_norm_weight = [0x3f80, 0x3f80];
+        let raw_layer_norm_bias = [0x0000, 0x0000];
+        let raw_epsilon = 0x0000;
+        let raw_expansion_weight = [
+            0x3f80, 0x0000, // hidden feature 0
+            0x0000, 0x3f80, // hidden feature 1
+        ];
+        let raw_expansion_bias = [0x0000, 0x0000];
+        let raw_projection_weight = [
+            0x3f80, 0x0000, // inner feature 0
+            0x0000, 0x3f80, // inner feature 1
+        ];
+        let raw_projection_bias = [0x0000, 0x0000];
+        let expected = reference_bf16_gpt2_mlp(
+            &raw_residual,
+            &raw_layer_norm_weight,
+            &raw_layer_norm_bias,
+            raw_epsilon,
+            &raw_expansion_weight,
+            &raw_expansion_bias,
+            &raw_projection_weight,
+            &raw_projection_bias,
+        );
+        assert_eq!(expected, [0x3feb, 0xbf94]);
+
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let residual = raw_residual
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let layer_norm_weight = raw_layer_norm_weight
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let layer_norm_bias = raw_layer_norm_bias
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let epsilon = builder.constant(SP1Field::from_canonical_u16(raw_epsilon));
+        let expansion_weight = raw_expansion_weight
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let expansion_bias = raw_expansion_bias
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let projection_weight = raw_projection_weight
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let projection_bias = raw_projection_bias
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let output = builder.bf16_gpt2_mlp(
+            &residual,
+            &layer_norm_weight,
+            &layer_norm_bias,
+            epsilon,
+            &expansion_weight,
+            &expansion_bias,
+            &projection_weight,
+            &projection_bias,
+        );
+        assert_eq!(output.len(), raw_residual.len());
+        for (&output, &expected) in output.iter().zip(&expected) {
+            builder.assert_felt_eq(output, SP1Field::from_canonical_u16(expected));
+        }
+
+        let mut compiler = AsmCompiler::default();
+        let program =
+            Arc::new(compiler.compile_inner(builder.into_root_block()).validate().unwrap());
+        let mut executor =
+            Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
+        executor.run().unwrap();
+        assert_eq!(executor.record.bf16_mul_events.len(), 12);
+        assert_eq!(executor.record.bf16_add_sub_events.len(), 17);
+        assert_eq!(executor.record.bf16_unary_events.len(), 5);
+        assert_eq!(
+            executor
+                .record
+                .bf16_unary_events
+                .iter()
+                .filter(|event| event.opcode == Bf16UnaryOpcode::GeluNew)
+                .count(),
+            raw_expansion_bias.len()
+        );
+        assert_eq!(executor.record.bf16_div_events.len(), 2);
+    }
+
+    #[test]
     fn compiles_and_executes_bf16_mean() {
         let raw_values = gpt2_once_hidden_state();
         assert_eq!(raw_values.len(), 768);
@@ -795,5 +1265,46 @@ mod tests {
     fn rejects_empty_bf16_softmax() {
         let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
         builder.bf16_softmax(&[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "BF16 attention value cache shape mismatch")]
+    fn rejects_mismatched_bf16_attention_value_cache() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let value = builder.constant(SP1Field::zero());
+        builder.bf16_attention_head(&[value; 2], &[value; 4], &[value; 3], value);
+    }
+
+    #[test]
+    #[should_panic(expected = "BF16 attention head dimension mismatch")]
+    fn rejects_mismatched_bf16_attention_head_dimensions() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let value = builder.constant(SP1Field::zero());
+        builder.bf16_merge_attention_heads(&[vec![value], vec![value; 2]]);
+    }
+
+    #[test]
+    #[should_panic(expected = "BF16 attention residual length mismatch")]
+    fn rejects_mismatched_bf16_attention_residual() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let value = builder.constant(SP1Field::zero());
+        builder.bf16_attention_output(&[vec![value]], &[value], &[value], &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "BF16 GPT-2 MLP projection weight shape mismatch")]
+    fn rejects_mismatched_bf16_gpt2_mlp_projection() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let value = builder.constant(SP1Field::zero());
+        builder.bf16_gpt2_mlp(
+            &[value],
+            &[value],
+            &[value],
+            value,
+            &[value],
+            &[value],
+            &[],
+            &[value],
+        );
     }
 }

@@ -7,9 +7,10 @@ use sp1_hypercube::{
     InteractionKind,
 };
 use sp1_recursion_executor::{
-    Address, Block, BF16_LOOKUP_ADD, BF16_LOOKUP_DIV, BF16_LOOKUP_EXPONENTIAL, BF16_LOOKUP_INIT,
-    BF16_LOOKUP_MUL, BF16_LOOKUP_RSQRT, BF16_LOOKUP_SHARED, BF16_LOOKUP_SQUARE, BF16_LSHIFT_PREFIX,
-    BF16_MANTISSA_BITS, BF16_ROUND_PREFIX, BF16_RSHIFT_PREFIX,
+    Address, Block, BF16_LOOKUP_ADD, BF16_LOOKUP_DIV, BF16_LOOKUP_EXPONENTIAL,
+    BF16_LOOKUP_GELU_NEW, BF16_LOOKUP_INIT, BF16_LOOKUP_MUL, BF16_LOOKUP_RSQRT, BF16_LOOKUP_SHARED,
+    BF16_LOOKUP_SQUARE, BF16_LSHIFT_PREFIX, BF16_MANTISSA_BITS, BF16_ROUND_PREFIX,
+    BF16_RSHIFT_PREFIX,
 };
 
 /// A trait which contains all helper methods for building SP1 recursion machine AIRs.
@@ -146,6 +147,26 @@ pub trait RecursionAirBuilder: BaseAirBuilder {
     {
         self.send_bf16_lookup(
             Self::Expr::from_canonical_u8(BF16_LOOKUP_EXPONENTIAL),
+            input,
+            output,
+            Self::Expr::zero(),
+            Self::Expr::zero(),
+            mult,
+        );
+    }
+
+    /// Look up the raw BF16 result of GPT-2's tanh-approximated GELU activation.
+    fn send_bf16_gelu_new<Input, Output>(
+        &mut self,
+        input: Input,
+        output: Output,
+        mult: impl Into<Self::Expr>,
+    ) where
+        Input: Into<Self::Expr>,
+        Output: Into<Self::Expr>,
+    {
+        self.send_bf16_lookup(
+            Self::Expr::from_canonical_u8(BF16_LOOKUP_GELU_NEW),
             input,
             output,
             Self::Expr::zero(),

@@ -39,8 +39,10 @@ pub const BF16_LOOKUP_SQUARE: u8 = 5;
 pub const BF16_LOOKUP_RSQRT: u8 = 6;
 /// Lookup opcode for the mathematical exponential of a raw BF16 value.
 pub const BF16_LOOKUP_EXPONENTIAL: u8 = 7;
+/// Lookup opcode for GPT-2's tanh-approximated GELU activation.
+pub const BF16_LOOKUP_GELU_NEW: u8 = 8;
 /// Number of lookup operations currently supplied by the BF16 table.
-pub const NUM_BF16_LOOKUP_OPS: usize = 8;
+pub const NUM_BF16_LOOKUP_OPS: usize = 9;
 
 /// Prefix used by the shared lookup for `Round`.
 pub const BF16_ROUND_PREFIX: u16 = 0x4000;
@@ -139,6 +141,7 @@ pub struct Bf16LookupTableRow {
     pub square: u16,
     pub rsqrt: u16,
     pub exponential: u16,
+    pub gelu_new: u16,
 }
 
 /// The BF16 lookup table is generated once and shared by witness and trace generation.
@@ -153,6 +156,7 @@ static BF16_LOOKUP_TABLE: LazyLock<Box<[Bf16LookupTableRow]>> = LazyLock::new(||
             square: evaluate_bf16_square(input),
             rsqrt: evaluate_bf16_rsqrt(input),
             exponential: evaluate_bf16_exponential(input),
+            gelu_new: evaluate_bf16_gelu_new(input),
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
@@ -172,6 +176,7 @@ pub enum Bf16UnaryOpcode {
     Square = BF16_LOOKUP_SQUARE,
     Rsqrt = BF16_LOOKUP_RSQRT,
     Exponential = BF16_LOOKUP_EXPONENTIAL,
+    GeluNew = BF16_LOOKUP_GELU_NEW,
 }
 
 impl Bf16UnaryOpcode {
@@ -209,6 +214,7 @@ impl Bf16UnaryWitness {
             Bf16UnaryOpcode::Square => bf16_square_lookup(input),
             Bf16UnaryOpcode::Rsqrt => bf16_rsqrt_lookup(input),
             Bf16UnaryOpcode::Exponential => bf16_exponential_lookup(input),
+            Bf16UnaryOpcode::GeluNew => bf16_gelu_new_lookup(input),
         };
         Self { opcode, input, output, lookup_row: input }
     }
@@ -710,6 +716,13 @@ pub fn bf16_exponential_lookup(input: u16) -> u16 {
     bf16_lookup_row(input).exponential
 }
 
+/// Look up GPT-2's tanh-approximated GELU of `input` as a raw BF16 encoding.
+#[must_use]
+#[inline]
+pub fn bf16_gelu_new_lookup(input: u16) -> u16 {
+    bf16_lookup_row(input).gelu_new
+}
+
 fn evaluate_bf16_init(raw: u16) -> Bf16CircuitValueInt {
     let sign = (raw >> 15) as u8;
     let biased_exponent = ((raw >> BF16_MANTISSA_BITS) & 0xff) as u8;
@@ -866,6 +879,18 @@ fn positive_f64_to_bf16_rtz(value: f64) -> u16 {
     low
 }
 
+/// Convert a real value to BF16 by rounding its magnitude toward zero.
+fn f64_to_bf16_rtz(value: f64) -> u16 {
+    const BF16_SIGN_MASK: u16 = 0x8000;
+    const BF16_POSITIVE_INFINITY: u16 = 0x7f80;
+
+    if value.is_nan() {
+        return BF16_POSITIVE_INFINITY;
+    }
+    let sign = if value.is_sign_negative() { BF16_SIGN_MASK } else { 0 };
+    sign | positive_f64_to_bf16_rtz(value.abs())
+}
+
 /// Pure table-generation implementation of the mathematical exponential rounded toward zero.
 ///
 /// `libm` supplies a deterministic software implementation. The conversion to BF16 is performed
@@ -885,6 +910,33 @@ fn evaluate_bf16_exponential(input: u16) -> u16 {
 
     let value = f64::from(f32::from_bits(u32::from(input) << BF16_BITS));
     positive_f64_to_bf16_rtz(libm::exp(value))
+}
+
+/// Pure table-generation implementation of GPT-2's `gelu_new` activation.
+///
+/// The complete tanh approximation is evaluated in deterministic software floating point and is
+/// rounded toward zero once at the raw-to-raw lookup boundary:
+/// `0.5 * x * (1 + tanh(sqrt(2 / pi) * (x + 0.044715 * x^3)))`.
+fn evaluate_bf16_gelu_new(input: u16) -> u16 {
+    const BF16_POSITIVE_INFINITY: u16 = 0x7f80;
+    const BF16_NEGATIVE_ZERO: u16 = 0x8000;
+    const SQRT_TWO_OVER_PI: f64 = 0.797_884_560_802_865_4;
+    const CUBIC_COEFFICIENT: f64 = 0.044_715;
+
+    let biased_exponent = (input >> BF16_MANTISSA_BITS) & 0xff;
+    let fraction = input & 0x7f;
+    if biased_exponent == 0xff {
+        if fraction != 0 {
+            return BF16_POSITIVE_INFINITY;
+        }
+        return if input >> 15 == 0 { BF16_POSITIVE_INFINITY } else { BF16_NEGATIVE_ZERO };
+    }
+
+    let value = f64::from(f32::from_bits(u32::from(input) << BF16_BITS));
+    let cubic = value * value * value;
+    let inner = SQRT_TWO_OVER_PI * (value + CUBIC_COEFFICIENT * cubic);
+    let output = 0.5 * value * (1.0 + libm::tanh(inner));
+    f64_to_bf16_rtz(output)
 }
 
 /// Look up the shared 16-bit column from the `VeriLLM` paper.
@@ -991,6 +1043,7 @@ mod tests {
             assert_eq!(row.square, evaluate_bf16_square(input));
             assert_eq!(row.rsqrt, evaluate_bf16_rsqrt(input));
             assert_eq!(row.exponential, evaluate_bf16_exponential(input));
+            assert_eq!(row.gelu_new, evaluate_bf16_gelu_new(input));
         }
     }
 
@@ -1110,6 +1163,30 @@ mod tests {
         assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Exponential, 0x7f80).output, 0x7f80);
         assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Exponential, 0xff80).output, 0x0000);
         assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Exponential, 0x7fc1).output, 0x7f80);
+    }
+
+    #[test]
+    fn gelu_new_is_finite_for_every_finite_input() {
+        for input in 0..=u16::MAX {
+            if evaluate_bf16_init(input).exponent == BF16_ABNORMAL_EXPONENT {
+                continue;
+            }
+            let output = evaluate_bf16_init(bf16_gelu_new_lookup(input));
+            assert_ne!(output.exponent, BF16_ABNORMAL_EXPONENT, "input={input:04x}");
+        }
+    }
+
+    #[test]
+    fn gelu_new_examples() {
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::GeluNew, 0x0000).output, 0x0000);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::GeluNew, 0x8000).output, 0x8000);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::GeluNew, 0x3f80).output, 0x3f57);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::GeluNew, 0xbf80).output, 0xbe22);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::GeluNew, 0x4000).output, 0x3ffa);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::GeluNew, 0xc000).output, 0xbd39);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::GeluNew, 0x7f80).output, 0x7f80);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::GeluNew, 0xff80).output, 0x8000);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::GeluNew, 0x7fc1).output, 0x7f80);
     }
 
     #[test]

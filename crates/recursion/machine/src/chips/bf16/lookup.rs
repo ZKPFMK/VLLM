@@ -8,8 +8,9 @@ use sp1_derive::AlignedBorrow;
 use sp1_hypercube::air::MachineAir;
 use sp1_recursion_executor::{
     bf16_i32_to_field, bf16_lookup_row, ExecutionRecord, RecursionProgram, BF16_LOOKUP_ADD,
-    BF16_LOOKUP_DIV, BF16_LOOKUP_EXPONENTIAL, BF16_LOOKUP_INIT, BF16_LOOKUP_MUL, BF16_LOOKUP_RSQRT,
-    BF16_LOOKUP_SHARED, BF16_LOOKUP_SQUARE, BF16_LOOKUP_TABLE_ROWS, NUM_BF16_LOOKUP_OPS,
+    BF16_LOOKUP_DIV, BF16_LOOKUP_EXPONENTIAL, BF16_LOOKUP_GELU_NEW, BF16_LOOKUP_INIT,
+    BF16_LOOKUP_MUL, BF16_LOOKUP_RSQRT, BF16_LOOKUP_SHARED, BF16_LOOKUP_SQUARE,
+    BF16_LOOKUP_TABLE_ROWS, NUM_BF16_LOOKUP_OPS,
 };
 
 use crate::builder::SP1RecursionAirBuilder;
@@ -36,6 +37,7 @@ pub struct Bf16LookupPreprocessedCols<T: Copy> {
     pub square: T,
     pub rsqrt: T,
     pub exponential: T,
+    pub gelu_new: T,
 }
 
 /// Multiplicities for every operation-specific BF16 lookup column.
@@ -112,6 +114,7 @@ impl<F: PrimeField32> MachineAir<F> for Bf16LookupChip {
                 square: F::from_canonical_u16(lookup.square),
                 rsqrt: F::from_canonical_u16(lookup.rsqrt),
                 exponential: F::from_canonical_u16(lookup.exponential),
+                gelu_new: F::from_canonical_u16(lookup.gelu_new),
             };
         }
     }
@@ -236,6 +239,14 @@ where
             AB::F::zero(),
             AB::F::zero(),
             local.multiplicities[BF16_LOOKUP_EXPONENTIAL as usize],
+        );
+        builder.receive_bf16_lookup(
+            AB::F::from_canonical_u8(BF16_LOOKUP_GELU_NEW),
+            table.input,
+            table.gelu_new,
+            AB::F::zero(),
+            AB::F::zero(),
+            local.multiplicities[BF16_LOOKUP_GELU_NEW as usize],
         );
         builder.receive_bf16_lookup(
             AB::F::from_canonical_u8(BF16_LOOKUP_DIV),

@@ -143,6 +143,8 @@ pub enum DslIr<C: Config> {
     Bf16Rsqrt(Felt<SP1Field>, Felt<SP1Field>),
     /// Computes the mathematical exponential of one raw 16-bit BF16 value with a direct lookup.
     Bf16Exponential(Felt<SP1Field>, Felt<SP1Field>),
+    /// Applies GPT-2's tanh-approximated GELU to one raw 16-bit BF16 value.
+    Bf16GeluNew(Felt<SP1Field>, Felt<SP1Field>),
     /// Divides two raw 16-bit BF16 values with Algorithm 2 from `VeriLLM`.
     Bf16Div(Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>),
     /// Adds two raw 16-bit BF16 values with Algorithm 3 from `VeriLLM`.

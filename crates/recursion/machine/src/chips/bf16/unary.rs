@@ -303,6 +303,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prove_bf16_gelu_new() {
+        type A = RecursionAir<SP1Field, 3, 2>;
+
+        let inputs = [
+            0x0000, 0x8000, 0x0001, 0x8001, 0x3f80, 0xbf80, 0x4000, 0xc000, 0x7f7f, 0xff7f, 0x7f80,
+            0xff80, 0x7fc1,
+        ];
+        let mut instructions = Vec::<Instruction<SP1Field>>::with_capacity(inputs.len() * 3);
+        for (index, input) in inputs.into_iter().enumerate() {
+            let output = Bf16UnaryWitness::new(Bf16UnaryOpcode::GeluNew, input).output;
+            let base = (index * 2) as u32;
+            instructions.extend([
+                instr::mem(MemAccessKind::Write, 1, base, input as u32),
+                instr::bf16_gelu_new(1, base + 1, base),
+                instr::mem(MemAccessKind::Read, 1, base + 1, output as u32),
+            ]);
+        }
+
+        let program = linear_program(instructions).unwrap();
+        let mut executor = Executor::<
+            SP1Field,
+            BinomialExtensionField<SP1Field, D>,
+            SP1DiffusionMatrix,
+        >::new(Arc::new(program.clone()), inner_perm());
+        executor.witness_stream = Vec::<Block<SP1Field>>::new().into();
+        executor.run().unwrap();
+
+        run_test_recursion(vec![executor.record], A::verillm_machine(), program).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn prove_bf16_softmax_pipeline() {
         type A = RecursionAir<SP1Field, 3, 2>;
 
