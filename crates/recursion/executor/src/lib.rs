@@ -271,6 +271,26 @@ pub struct Bf16MulInstr<F> {
 
 // -------------------------------------------------------------------------------------------------
 
+/// The input and output of a raw-to-raw unary BF16 operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(C)]
+pub struct Bf16UnaryIo<V> {
+    pub output: V,
+    pub input: V,
+}
+
+/// An instruction invoking an opcode-selected raw-to-raw BF16 lookup.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[repr(C)]
+pub struct Bf16UnaryInstr<F> {
+    pub opcode: Bf16UnaryOpcode,
+    pub addrs: Bf16UnaryIo<Address<F>>,
+    /// Multiplicity with which the output is consumed from recursion memory.
+    pub mult: F,
+}
+
+// -------------------------------------------------------------------------------------------------
+
 /// The inputs and output of a raw 16-bit BF16 division.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(C)]
@@ -690,6 +710,19 @@ where
                 let witness = Bf16MulWitness::new(lhs_raw as u16, rhs_raw as u16);
                 memory.mw_unchecked(output, Block::from(F::from_canonical_u16(witness.output.raw)));
                 UnsafeCell::raw_get(record.bf16_mul_events[offset].as_ptr())
+                    .write(witness.as_event());
+            }
+            Instruction::Bf16Unary(Bf16UnaryInstr {
+                opcode,
+                addrs: Bf16UnaryIo { output, input },
+                mult: _,
+            }) => {
+                let input_raw = memory.mr_unchecked(input).val[0].as_canonical_u32();
+                assert!(input_raw < (1 << BF16_BITS), "unary BF16 input is not a 16-bit value");
+
+                let witness = Bf16UnaryWitness::new(opcode, input_raw as u16);
+                memory.mw_unchecked(output, Block::from(F::from_canonical_u16(witness.output)));
+                UnsafeCell::raw_get(record.bf16_unary_events[offset].as_ptr())
                     .write(witness.as_event());
             }
             Instruction::Bf16Div(Bf16DivInstr {

@@ -13,7 +13,7 @@ use sp1_hypercube::{air::SP1AirBuilder, InteractionKind, MachineRecord, PROOF_MA
 use crate::{
     instruction::{HintBitsInstr, HintExt2FeltsInstr, HintInstr},
     public_values::RecursionPublicValues,
-    Bf16AddSubEvent, Bf16DivEvent, Bf16MulEvent, ExtFeltEvent, Instruction,
+    Bf16AddSubEvent, Bf16DivEvent, Bf16MulEvent, Bf16UnaryEvent, ExtFeltEvent, Instruction,
     Poseidon2LinearLayerEvent, Poseidon2SBoxEvent, PrefixSumChecksEvent,
 };
 
@@ -41,6 +41,7 @@ pub struct ExecutionRecord<F> {
     pub poseidon2_sbox_events: Vec<Poseidon2SBoxEvent<F>>,
     pub select_events: Vec<SelectEvent<F>>,
     pub bf16_mul_events: Vec<Bf16MulEvent<F>>,
+    pub bf16_unary_events: Vec<Bf16UnaryEvent<F>>,
     pub bf16_div_events: Vec<Bf16DivEvent<F>>,
     pub bf16_add_sub_events: Vec<Bf16AddSubEvent<F>>,
     pub prefix_sum_checks_events: Vec<PrefixSumChecksEvent<F>>,
@@ -63,6 +64,7 @@ pub struct UnsafeRecord<F> {
     pub poseidon2_sbox_events: Vec<MaybeUninit<UnsafeCell<Poseidon2SBoxEvent<F>>>>,
     pub select_events: Vec<MaybeUninit<UnsafeCell<SelectEvent<F>>>>,
     pub bf16_mul_events: Vec<MaybeUninit<UnsafeCell<Bf16MulEvent<F>>>>,
+    pub bf16_unary_events: Vec<MaybeUninit<UnsafeCell<Bf16UnaryEvent<F>>>>,
     pub bf16_div_events: Vec<MaybeUninit<UnsafeCell<Bf16DivEvent<F>>>>,
     pub bf16_add_sub_events: Vec<MaybeUninit<UnsafeCell<Bf16AddSubEvent<F>>>>,
     pub prefix_sum_checks_events: Vec<MaybeUninit<UnsafeCell<PrefixSumChecksEvent<F>>>>,
@@ -95,6 +97,7 @@ impl<F> UnsafeRecord<F> {
             poseidon2_sbox_events: std::mem::transmute(self.poseidon2_sbox_events),
             select_events: std::mem::transmute(self.select_events),
             bf16_mul_events: std::mem::transmute(self.bf16_mul_events),
+            bf16_unary_events: std::mem::transmute(self.bf16_unary_events),
             bf16_div_events: std::mem::transmute(self.bf16_div_events),
             bf16_add_sub_events: std::mem::transmute(self.bf16_add_sub_events),
             prefix_sum_checks_events: std::mem::transmute(self.prefix_sum_checks_events),
@@ -129,6 +132,7 @@ impl<F> UnsafeRecord<F> {
             poseidon2_sbox_events: create_uninit_vec(event_counts.poseidon2_sbox_events),
             select_events: create_uninit_vec(event_counts.select_events),
             bf16_mul_events: create_uninit_vec(event_counts.bf16_mul_events),
+            bf16_unary_events: create_uninit_vec(event_counts.bf16_unary_events),
             bf16_div_events: create_uninit_vec(event_counts.bf16_div_events),
             bf16_add_sub_events: create_uninit_vec(event_counts.bf16_add_sub_events),
             prefix_sum_checks_events: create_uninit_vec(event_counts.prefix_sum_checks_events),
@@ -152,6 +156,7 @@ impl<F: PrimeField32> MachineRecord for ExecutionRecord<F> {
             ("poseidon2_sbox_events", self.poseidon2_sbox_events.len()),
             ("select_events", self.select_events.len()),
             ("bf16_mul_events", self.bf16_mul_events.len()),
+            ("bf16_unary_events", self.bf16_unary_events.len()),
             ("bf16_div_events", self.bf16_div_events.len()),
             ("bf16_add_sub_events", self.bf16_add_sub_events.len()),
             ("prefix_sum_checks_events", self.prefix_sum_checks_events.len()),
@@ -178,6 +183,7 @@ impl<F: PrimeField32> MachineRecord for ExecutionRecord<F> {
             poseidon2_sbox_events,
             select_events,
             bf16_mul_events,
+            bf16_unary_events,
             bf16_div_events,
             bf16_add_sub_events,
             prefix_sum_checks_events,
@@ -193,6 +199,7 @@ impl<F: PrimeField32> MachineRecord for ExecutionRecord<F> {
         poseidon2_sbox_events.append(&mut other.poseidon2_sbox_events);
         select_events.append(&mut other.select_events);
         bf16_mul_events.append(&mut other.bf16_mul_events);
+        bf16_unary_events.append(&mut other.bf16_unary_events);
         bf16_div_events.append(&mut other.bf16_div_events);
         bf16_add_sub_events.append(&mut other.bf16_add_sub_events);
         prefix_sum_checks_events.append(&mut other.prefix_sum_checks_events);
@@ -241,6 +248,7 @@ pub struct RecursionAirEventCount {
     pub poseidon2_sbox_events: usize,
     pub select_events: usize,
     pub bf16_mul_events: usize,
+    pub bf16_unary_events: usize,
     pub bf16_div_events: usize,
     pub bf16_add_sub_events: usize,
     pub prefix_sum_checks_events: usize,
@@ -260,6 +268,7 @@ impl<F> AddAssign<&Instruction<F>> for RecursionAirEventCount {
             Instruction::Poseidon2SBox(_) => self.poseidon2_sbox_events += 1,
             Instruction::Select(_) => self.select_events += 1,
             Instruction::Bf16Mul(_) => self.bf16_mul_events += 1,
+            Instruction::Bf16Unary(_) => self.bf16_unary_events += 1,
             Instruction::Bf16Div(_) => self.bf16_div_events += 1,
             Instruction::Bf16AddSub(_) => self.bf16_add_sub_events += 1,
             Instruction::Hint(HintInstr { output_addrs_mults })

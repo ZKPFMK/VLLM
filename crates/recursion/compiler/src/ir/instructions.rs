@@ -137,6 +137,10 @@ pub enum DslIr<C: Config> {
 
     /// Multiplies two raw 16-bit BF16 values with the `VeriLLM` recursion chip.
     Bf16Mul(Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>),
+    /// Squares one raw 16-bit BF16 value with a direct lookup.
+    Bf16Square(Felt<SP1Field>, Felt<SP1Field>),
+    /// Computes the reciprocal square root of one raw 16-bit BF16 value with a direct lookup.
+    Bf16Rsqrt(Felt<SP1Field>, Felt<SP1Field>),
     /// Divides two raw 16-bit BF16 values with Algorithm 2 from `VeriLLM`.
     Bf16Div(Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>),
     /// Adds two raw 16-bit BF16 values with Algorithm 3 from `VeriLLM`.

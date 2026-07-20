@@ -27,6 +27,7 @@ pub enum Instruction<F> {
     Hint(HintInstr<F>),
     DebugBacktrace(Backtrace),
     Bf16Mul(Bf16MulInstr<F>),
+    Bf16Unary(Bf16UnaryInstr<F>),
     Bf16Div(Bf16DivInstr<F>),
     Bf16AddSub(Bf16AddSubInstr<F>),
 }
@@ -75,6 +76,9 @@ impl<F: Copy> Instruction<F> {
             Instruction::Bf16Mul(Bf16MulInstr {
                 addrs: Bf16MulIo { output, lhs, rhs }, ..
             }) => (svec![lhs, rhs], svec![output]),
+            Instruction::Bf16Unary(Bf16UnaryInstr {
+                addrs: Bf16UnaryIo { output, input }, ..
+            }) => (svec![input], svec![output]),
             Instruction::Bf16Div(Bf16DivInstr {
                 addrs: Bf16DivIo { output, lhs, rhs }, ..
             }) => (svec![lhs, rhs], svec![output]),
@@ -296,6 +300,30 @@ pub fn bf16_mul<F: AbstractField>(mult: u32, output: u32, lhs: u32, rhs: u32) ->
             output: Address(F::from_canonical_u32(output)),
             lhs: Address(F::from_canonical_u32(lhs)),
             rhs: Address(F::from_canonical_u32(rhs)),
+        },
+        mult: F::from_canonical_u32(mult),
+    })
+}
+
+/// Construct a raw 16-bit BF16 square instruction.
+pub fn bf16_square<F: AbstractField>(mult: u32, output: u32, input: u32) -> Instruction<F> {
+    Instruction::Bf16Unary(Bf16UnaryInstr {
+        opcode: Bf16UnaryOpcode::Square,
+        addrs: Bf16UnaryIo {
+            output: Address(F::from_canonical_u32(output)),
+            input: Address(F::from_canonical_u32(input)),
+        },
+        mult: F::from_canonical_u32(mult),
+    })
+}
+
+/// Construct a raw 16-bit BF16 reciprocal-square-root instruction.
+pub fn bf16_rsqrt<F: AbstractField>(mult: u32, output: u32, input: u32) -> Instruction<F> {
+    Instruction::Bf16Unary(Bf16UnaryInstr {
+        opcode: Bf16UnaryOpcode::Rsqrt,
+        addrs: Bf16UnaryIo {
+            output: Address(F::from_canonical_u32(output)),
+            input: Address(F::from_canonical_u32(input)),
         },
         mult: F::from_canonical_u32(mult),
     })

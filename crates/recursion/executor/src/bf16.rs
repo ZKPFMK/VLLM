@@ -33,8 +33,12 @@ pub const BF16_LOOKUP_MUL: u8 = 2;
 pub const BF16_LOOKUP_DIV: u8 = 3;
 /// Lookup opcode for BF16 mantissa addition and normalization.
 pub const BF16_LOOKUP_ADD: u8 = 4;
+/// Lookup opcode for squaring a raw BF16 value.
+pub const BF16_LOOKUP_SQUARE: u8 = 5;
+/// Lookup opcode for the reciprocal square root of a raw BF16 value.
+pub const BF16_LOOKUP_RSQRT: u8 = 6;
 /// Number of lookup operations currently supplied by the BF16 table.
-pub const NUM_BF16_LOOKUP_OPS: usize = 5;
+pub const NUM_BF16_LOOKUP_OPS: usize = 7;
 
 /// Prefix used by the shared lookup for `Round`.
 pub const BF16_ROUND_PREFIX: u16 = 0x4000;
@@ -130,6 +134,8 @@ pub struct Bf16LookupTableRow {
     pub mul: u16,
     pub div: u16,
     pub add: u16,
+    pub square: u16,
+    pub rsqrt: u16,
 }
 
 /// The BF16 lookup table is generated once and shared by witness and trace generation.
@@ -141,6 +147,8 @@ static BF16_LOOKUP_TABLE: LazyLock<Box<[Bf16LookupTableRow]>> = LazyLock::new(||
             mul: evaluate_bf16_mul(input),
             div: evaluate_bf16_div(input),
             add: evaluate_bf16_add(input),
+            square: evaluate_bf16_square(input),
+            rsqrt: evaluate_bf16_rsqrt(input),
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
@@ -151,6 +159,63 @@ static BF16_LOOKUP_TABLE: LazyLock<Box<[Bf16LookupTableRow]>> = LazyLock::new(||
 #[inline]
 pub fn bf16_lookup_row(input: u16) -> &'static Bf16LookupTableRow {
     &BF16_LOOKUP_TABLE[input as usize]
+}
+
+/// Opcode for a raw-to-raw unary BF16 lookup instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum Bf16UnaryOpcode {
+    Square = BF16_LOOKUP_SQUARE,
+    Rsqrt = BF16_LOOKUP_RSQRT,
+}
+
+impl Bf16UnaryOpcode {
+    #[must_use]
+    pub const fn lookup_opcode(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Complete event for one raw-to-raw unary BF16 lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(C)]
+pub struct Bf16UnaryEvent<F> {
+    pub opcode: Bf16UnaryOpcode,
+    pub input: F,
+    pub output: F,
+    /// The lookup-table row, equal to the raw input encoding.
+    pub lookup_row: u16,
+}
+
+/// Integer witness produced by a raw-to-raw unary BF16 table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bf16UnaryWitness {
+    pub opcode: Bf16UnaryOpcode,
+    pub input: u16,
+    pub output: u16,
+    pub lookup_row: u16,
+}
+
+impl Bf16UnaryWitness {
+    /// Execute one raw-to-raw unary BF16 lookup.
+    #[must_use]
+    pub fn new(opcode: Bf16UnaryOpcode, input: u16) -> Self {
+        let output = match opcode {
+            Bf16UnaryOpcode::Square => bf16_square_lookup(input),
+            Bf16UnaryOpcode::Rsqrt => bf16_rsqrt_lookup(input),
+        };
+        Self { opcode, input, output, lookup_row: input }
+    }
+
+    #[must_use]
+    pub fn as_event<F: AbstractField>(self) -> Bf16UnaryEvent<F> {
+        Bf16UnaryEvent {
+            opcode: self.opcode,
+            input: F::from_canonical_u16(self.input),
+            output: F::from_canonical_u16(self.output),
+            lookup_row: self.lookup_row,
+        }
+    }
 }
 
 /// Rows queried by one BF16 multiplication event.
@@ -618,6 +683,20 @@ pub fn bf16_add_lookup(input: u16) -> u16 {
     bf16_lookup_row(input).add
 }
 
+/// Look up the raw BF16 encoding of `input * input`.
+#[must_use]
+#[inline]
+pub fn bf16_square_lookup(input: u16) -> u16 {
+    bf16_lookup_row(input).square
+}
+
+/// Look up the raw BF16 encoding of `1 / sqrt(input)`.
+#[must_use]
+#[inline]
+pub fn bf16_rsqrt_lookup(input: u16) -> u16 {
+    bf16_lookup_row(input).rsqrt
+}
+
 fn evaluate_bf16_init(raw: u16) -> Bf16CircuitValueInt {
     let sign = (raw >> 15) as u8;
     let biased_exponent = ((raw >> BF16_MANTISSA_BITS) & 0xff) as u8;
@@ -675,6 +754,69 @@ fn evaluate_bf16_add(input: u16) -> u16 {
     let normalization_shift = 2 * BF16_MANTISSA_BITS + 1 - floor_log2;
     let normalized = ((input as u32) << normalization_shift) >> (BF16_MANTISSA_BITS + 1);
     ((normalization_shift << (BF16_MANTISSA_BITS + 1)) | normalized) as u16
+}
+
+/// Pure table-generation implementation of `input * input`.
+///
+/// This deliberately uses the evaluator functions directly instead of [`Bf16MulWitness`], because
+/// the witness reads this same lazily initialized table.
+fn evaluate_bf16_square(input: u16) -> u16 {
+    let value = evaluate_bf16_init(input);
+
+    let mul_row = (value.mantissa << 8) | value.mantissa;
+    let product = evaluate_bf16_mul(mul_row);
+    let carry = evaluate_bf16_shared(bf16_encode_rshift(1, product)) as u8;
+    let normalized_mantissa = product - (1 << (BF16_MANTISSA_BITS + 1)) * carry as u16;
+
+    let intermediate_exponent = value.exponent * 2 + carry as i32;
+    let output_exponent = evaluate_bf16_shared(bf16_encode_exp(intermediate_exponent));
+    let clamp = evaluate_bf16_shared(bf16_encode_clamp(intermediate_exponent)) as u16;
+    let output_mantissa =
+        evaluate_bf16_shared(bf16_encode_round(clamp, normalized_mantissa)) as u16;
+
+    // Squaring always clears the sign because the multiplication chip computes sign XOR sign.
+    Bf16CircuitValueInt::encode(0, output_exponent, output_mantissa)
+}
+
+/// Pure table-generation implementation of `1 / sqrt(input)` rounded toward zero to BF16.
+///
+/// Layer normalization only queries positive finite inputs. Zero, negative, and abnormal inputs
+/// are mapped to the canonical abnormal value so the lookup remains a total 16-bit function.
+/// For a positive finite value `x = m * 2^(e - 7)`, the returned normalized mantissa `n` is the
+/// largest integer satisfying `n^2 * m <= 2^(21 - 2f - e)`, where `f` is the output exponent.
+/// This computes the exact BF16 round-toward-zero result without an intermediate host float.
+fn evaluate_bf16_rsqrt(input: u16) -> u16 {
+    let value = evaluate_bf16_init(input);
+    if value.sign != 0
+        || value.exponent == BF16_ZERO_EXPONENT
+        || value.exponent == BF16_ABNORMAL_EXPONENT
+    {
+        return Bf16CircuitValueInt::encode(0, BF16_ABNORMAL_EXPONENT, 0);
+    }
+
+    let exponent = value.exponent;
+    let output_exponent = if exponent % 2 == 0 {
+        -exponent / 2 - i32::from(value.mantissa != 1 << BF16_MANTISSA_BITS)
+    } else {
+        -(exponent + 1) / 2
+    };
+    let bound_exponent = 21 - 2 * output_exponent - exponent;
+    debug_assert!((21..=23).contains(&bound_exponent));
+    let bound = 1_u32 << bound_exponent;
+    let input_mantissa = u32::from(value.mantissa);
+
+    let mut low = 1_u16 << BF16_MANTISSA_BITS;
+    let mut high = 1_u16 << (BF16_MANTISSA_BITS + 1);
+    while low + 1 < high {
+        let candidate = low + (high - low) / 2;
+        if u32::from(candidate).pow(2) * input_mantissa <= bound {
+            low = candidate;
+        } else {
+            high = candidate;
+        }
+    }
+
+    Bf16CircuitValueInt::encode(0, output_exponent, low)
 }
 
 /// Look up the shared 16-bit column from the `VeriLLM` paper.
@@ -778,6 +920,19 @@ mod tests {
             assert_eq!(row.mul, evaluate_bf16_mul(input));
             assert_eq!(row.div, evaluate_bf16_div(input));
             assert_eq!(row.add, evaluate_bf16_add(input));
+            assert_eq!(row.square, evaluate_bf16_square(input));
+            assert_eq!(row.rsqrt, evaluate_bf16_rsqrt(input));
+        }
+    }
+
+    #[test]
+    fn square_table_matches_multiplication_for_every_input() {
+        for input in 0..=u16::MAX {
+            assert_eq!(
+                Bf16UnaryWitness::new(Bf16UnaryOpcode::Square, input).output,
+                Bf16MulWitness::new(input, input).output.raw,
+                "BF16 square mismatch for {input:04x}"
+            );
         }
     }
 
@@ -802,6 +957,51 @@ mod tests {
         assert_eq!(Bf16MulWitness::new(0x0001, 0x3f80).output.raw, 0x0001);
         // Overflow is represented canonically as infinity.
         assert_eq!(Bf16MulWitness::new(0x7f7f, 0x4000).output.raw, 0x7f80);
+    }
+
+    #[test]
+    fn square_examples() {
+        // 1.5^2 = 2.25.
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Square, 0x3fc0).output, 0x4010);
+        // Squaring clears the sign.
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Square, 0xc000).output, 0x4080);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Square, 0x8000).output, 0x0000);
+    }
+
+    #[test]
+    fn rsqrt_rounds_toward_zero_for_every_positive_finite_input() {
+        for input in 0..=u16::MAX {
+            let value = evaluate_bf16_init(input);
+            if value.sign != 0
+                || value.exponent == BF16_ZERO_EXPONENT
+                || value.exponent == BF16_ABNORMAL_EXPONENT
+            {
+                continue;
+            }
+
+            let output = evaluate_bf16_init(bf16_rsqrt_lookup(input));
+            assert_eq!(output.sign, 0);
+            assert_ne!(output.exponent, BF16_ZERO_EXPONENT);
+            assert_ne!(output.exponent, BF16_ABNORMAL_EXPONENT);
+
+            let bound_exponent = 21 - 2 * output.exponent - value.exponent;
+            let bound = 1_u32 << bound_exponent;
+            let input_mantissa = u32::from(value.mantissa);
+            let output_mantissa = u32::from(output.mantissa);
+            assert!(output_mantissa.pow(2) * input_mantissa <= bound);
+            assert!((output_mantissa + 1).pow(2) * input_mantissa > bound);
+        }
+    }
+
+    #[test]
+    fn rsqrt_examples() {
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Rsqrt, 0x3f80).output, 0x3f80);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Rsqrt, 0x4080).output, 0x3f00);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Rsqrt, 0x3e80).output, 0x4000);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Rsqrt, 0x4000).output, 0x3f35);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Rsqrt, 0x0000).output, 0x7f80);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Rsqrt, 0xbf80).output, 0x7f80);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Rsqrt, 0x7f80).output, 0x7f80);
     }
 
     #[test]

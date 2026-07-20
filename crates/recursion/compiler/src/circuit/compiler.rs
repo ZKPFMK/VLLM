@@ -388,6 +388,24 @@ where
     }
 
     #[inline(always)]
+    fn bf16_square(&mut self, dst: impl Reg, input: impl Reg) -> Instruction<SP1Field> {
+        Instruction::Bf16Unary(Bf16UnaryInstr {
+            opcode: Bf16UnaryOpcode::Square,
+            addrs: Bf16UnaryIo { output: dst.write(self), input: input.read(self) },
+            mult: SP1Field::zero(),
+        })
+    }
+
+    #[inline(always)]
+    fn bf16_rsqrt(&mut self, dst: impl Reg, input: impl Reg) -> Instruction<SP1Field> {
+        Instruction::Bf16Unary(Bf16UnaryInstr {
+            opcode: Bf16UnaryOpcode::Rsqrt,
+            addrs: Bf16UnaryIo { output: dst.write(self), input: input.read(self) },
+            mult: SP1Field::zero(),
+        })
+    }
+
+    #[inline(always)]
     fn bf16_div(&mut self, dst: impl Reg, lhs: impl Reg, rhs: impl Reg) -> Instruction<SP1Field> {
         Instruction::Bf16Div(Bf16DivInstr {
             addrs: Bf16DivIo { output: dst.write(self), lhs: lhs.read(self), rhs: rhs.read(self) },
@@ -603,6 +621,8 @@ where
 
             DslIr::Select(bit, dst1, dst2, lhs, rhs) => f(self.select(bit, dst1, dst2, lhs, rhs)),
             DslIr::Bf16Mul(dst, lhs, rhs) => f(self.bf16_mul(dst, lhs, rhs)),
+            DslIr::Bf16Square(dst, input) => f(self.bf16_square(dst, input)),
+            DslIr::Bf16Rsqrt(dst, input) => f(self.bf16_rsqrt(dst, input)),
             DslIr::Bf16Div(dst, lhs, rhs) => f(self.bf16_div(dst, lhs, rhs)),
             DslIr::Bf16Add(dst, lhs, rhs) => {
                 f(self.bf16_add_sub(Bf16AddSubOpcode::Add, dst, lhs, rhs))
@@ -805,6 +825,11 @@ where
                     addrs: Bf16MulIo { output: ref addr, .. },
                     mult,
                 }) => backfill((mult, addr)),
+                Instruction::Bf16Unary(Bf16UnaryInstr {
+                    addrs: Bf16UnaryIo { output: ref addr, .. },
+                    mult,
+                    ..
+                }) => backfill((mult, addr)),
                 Instruction::Bf16Div(Bf16DivInstr {
                     addrs: Bf16DivIo { output: ref addr, .. },
                     mult,
@@ -936,6 +961,7 @@ const fn instr_name<F>(instr: &Instruction<F>) -> &'static str {
         Instruction::Poseidon2SBox(_) => "Poseidon2SBox",
         Instruction::Select(_) => "Select",
         Instruction::Bf16Mul(_) => "Bf16Mul",
+        Instruction::Bf16Unary(_) => "Bf16Unary",
         Instruction::Bf16Div(_) => "Bf16Div",
         Instruction::Bf16AddSub(_) => "Bf16AddSub",
         Instruction::HintBits(_) => "HintBits",

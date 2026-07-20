@@ -8,8 +8,8 @@ use sp1_derive::AlignedBorrow;
 use sp1_hypercube::air::MachineAir;
 use sp1_recursion_executor::{
     bf16_i32_to_field, bf16_lookup_row, ExecutionRecord, RecursionProgram, BF16_LOOKUP_ADD,
-    BF16_LOOKUP_DIV, BF16_LOOKUP_INIT, BF16_LOOKUP_MUL, BF16_LOOKUP_SHARED, BF16_LOOKUP_TABLE_ROWS,
-    NUM_BF16_LOOKUP_OPS,
+    BF16_LOOKUP_DIV, BF16_LOOKUP_INIT, BF16_LOOKUP_MUL, BF16_LOOKUP_RSQRT, BF16_LOOKUP_SHARED,
+    BF16_LOOKUP_SQUARE, BF16_LOOKUP_TABLE_ROWS, NUM_BF16_LOOKUP_OPS,
 };
 
 use crate::builder::SP1RecursionAirBuilder;
@@ -33,9 +33,11 @@ pub struct Bf16LookupPreprocessedCols<T: Copy> {
     pub mul: T,
     pub div: T,
     pub add: T,
+    pub square: T,
+    pub rsqrt: T,
 }
 
-/// Multiplicities for the initialization, shared, and multiplication columns.
+/// Multiplicities for every operation-specific BF16 lookup column.
 #[derive(AlignedBorrow, Debug, Clone, Copy)]
 #[repr(C)]
 pub struct Bf16LookupCols<T: Copy> {
@@ -106,6 +108,8 @@ impl<F: PrimeField32> MachineAir<F> for Bf16LookupChip {
                 mul: F::from_canonical_u16(lookup.mul),
                 div: F::from_canonical_u16(lookup.div),
                 add: F::from_canonical_u16(lookup.add),
+                square: F::from_canonical_u16(lookup.square),
+                rsqrt: F::from_canonical_u16(lookup.rsqrt),
             };
         }
     }
@@ -141,6 +145,9 @@ impl<F: PrimeField32> MachineAir<F> for Bf16LookupChip {
                 increment(BF16_LOOKUP_SHARED, row);
             }
             increment(BF16_LOOKUP_MUL, event.lookup_rows.mul);
+        }
+        for event in &input.bf16_unary_events {
+            increment(event.opcode.lookup_opcode(), event.lookup_row);
         }
         for event in &input.bf16_div_events {
             for row in event.lookup_rows.init {
@@ -203,6 +210,22 @@ where
             AB::F::zero(),
             AB::F::zero(),
             local.multiplicities[BF16_LOOKUP_MUL as usize],
+        );
+        builder.receive_bf16_lookup(
+            AB::F::from_canonical_u8(BF16_LOOKUP_SQUARE),
+            table.input,
+            table.square,
+            AB::F::zero(),
+            AB::F::zero(),
+            local.multiplicities[BF16_LOOKUP_SQUARE as usize],
+        );
+        builder.receive_bf16_lookup(
+            AB::F::from_canonical_u8(BF16_LOOKUP_RSQRT),
+            table.input,
+            table.rsqrt,
+            AB::F::zero(),
+            AB::F::zero(),
+            local.multiplicities[BF16_LOOKUP_RSQRT as usize],
         );
         builder.receive_bf16_lookup(
             AB::F::from_canonical_u8(BF16_LOOKUP_DIV),

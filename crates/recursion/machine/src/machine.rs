@@ -7,7 +7,7 @@ use sp1_recursion_executor::{ExecutionRecord, RecursionAirEventCount, RecursionP
 use crate::chips::{
     alu_base::{BaseAluChip, NUM_BASE_ALU_ENTRIES_PER_ROW},
     alu_ext::{ExtAluChip, NUM_EXT_ALU_ENTRIES_PER_ROW},
-    bf16::{Bf16AddSubChip, Bf16DivChip, Bf16LookupChip, Bf16MulChip},
+    bf16::{Bf16AddSubChip, Bf16DivChip, Bf16LookupChip, Bf16MulChip, Bf16UnaryChip},
     mem::{constant::NUM_CONST_MEM_ENTRIES_PER_ROW, MemoryConstChip, MemoryVarChip},
     poseidon2_helper::{
         convert::{ConvertChip, NUM_CONVERT_ENTRIES_PER_ROW},
@@ -46,6 +46,7 @@ pub enum RecursionAir<
     PublicValues(PublicValuesChip),
     Bf16Lookup(Bf16LookupChip),
     Bf16Mul(Bf16MulChip),
+    Bf16Unary(Bf16UnaryChip),
     Bf16Div(Bf16DivChip),
     Bf16AddSub(Bf16AddSubChip),
 }
@@ -82,6 +83,7 @@ impl<
             RecursionAir::Select(SelectChip),
             RecursionAir::Bf16Lookup(Bf16LookupChip),
             RecursionAir::Bf16Mul(Bf16MulChip),
+            RecursionAir::Bf16Unary(Bf16UnaryChip),
             RecursionAir::Bf16Div(Bf16DivChip),
             RecursionAir::Bf16AddSub(Bf16AddSubChip),
             RecursionAir::PublicValues(PublicValuesChip),
@@ -128,6 +130,7 @@ impl<
             RecursionAir::Select(SelectChip),
             RecursionAir::Bf16Lookup(Bf16LookupChip),
             RecursionAir::Bf16Mul(Bf16MulChip),
+            RecursionAir::Bf16Unary(Bf16UnaryChip),
             RecursionAir::Bf16Div(Bf16DivChip),
             RecursionAir::Bf16AddSub(Bf16AddSubChip),
             RecursionAir::PublicValues(PublicValuesChip),
