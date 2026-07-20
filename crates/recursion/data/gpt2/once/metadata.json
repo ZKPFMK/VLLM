@@ -1,0 +1,32 @@
+{
+  "format_version": 1,
+  "model_type": "gpt2",
+  "prompt": "once",
+  "input_ids": [
+    27078
+  ],
+  "tokens": [
+    "once"
+  ],
+  "stage": "token_embedding_plus_position_embedding",
+  "huggingface_hidden_states_index": 0,
+  "transformer_block_input": 0,
+  "dropout_active": false,
+  "dtype": "bfloat16",
+  "shape": [
+    1,
+    1,
+    768
+  ],
+  "flatten_order": "row-major",
+  "value_encoding": "IEEE 754 BF16 raw bits as one uppercase hex u16 per line",
+  "values_file": "hidden_state.bf16.hex",
+  "values_count": 768,
+  "values_sha256": "3b9224134fb5036633098d5073a248c69bf617273b71f3489db1a0970e811070",
+  "model_config_sha256": "21f90413c03910ecfeae6b4e234055c7ecea9310d405077cccfc8ab03318f30b",
+  "model_weights_sha256": "dd9fbcf547ff508105084f76d13253a1da49bda3062d6c82904cd0825feac2cc",
+  "tokenizer_sha256": "8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6",
+  "torch_version": "2.12.1",
+  "transformers_version": "5.14.1",
+  "device": "cpu"
+}
