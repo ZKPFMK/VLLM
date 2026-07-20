@@ -64,6 +64,22 @@ impl<C: Config> Builder<C> {
         output
     }
 
+    /// Compute a non-empty BF16 dot product, rounding every multiplication and addition toward
+    /// zero before the next operation consumes it.
+    ///
+    /// Products are accumulated strictly from left to right.
+    pub fn bf16_dot(&mut self, lhs: &[Felt<SP1Field>], rhs: &[Felt<SP1Field>]) -> Felt<SP1Field> {
+        assert!(!lhs.is_empty(), "BF16 dot product requires at least one value");
+        assert_eq!(lhs.len(), rhs.len(), "BF16 dot product length mismatch");
+
+        let mut sum = self.bf16_mul(lhs[0], rhs[0]);
+        for (&lhs, &rhs) in lhs[1..].iter().zip(&rhs[1..]) {
+            let product = self.bf16_mul(lhs, rhs);
+            sum = self.bf16_add(sum, product);
+        }
+        sum
+    }
+
     /// Compute the mean of a non-empty BF16 vector.
     ///
     /// Values are added from left to right, and the final sum is divided by the BF16 encoding of
@@ -172,6 +188,15 @@ mod tests {
     fn reference_bf16_mean(values: &[u16]) -> u16 {
         let sum = values[1..].iter().fold(values[0], |sum, &value| reference_bf16_add(sum, value));
         Bf16DivWitness::new(sum, usize_to_bf16_raw(values.len())).output.raw
+    }
+
+    fn reference_bf16_dot(lhs: &[u16], rhs: &[u16]) -> u16 {
+        let mut sum = Bf16MulWitness::new(lhs[0], rhs[0]).output.raw;
+        for (&lhs, &rhs) in lhs[1..].iter().zip(&rhs[1..]) {
+            let product = Bf16MulWitness::new(lhs, rhs).output.raw;
+            sum = reference_bf16_add(sum, product);
+        }
+        sum
     }
 
     fn reference_bf16_layer_norm(
@@ -292,6 +317,35 @@ mod tests {
     }
 
     #[test]
+    fn compiles_and_executes_bf16_dot() {
+        let raw_lhs = [0x3f80, 0x4000, 0xbf00];
+        let raw_rhs = [0x4000, 0xbf80, 0x4080];
+        let expected = reference_bf16_dot(&raw_lhs, &raw_rhs);
+        assert_eq!(expected, 0xc000);
+
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let lhs = raw_lhs
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let rhs = raw_rhs
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let output = builder.bf16_dot(&lhs, &rhs);
+        builder.assert_felt_eq(output, SP1Field::from_canonical_u16(expected));
+
+        let mut compiler = AsmCompiler::default();
+        let program =
+            Arc::new(compiler.compile_inner(builder.into_root_block()).validate().unwrap());
+        let mut executor =
+            Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
+        executor.run().unwrap();
+        assert_eq!(executor.record.bf16_mul_events.len(), raw_lhs.len());
+        assert_eq!(executor.record.bf16_add_sub_events.len(), raw_lhs.len() - 1);
+    }
+
+    #[test]
     fn compiles_and_executes_bf16_mean() {
         let raw_values = gpt2_once_hidden_state();
         assert_eq!(raw_values.len(), 768);
@@ -391,5 +445,20 @@ mod tests {
     fn rejects_empty_bf16_mean() {
         let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
         builder.bf16_mean(&[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "BF16 dot product requires at least one value")]
+    fn rejects_empty_bf16_dot() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        builder.bf16_dot(&[], &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "BF16 dot product length mismatch")]
+    fn rejects_mismatched_bf16_dot() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let value = builder.constant(SP1Field::zero());
+        builder.bf16_dot(&[value], &[]);
     }
 }
