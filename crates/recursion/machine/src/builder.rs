@@ -7,8 +7,8 @@ use sp1_hypercube::{
     InteractionKind,
 };
 use sp1_recursion_executor::{
-    Address, Block, BF16_LOOKUP_ADD, BF16_LOOKUP_DIV, BF16_LOOKUP_INIT, BF16_LOOKUP_MUL,
-    BF16_LOOKUP_RSQRT, BF16_LOOKUP_SHARED, BF16_LOOKUP_SQUARE, BF16_LSHIFT_PREFIX,
+    Address, Block, BF16_LOOKUP_ADD, BF16_LOOKUP_DIV, BF16_LOOKUP_EXPONENTIAL, BF16_LOOKUP_INIT,
+    BF16_LOOKUP_MUL, BF16_LOOKUP_RSQRT, BF16_LOOKUP_SHARED, BF16_LOOKUP_SQUARE, BF16_LSHIFT_PREFIX,
     BF16_MANTISSA_BITS, BF16_ROUND_PREFIX, BF16_RSHIFT_PREFIX,
 };
 
@@ -126,6 +126,26 @@ pub trait RecursionAirBuilder: BaseAirBuilder {
     {
         self.send_bf16_lookup(
             Self::Expr::from_canonical_u8(BF16_LOOKUP_RSQRT),
+            input,
+            output,
+            Self::Expr::zero(),
+            Self::Expr::zero(),
+            mult,
+        );
+    }
+
+    /// Look up the raw BF16 result of the mathematical exponential of `input`.
+    fn send_bf16_exponential<Input, Output>(
+        &mut self,
+        input: Input,
+        output: Output,
+        mult: impl Into<Self::Expr>,
+    ) where
+        Input: Into<Self::Expr>,
+        Output: Into<Self::Expr>,
+    {
+        self.send_bf16_lookup(
+            Self::Expr::from_canonical_u8(BF16_LOOKUP_EXPONENTIAL),
             input,
             output,
             Self::Expr::zero(),

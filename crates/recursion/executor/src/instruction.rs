@@ -329,6 +329,18 @@ pub fn bf16_rsqrt<F: AbstractField>(mult: u32, output: u32, input: u32) -> Instr
     })
 }
 
+/// Construct a raw 16-bit BF16 mathematical-exponential instruction.
+pub fn bf16_exponential<F: AbstractField>(mult: u32, output: u32, input: u32) -> Instruction<F> {
+    Instruction::Bf16Unary(Bf16UnaryInstr {
+        opcode: Bf16UnaryOpcode::Exponential,
+        addrs: Bf16UnaryIo {
+            output: Address(F::from_canonical_u32(output)),
+            input: Address(F::from_canonical_u32(input)),
+        },
+        mult: F::from_canonical_u32(mult),
+    })
+}
+
 /// Construct a raw 16-bit BF16 division instruction.
 pub fn bf16_div<F: AbstractField>(mult: u32, output: u32, lhs: u32, rhs: u32) -> Instruction<F> {
     Instruction::Bf16Div(Bf16DivInstr {

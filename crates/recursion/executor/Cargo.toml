@@ -20,6 +20,7 @@ tracing = { workspace = true }
 sp1-hypercube = { workspace = true }
 hashbrown = { workspace = true, features = ["serde"] }
 itertools = { workspace = true }
+libm = { workspace = true }
 serde = { workspace = true, features = ["derive", "rc"] }
 backtrace = { workspace = true, features = ["serde"] }
 static_assertions = { workspace = true }

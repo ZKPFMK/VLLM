@@ -37,8 +37,10 @@ pub const BF16_LOOKUP_ADD: u8 = 4;
 pub const BF16_LOOKUP_SQUARE: u8 = 5;
 /// Lookup opcode for the reciprocal square root of a raw BF16 value.
 pub const BF16_LOOKUP_RSQRT: u8 = 6;
+/// Lookup opcode for the mathematical exponential of a raw BF16 value.
+pub const BF16_LOOKUP_EXPONENTIAL: u8 = 7;
 /// Number of lookup operations currently supplied by the BF16 table.
-pub const NUM_BF16_LOOKUP_OPS: usize = 7;
+pub const NUM_BF16_LOOKUP_OPS: usize = 8;
 
 /// Prefix used by the shared lookup for `Round`.
 pub const BF16_ROUND_PREFIX: u16 = 0x4000;
@@ -136,6 +138,7 @@ pub struct Bf16LookupTableRow {
     pub add: u16,
     pub square: u16,
     pub rsqrt: u16,
+    pub exponential: u16,
 }
 
 /// The BF16 lookup table is generated once and shared by witness and trace generation.
@@ -149,6 +152,7 @@ static BF16_LOOKUP_TABLE: LazyLock<Box<[Bf16LookupTableRow]>> = LazyLock::new(||
             add: evaluate_bf16_add(input),
             square: evaluate_bf16_square(input),
             rsqrt: evaluate_bf16_rsqrt(input),
+            exponential: evaluate_bf16_exponential(input),
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
@@ -167,6 +171,7 @@ pub fn bf16_lookup_row(input: u16) -> &'static Bf16LookupTableRow {
 pub enum Bf16UnaryOpcode {
     Square = BF16_LOOKUP_SQUARE,
     Rsqrt = BF16_LOOKUP_RSQRT,
+    Exponential = BF16_LOOKUP_EXPONENTIAL,
 }
 
 impl Bf16UnaryOpcode {
@@ -203,6 +208,7 @@ impl Bf16UnaryWitness {
         let output = match opcode {
             Bf16UnaryOpcode::Square => bf16_square_lookup(input),
             Bf16UnaryOpcode::Rsqrt => bf16_rsqrt_lookup(input),
+            Bf16UnaryOpcode::Exponential => bf16_exponential_lookup(input),
         };
         Self { opcode, input, output, lookup_row: input }
     }
@@ -697,6 +703,13 @@ pub fn bf16_rsqrt_lookup(input: u16) -> u16 {
     bf16_lookup_row(input).rsqrt
 }
 
+/// Look up the raw BF16 encoding of the mathematical exponential of `input`.
+#[must_use]
+#[inline]
+pub fn bf16_exponential_lookup(input: u16) -> u16 {
+    bf16_lookup_row(input).exponential
+}
+
 fn evaluate_bf16_init(raw: u16) -> Bf16CircuitValueInt {
     let sign = (raw >> 15) as u8;
     let biased_exponent = ((raw >> BF16_MANTISSA_BITS) & 0xff) as u8;
@@ -819,6 +832,61 @@ fn evaluate_bf16_rsqrt(input: u16) -> u16 {
     Bf16CircuitValueInt::encode(0, output_exponent, low)
 }
 
+/// Convert a nonnegative finite real value to BF16 by rounding toward zero.
+///
+/// Positive finite BF16 encodings are monotonically ordered, so a binary search avoids an
+/// intermediate round-to-nearest `f32` conversion. Values larger than the maximum finite BF16
+/// value follow the arithmetic chips' overflow policy and map to positive infinity.
+fn positive_f64_to_bf16_rtz(value: f64) -> u16 {
+    const BF16_POSITIVE_INFINITY: u16 = 0x7f80;
+    const BF16_MAX_FINITE: u16 = 0x7f7f;
+
+    if !value.is_finite() {
+        return BF16_POSITIVE_INFINITY;
+    }
+    if value <= 0.0 {
+        return 0;
+    }
+
+    let bf16_to_f64 = |raw: u16| f64::from(f32::from_bits(u32::from(raw) << BF16_BITS));
+    if value > bf16_to_f64(BF16_MAX_FINITE) {
+        return BF16_POSITIVE_INFINITY;
+    }
+
+    let mut low = 0_u16;
+    let mut high = BF16_POSITIVE_INFINITY;
+    while low + 1 < high {
+        let middle = low + (high - low) / 2;
+        if bf16_to_f64(middle) <= value {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    low
+}
+
+/// Pure table-generation implementation of the mathematical exponential rounded toward zero.
+///
+/// `libm` supplies a deterministic software implementation. The conversion to BF16 is performed
+/// separately by [`positive_f64_to_bf16_rtz`] so host `f32` round-to-nearest is never observable.
+/// NaNs use the canonical abnormal value shared by the VeriLLM representation.
+fn evaluate_bf16_exponential(input: u16) -> u16 {
+    const BF16_POSITIVE_INFINITY: u16 = 0x7f80;
+
+    let biased_exponent = (input >> BF16_MANTISSA_BITS) & 0xff;
+    let fraction = input & 0x7f;
+    if biased_exponent == 0xff {
+        if fraction != 0 {
+            return BF16_POSITIVE_INFINITY;
+        }
+        return if input >> 15 == 0 { BF16_POSITIVE_INFINITY } else { 0 };
+    }
+
+    let value = f64::from(f32::from_bits(u32::from(input) << BF16_BITS));
+    positive_f64_to_bf16_rtz(libm::exp(value))
+}
+
 /// Look up the shared 16-bit column from the `VeriLLM` paper.
 #[must_use]
 #[inline]
@@ -922,6 +990,7 @@ mod tests {
             assert_eq!(row.add, evaluate_bf16_add(input));
             assert_eq!(row.square, evaluate_bf16_square(input));
             assert_eq!(row.rsqrt, evaluate_bf16_rsqrt(input));
+            assert_eq!(row.exponential, evaluate_bf16_exponential(input));
         }
     }
 
@@ -1002,6 +1071,45 @@ mod tests {
         assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Rsqrt, 0x0000).output, 0x7f80);
         assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Rsqrt, 0xbf80).output, 0x7f80);
         assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Rsqrt, 0x7f80).output, 0x7f80);
+    }
+
+    #[test]
+    fn exponential_rounds_toward_zero_for_every_finite_input() {
+        const BF16_MAX_FINITE: u16 = 0x7f7f;
+
+        let bf16_to_f64 = |raw: u16| f64::from(f32::from_bits(u32::from(raw) << BF16_BITS));
+        for input in 0..=u16::MAX {
+            let initialized = evaluate_bf16_init(input);
+            if initialized.exponent == BF16_ABNORMAL_EXPONENT {
+                continue;
+            }
+
+            let input_value = bf16_to_f64(input);
+            let exact = libm::exp(input_value);
+            let output = bf16_exponential_lookup(input);
+            if !exact.is_finite() || exact > bf16_to_f64(BF16_MAX_FINITE) {
+                assert_eq!(output, 0x7f80);
+                continue;
+            }
+
+            assert!(bf16_to_f64(output) <= exact);
+            if output < BF16_MAX_FINITE {
+                assert!(bf16_to_f64(output + 1) > exact);
+            }
+        }
+    }
+
+    #[test]
+    fn exponential_examples() {
+        // e^0 = 1, while nontrivial results are rounded toward zero to BF16.
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Exponential, 0x0000).output, 0x3f80);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Exponential, 0x3f80).output, 0x402d);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Exponential, 0xbf80).output, 0x3ebc);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Exponential, 0x4000).output, 0x40ec);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Exponential, 0xc000).output, 0x3e0a);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Exponential, 0x7f80).output, 0x7f80);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Exponential, 0xff80).output, 0x0000);
+        assert_eq!(Bf16UnaryWitness::new(Bf16UnaryOpcode::Exponential, 0x7fc1).output, 0x7f80);
     }
 
     #[test]

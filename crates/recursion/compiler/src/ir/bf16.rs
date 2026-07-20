@@ -40,6 +40,13 @@ impl<C: Config> Builder<C> {
         output
     }
 
+    /// Compute the mathematical exponential of one raw BF16 encoding with a single lookup.
+    pub fn bf16_exponential(&mut self, input: Felt<SP1Field>) -> Felt<SP1Field> {
+        let output = self.uninit();
+        self.push_op(DslIr::Bf16Exponential(output, input));
+        output
+    }
+
     /// Divide two raw 16-bit BF16 encodings using Algorithm 2 from `VeriLLM`.
     ///
     /// Both operands and the returned value are stored as `Felt<SP1Field>`, but the BF16 lookup
@@ -78,6 +85,119 @@ impl<C: Config> Builder<C> {
             sum = self.bf16_add(sum, product);
         }
         sum
+    }
+
+    /// Apply a BF16 linear transformation with a bias.
+    ///
+    /// `weight` is a row-major `[input_features, output_features]` matrix, matching the layout of
+    /// GPT-2's `Conv1D` weights. Each output dot product is accumulated from left to right, and
+    /// every multiplication and addition rounds toward zero before its result is reused.
+    pub fn bf16_linear(
+        &mut self,
+        input: &[Felt<SP1Field>],
+        weight: &[Felt<SP1Field>],
+        bias: &[Felt<SP1Field>],
+    ) -> Vec<Felt<SP1Field>> {
+        assert!(!input.is_empty(), "BF16 linear requires at least one input feature");
+        assert!(!bias.is_empty(), "BF16 linear requires at least one output feature");
+
+        let output_features = bias.len();
+        let expected_weight_len = input
+            .len()
+            .checked_mul(output_features)
+            .expect("BF16 linear weight dimensions overflow");
+        assert_eq!(weight.len(), expected_weight_len, "BF16 linear weight shape mismatch");
+
+        let mut output = Vec::with_capacity(output_features);
+        for output_index in 0..output_features {
+            let column = weight
+                .chunks_exact(output_features)
+                .map(|row| row[output_index])
+                .collect::<Vec<_>>();
+            let dot = self.bf16_dot(input, &column);
+            output.push(self.bf16_add(dot, bias[output_index]));
+        }
+        output
+    }
+
+    /// Split one GPT-2 QKV projection into query, key, and value heads.
+    ///
+    /// The input layout is `[Q, K, V]`, with each section laid out as
+    /// `[num_heads, head_dimension]`. This only rearranges existing circuit variables and therefore
+    /// emits no instructions or lookup events.
+    pub fn bf16_split_qkv_heads(
+        &self,
+        qkv: &[Felt<SP1Field>],
+        num_heads: usize,
+    ) -> (Vec<Vec<Felt<SP1Field>>>, Vec<Vec<Felt<SP1Field>>>, Vec<Vec<Felt<SP1Field>>>) {
+        assert!(!qkv.is_empty(), "BF16 QKV split requires at least one value");
+        assert!(num_heads > 0, "BF16 QKV split requires at least one head");
+        assert_eq!(qkv.len() % 3, 0, "BF16 QKV length must be divisible by three");
+
+        let hidden_size = qkv.len() / 3;
+        assert_eq!(
+            hidden_size % num_heads,
+            0,
+            "BF16 QKV hidden size must be divisible by head count"
+        );
+        let head_dimension = hidden_size / num_heads;
+        let (query, key_value) = qkv.split_at(hidden_size);
+        let (key, value) = key_value.split_at(hidden_size);
+        let split_heads = |values: &[Felt<SP1Field>]| {
+            values.chunks_exact(head_dimension).map(<[Felt<SP1Field>]>::to_vec).collect::<Vec<_>>()
+        };
+
+        (split_heads(query), split_heads(key), split_heads(value))
+    }
+
+    /// Compute one scaled BF16 attention score: `(query dot key) * scale`.
+    ///
+    /// For GPT-2 with a head dimension of 64, `scale` is the raw BF16 value `0x3e00` (`1/8`).
+    pub fn bf16_scaled_attention_score(
+        &mut self,
+        query: &[Felt<SP1Field>],
+        key: &[Felt<SP1Field>],
+        scale: Felt<SP1Field>,
+    ) -> Felt<SP1Field> {
+        let dot = self.bf16_dot(query, key);
+        self.bf16_mul(dot, scale)
+    }
+
+    /// Compute the scaled attention scores for one query head against a flattened key cache.
+    ///
+    /// `keys` has row-major layout `[key_count, head_dimension]`. Autoregressive inference can pass
+    /// only past and current keys, making every returned score causally visible without a mask.
+    pub fn bf16_attention_scores(
+        &mut self,
+        query: &[Felt<SP1Field>],
+        keys: &[Felt<SP1Field>],
+        scale: Felt<SP1Field>,
+    ) -> Vec<Felt<SP1Field>> {
+        assert!(!query.is_empty(), "BF16 attention scores require a non-empty query");
+        assert!(!keys.is_empty(), "BF16 attention scores require at least one key");
+        assert_eq!(keys.len() % query.len(), 0, "BF16 attention key cache shape mismatch");
+
+        keys.chunks_exact(query.len())
+            .map(|key| self.bf16_scaled_attention_score(query, key, scale))
+            .collect()
+    }
+
+    /// Compute a basic BF16 softmax, rounding every intermediate operation toward zero.
+    ///
+    /// Exponential values and their left-to-right sum remain in BF16. This version deliberately
+    /// does not subtract the maximum score; a numerically stable softmax will additionally require
+    /// a constrained BF16 comparison/maximum operation.
+    pub fn bf16_softmax(&mut self, values: &[Felt<SP1Field>]) -> Vec<Felt<SP1Field>> {
+        assert!(!values.is_empty(), "BF16 softmax requires at least one value");
+
+        let exponential_values =
+            values.iter().map(|&value| self.bf16_exponential(value)).collect::<Vec<_>>();
+        let mut sum = exponential_values[0];
+        for &value in &exponential_values[1..] {
+            sum = self.bf16_add(sum, value);
+        }
+
+        exponential_values.into_iter().map(|value| self.bf16_div(value, sum)).collect()
     }
 
     /// Compute the mean of a non-empty BF16 vector.
@@ -199,6 +319,39 @@ mod tests {
         sum
     }
 
+    fn reference_bf16_linear(input: &[u16], weight: &[u16], bias: &[u16]) -> Vec<u16> {
+        let output_features = bias.len();
+        (0..output_features)
+            .map(|output_index| {
+                let column = weight
+                    .chunks_exact(output_features)
+                    .map(|row| row[output_index])
+                    .collect::<Vec<_>>();
+                let dot = reference_bf16_dot(input, &column);
+                reference_bf16_add(dot, bias[output_index])
+            })
+            .collect()
+    }
+
+    fn reference_bf16_scaled_attention_score(query: &[u16], key: &[u16], scale: u16) -> u16 {
+        let dot = reference_bf16_dot(query, key);
+        Bf16MulWitness::new(dot, scale).output.raw
+    }
+
+    fn reference_bf16_softmax(values: &[u16]) -> Vec<u16> {
+        let exponential_values = values
+            .iter()
+            .map(|&value| Bf16UnaryWitness::new(Bf16UnaryOpcode::Exponential, value).output)
+            .collect::<Vec<_>>();
+        let sum = exponential_values[1..]
+            .iter()
+            .fold(exponential_values[0], |sum, &value| reference_bf16_add(sum, value));
+        exponential_values
+            .into_iter()
+            .map(|value| Bf16DivWitness::new(value, sum).output.raw)
+            .collect()
+    }
+
     fn reference_bf16_layer_norm(
         values: &[u16],
         weight: &[u16],
@@ -281,6 +434,23 @@ mod tests {
     }
 
     #[test]
+    fn compiles_and_executes_bf16_exponential() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let input: Felt<_> = builder.constant(SP1Field::from_canonical_u16(0xbf80));
+        let output = builder.bf16_exponential(input);
+        builder.assert_felt_eq(output, SP1Field::from_canonical_u16(0x3ebc));
+
+        let mut compiler = AsmCompiler::default();
+        let program =
+            Arc::new(compiler.compile_inner(builder.into_root_block()).validate().unwrap());
+        let mut executor =
+            Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
+        executor.run().unwrap();
+        assert_eq!(executor.record.bf16_unary_events.len(), 1);
+        assert_eq!(executor.record.bf16_unary_events[0].opcode, Bf16UnaryOpcode::Exponential);
+    }
+
+    #[test]
     fn compiles_and_executes_bf16_div() {
         let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
         let lhs: Felt<_> = builder.constant(SP1Field::from_canonical_u16(0x4040));
@@ -343,6 +513,123 @@ mod tests {
         executor.run().unwrap();
         assert_eq!(executor.record.bf16_mul_events.len(), raw_lhs.len());
         assert_eq!(executor.record.bf16_add_sub_events.len(), raw_lhs.len() - 1);
+    }
+
+    #[test]
+    fn compiles_and_executes_bf16_linear() {
+        let raw_input = [0x3f80, 0x4000];
+        let raw_weight = [
+            0x3f80, 0x4000, 0xbf80, // input feature 0
+            0x4040, 0xbf80, 0x3f00, // input feature 1
+        ];
+        let raw_bias = [0x3f00, 0x3f80, 0xc000];
+        let expected = reference_bf16_linear(&raw_input, &raw_weight, &raw_bias);
+        assert_eq!(expected, [0x40f0, 0x3f80, 0xc000]);
+
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let input = raw_input
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let weight = raw_weight
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let bias = raw_bias
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let output = builder.bf16_linear(&input, &weight, &bias);
+        assert_eq!(output.len(), expected.len());
+        for (&output, &expected) in output.iter().zip(&expected) {
+            builder.assert_felt_eq(output, SP1Field::from_canonical_u16(expected));
+        }
+
+        let mut compiler = AsmCompiler::default();
+        let program =
+            Arc::new(compiler.compile_inner(builder.into_root_block()).validate().unwrap());
+        let mut executor =
+            Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
+        executor.run().unwrap();
+        assert_eq!(executor.record.bf16_mul_events.len(), raw_input.len() * raw_bias.len());
+        assert_eq!(executor.record.bf16_add_sub_events.len(), raw_input.len() * raw_bias.len());
+    }
+
+    #[test]
+    fn compiles_and_executes_bf16_attention_scores() {
+        let raw_qkv = [
+            0x3f80, 0x4000, 0x4040, 0x4080, // query heads
+            0x3f00, 0xbf80, 0x4000, 0x3e80, // key heads
+            0x40a0, 0x40c0, 0x40e0, 0x4100, // value heads
+        ];
+        let raw_scale = 0x3f00;
+        let expected = [
+            reference_bf16_scaled_attention_score(&raw_qkv[0..2], &raw_qkv[4..6], raw_scale),
+            reference_bf16_scaled_attention_score(&raw_qkv[0..2], &raw_qkv[6..8], raw_scale),
+        ];
+        assert_eq!(expected, [0xbf40, 0x3fa0]);
+
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let qkv = raw_qkv
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let scale = builder.constant(SP1Field::from_canonical_u16(raw_scale));
+        let (query, key, value) = builder.bf16_split_qkv_heads(&qkv, 2);
+        assert_eq!(query.len(), 2);
+        assert_eq!(key.len(), 2);
+        assert_eq!(value.len(), 2);
+        assert!(query.iter().chain(&key).chain(&value).all(|head| head.len() == 2));
+
+        let key_cache = key.into_iter().flatten().collect::<Vec<_>>();
+        let scores = builder.bf16_attention_scores(&query[0], &key_cache, scale);
+        assert_eq!(scores.len(), expected.len());
+        for (&score, &expected) in scores.iter().zip(&expected) {
+            builder.assert_felt_eq(score, SP1Field::from_canonical_u16(expected));
+        }
+        builder.assert_felt_eq(value[1][1], SP1Field::from_canonical_u16(raw_qkv[11]));
+
+        let mut compiler = AsmCompiler::default();
+        let program =
+            Arc::new(compiler.compile_inner(builder.into_root_block()).validate().unwrap());
+        let mut executor =
+            Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
+        executor.run().unwrap();
+        assert_eq!(executor.record.bf16_mul_events.len(), 6);
+        assert_eq!(executor.record.bf16_add_sub_events.len(), 2);
+    }
+
+    #[test]
+    fn compiles_and_executes_bf16_softmax() {
+        let raw_values = [0xbf80, 0x0000];
+        let expected = reference_bf16_softmax(&raw_values);
+        assert_eq!(expected, [0x3e89, 0x3f3b]);
+
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let values = raw_values
+            .iter()
+            .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+            .collect::<Vec<_>>();
+        let output = builder.bf16_softmax(&values);
+        assert_eq!(output.len(), expected.len());
+        for (&output, &expected) in output.iter().zip(&expected) {
+            builder.assert_felt_eq(output, SP1Field::from_canonical_u16(expected));
+        }
+
+        let mut compiler = AsmCompiler::default();
+        let program =
+            Arc::new(compiler.compile_inner(builder.into_root_block()).validate().unwrap());
+        let mut executor =
+            Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
+        executor.run().unwrap();
+        assert_eq!(executor.record.bf16_unary_events.len(), raw_values.len());
+        assert!(executor
+            .record
+            .bf16_unary_events
+            .iter()
+            .all(|event| event.opcode == Bf16UnaryOpcode::Exponential));
+        assert_eq!(executor.record.bf16_add_sub_events.len(), raw_values.len() - 1);
+        assert_eq!(executor.record.bf16_div_events.len(), raw_values.len());
     }
 
     #[test]
@@ -460,5 +747,53 @@ mod tests {
         let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
         let value = builder.constant(SP1Field::zero());
         builder.bf16_dot(&[value], &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "BF16 linear requires at least one input feature")]
+    fn rejects_empty_bf16_linear_input() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let bias = builder.constant(SP1Field::zero());
+        builder.bf16_linear(&[], &[], &[bias]);
+    }
+
+    #[test]
+    #[should_panic(expected = "BF16 linear requires at least one output feature")]
+    fn rejects_empty_bf16_linear_output() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let input = builder.constant(SP1Field::zero());
+        builder.bf16_linear(&[input], &[], &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "BF16 linear weight shape mismatch")]
+    fn rejects_mismatched_bf16_linear_weight() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let input = builder.constant(SP1Field::zero());
+        let bias = builder.constant(SP1Field::zero());
+        builder.bf16_linear(&[input], &[], &[bias]);
+    }
+
+    #[test]
+    #[should_panic(expected = "BF16 QKV hidden size must be divisible by head count")]
+    fn rejects_mismatched_bf16_qkv_heads() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let value = builder.constant(SP1Field::zero());
+        builder.bf16_split_qkv_heads(&[value; 6], 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "BF16 attention key cache shape mismatch")]
+    fn rejects_mismatched_bf16_attention_key_cache() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let value = builder.constant(SP1Field::zero());
+        builder.bf16_attention_scores(&[value; 2], &[value; 3], value);
+    }
+
+    #[test]
+    #[should_panic(expected = "BF16 softmax requires at least one value")]
+    fn rejects_empty_bf16_softmax() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        builder.bf16_softmax(&[]);
     }
 }

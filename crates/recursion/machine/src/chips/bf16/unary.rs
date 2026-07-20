@@ -271,4 +271,63 @@ mod tests {
 
         run_test_recursion(vec![executor.record], A::verillm_machine(), program).await.unwrap();
     }
+
+    #[tokio::test]
+    async fn prove_bf16_exponential() {
+        type A = RecursionAir<SP1Field, 3, 2>;
+
+        let inputs = [
+            0x0000, 0x8000, 0x3f80, 0xbf80, 0x4000, 0xc000, 0x42b2, 0xc2d0, 0x7f80, 0xff80, 0x7fc1,
+        ];
+        let mut instructions = Vec::<Instruction<SP1Field>>::with_capacity(inputs.len() * 3);
+        for (index, input) in inputs.into_iter().enumerate() {
+            let output = Bf16UnaryWitness::new(Bf16UnaryOpcode::Exponential, input).output;
+            let base = (index * 2) as u32;
+            instructions.extend([
+                instr::mem(MemAccessKind::Write, 1, base, input as u32),
+                instr::bf16_exponential(1, base + 1, base),
+                instr::mem(MemAccessKind::Read, 1, base + 1, output as u32),
+            ]);
+        }
+
+        let program = linear_program(instructions).unwrap();
+        let mut executor = Executor::<
+            SP1Field,
+            BinomialExtensionField<SP1Field, D>,
+            SP1DiffusionMatrix,
+        >::new(Arc::new(program.clone()), inner_perm());
+        executor.witness_stream = Vec::<Block<SP1Field>>::new().into();
+        executor.run().unwrap();
+
+        run_test_recursion(vec![executor.record], A::verillm_machine(), program).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prove_bf16_softmax_pipeline() {
+        type A = RecursionAir<SP1Field, 3, 2>;
+
+        // softmax([-1, 0]) = [0x3e89, 0x3f3b] with BF16 round-toward-zero after every step.
+        let instructions = vec![
+            instr::mem(MemAccessKind::Write, 1, 0, 0xbf80),
+            instr::mem(MemAccessKind::Write, 1, 1, 0x0000),
+            instr::bf16_exponential(2, 2, 0),
+            instr::bf16_exponential(2, 3, 1),
+            instr::bf16_add(2, 4, 2, 3),
+            instr::bf16_div(1, 5, 2, 4),
+            instr::bf16_div(1, 6, 3, 4),
+            instr::mem(MemAccessKind::Read, 1, 5, 0x3e89),
+            instr::mem(MemAccessKind::Read, 1, 6, 0x3f3b),
+        ];
+
+        let program = linear_program(instructions).unwrap();
+        let mut executor = Executor::<
+            SP1Field,
+            BinomialExtensionField<SP1Field, D>,
+            SP1DiffusionMatrix,
+        >::new(Arc::new(program.clone()), inner_perm());
+        executor.witness_stream = Vec::<Block<SP1Field>>::new().into();
+        executor.run().unwrap();
+
+        run_test_recursion(vec![executor.record], A::verillm_machine(), program).await.unwrap();
+    }
 }

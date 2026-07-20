@@ -56,10 +56,13 @@ fn main() {
         .iter()
         .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
         .collect::<Vec<Felt<_>>>();
-    let bias = builder.constant(SP1Field::from_canonical_u16(bias[0]));
-    let dot = builder.bf16_dot(&input, &weight);
-    let output = builder.bf16_add(dot, bias);
-    builder.print_f(output);
+    let bias = bias
+        .iter()
+        .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
+        .collect::<Vec<Felt<_>>>();
+    let output = builder.bf16_linear(&input, &weight, &bias);
+    assert_eq!(output.len(), 1);
+    builder.print_f(output[0]);
 
     let mut compiler = AsmCompiler::default();
     let program = Arc::new(compiler.compile_inner(builder.into_root_block()).validate().unwrap());
