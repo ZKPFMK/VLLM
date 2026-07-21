@@ -14,6 +14,7 @@ use crate::builder::SP1RecursionAirBuilder;
 
 use super::MemoryAccessCols;
 
+/// Number of independent constant-memory events stored in one trace row.
 pub const NUM_CONST_MEM_ENTRIES_PER_ROW: usize = 1;
 
 #[derive(Default, Clone)]
@@ -120,6 +121,11 @@ impl<F: PrimeField32> MachineAir<F> for MemoryConstChip<F> {
                     NUM_MEM_PREPROCESSED_INIT_COLS,
                 )
             };
+            // The final real row can contain fewer than `NUM_CONST_MEM_ENTRIES_PER_ROW` events.
+            // Zero it first so every unused lane has zero address, value, and multiplicity.
+            unsafe {
+                core::ptr::write_bytes(values.as_mut_ptr(), 0, values.len());
+            }
             let cols: &mut MemoryConstPreprocessedCols<_> = values.borrow_mut();
             for (cell, access) in zip(&mut cols.values_and_accesses, row_vs_as) {
                 *cell = access;
@@ -129,7 +135,7 @@ impl<F: PrimeField32> MachineAir<F> for MemoryConstChip<F> {
 
         let padded_nb_rows = self.preprocessed_num_rows_with_instrs_len(program, nb_rows).unwrap();
 
-        // NOTE: this is safe since there are always a single event per row.
+        // Zero all fully padded rows after the final real row.
         unsafe {
             let padding_start = nb_rows * NUM_MEM_PREPROCESSED_INIT_COLS;
             let padding_size = padded_nb_rows * NUM_MEM_PREPROCESSED_INIT_COLS - padding_start;

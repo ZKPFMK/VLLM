@@ -1,5 +1,5 @@
 use core::borrow::Borrow;
-use std::{borrow::BorrowMut, mem::MaybeUninit};
+use std::{borrow::BorrowMut, iter::zip, mem::MaybeUninit};
 
 use slop_air::{Air, BaseAir, PairBuilder};
 use slop_algebra::{AbstractField, Field, PrimeField32};
@@ -16,14 +16,26 @@ use sp1_recursion_executor::{
 
 use crate::builder::SP1RecursionAirBuilder;
 
+/// Number of independent BF16 addition/subtraction events stored in one trace row.
+pub const NUM_BF16_ADD_SUB_EVENTS_PER_ROW: usize = 12;
+
 pub const BF16_ADD_SUB_COLS: usize = core::mem::size_of::<Bf16AddSubCols<u8>>();
+pub const BF16_ADD_SUB_VALUE_COLS: usize = core::mem::size_of::<Bf16AddSubValueCols<u8>>();
 pub const BF16_ADD_SUB_PREPROCESSED_COLS: usize =
     core::mem::size_of::<Bf16AddSubPreprocessedCols<u8>>();
+pub const BF16_ADD_SUB_ACCESS_COLS: usize = core::mem::size_of::<Bf16AddSubAccessCols<u8>>();
 
 /// Main trace columns shared by Algorithm 3 addition and subtraction.
 #[derive(AlignedBorrow, Debug, Clone, Copy)]
 #[repr(C)]
 pub struct Bf16AddSubCols<T: Copy> {
+    pub values: [Bf16AddSubValueCols<T>; NUM_BF16_ADD_SUB_EVENTS_PER_ROW],
+}
+
+/// Main trace columns for one Algorithm 3 addition or subtraction.
+#[derive(AlignedBorrow, Debug, Clone, Copy)]
+#[repr(C)]
+pub struct Bf16AddSubValueCols<T: Copy> {
     pub lhs: Bf16CircuitValue<T>,
     pub rhs: Bf16CircuitValue<T>,
     pub output: Bf16CircuitValue<T>,
@@ -49,6 +61,13 @@ pub struct Bf16AddSubCols<T: Copy> {
 #[derive(AlignedBorrow, Debug, Clone, Copy)]
 #[repr(C)]
 pub struct Bf16AddSubPreprocessedCols<T: Copy> {
+    pub accesses: [Bf16AddSubAccessCols<T>; NUM_BF16_ADD_SUB_EVENTS_PER_ROW],
+}
+
+/// Program columns for one BF16 addition/subtraction event.
+#[derive(AlignedBorrow, Debug, Clone, Copy)]
+#[repr(C)]
+pub struct Bf16AddSubAccessCols<T: Copy> {
     pub is_real: T,
     /// Zero for addition and one for subtraction.
     pub op_code: T,
@@ -92,7 +111,8 @@ impl<F: PrimeField32> MachineAir<F> for Bf16AddSubChip {
         instrs_len: usize,
     ) -> Option<usize> {
         let height = program.shape.as_ref().and_then(|shape| shape.height(self));
-        Some(next_multiple_of_32(instrs_len, height))
+        let rows = instrs_len.div_ceil(NUM_BF16_ADD_SUB_EVENTS_PER_ROW);
+        Some(next_multiple_of_32(rows, height))
     }
 
     fn generate_preprocessed_trace_into(
@@ -123,7 +143,7 @@ impl<F: PrimeField32> MachineAir<F> for Bf16AddSubChip {
             )
         };
         unsafe {
-            let padding_start = instructions.len() * BF16_ADD_SUB_PREPROCESSED_COLS;
+            let padding_start = instructions.len() * BF16_ADD_SUB_ACCESS_COLS;
             core::ptr::write_bytes(
                 values[padding_start..].as_mut_ptr(),
                 0,
@@ -131,27 +151,27 @@ impl<F: PrimeField32> MachineAir<F> for Bf16AddSubChip {
             );
         }
 
-        let populated = instructions.len() * BF16_ADD_SUB_PREPROCESSED_COLS;
-        values[..populated]
-            .par_chunks_mut(BF16_ADD_SUB_PREPROCESSED_COLS)
-            .zip_eq(instructions)
-            .for_each(|(row, instruction)| {
+        let populated = instructions.len() * BF16_ADD_SUB_ACCESS_COLS;
+        values[..populated].par_chunks_mut(BF16_ADD_SUB_ACCESS_COLS).zip_eq(instructions).for_each(
+            |(row, instruction)| {
                 let Bf16AddSubInstr { opcode, addrs, mult } = instruction;
-                let cols: &mut Bf16AddSubPreprocessedCols<F> = row.borrow_mut();
-                *cols = Bf16AddSubPreprocessedCols {
+                let cols: &mut Bf16AddSubAccessCols<F> = row.borrow_mut();
+                *cols = Bf16AddSubAccessCols {
                     is_real: F::one(),
                     op_code: F::from_canonical_u8(opcode.as_u8()),
                     addrs: *addrs,
                     mult: *mult,
                 };
-            });
+            },
+        );
     }
 
     fn generate_dependencies(&self, _input: &Self::Record, _output: &mut Self::Record) {}
 
     fn num_rows(&self, input: &Self::Record) -> Option<usize> {
         let height = input.program.shape.as_ref().and_then(|shape| shape.height(self));
-        Some(next_multiple_of_32(input.bf16_add_sub_events.len(), height))
+        let rows = input.bf16_add_sub_events.len().div_ceil(NUM_BF16_ADD_SUB_EVENTS_PER_ROW);
+        Some(next_multiple_of_32(rows, height))
     }
 
     fn generate_trace_into(
@@ -172,7 +192,7 @@ impl<F: PrimeField32> MachineAir<F> for Bf16AddSubChip {
             core::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut F, rows * BF16_ADD_SUB_COLS)
         };
         unsafe {
-            let padding_start = events.len() * BF16_ADD_SUB_COLS;
+            let padding_start = events.len() * BF16_ADD_SUB_VALUE_COLS;
             core::ptr::write_bytes(
                 values[padding_start..].as_mut_ptr(),
                 0,
@@ -180,11 +200,11 @@ impl<F: PrimeField32> MachineAir<F> for Bf16AddSubChip {
             );
         }
 
-        let populated = events.len() * BF16_ADD_SUB_COLS;
-        values[..populated].par_chunks_mut(BF16_ADD_SUB_COLS).zip_eq(events).for_each(
+        let populated = events.len() * BF16_ADD_SUB_VALUE_COLS;
+        values[..populated].par_chunks_mut(BF16_ADD_SUB_VALUE_COLS).zip_eq(events).for_each(
             |(row, event)| {
-                let cols: &mut Bf16AddSubCols<F> = row.borrow_mut();
-                *cols = Bf16AddSubCols {
+                let cols: &mut Bf16AddSubValueCols<F> = row.borrow_mut();
+                *cols = Bf16AddSubValueCols {
                     lhs: event.lhs,
                     rhs: event.rhs,
                     output: event.output,
@@ -236,132 +256,141 @@ where
         let zero_exponent = bf16_i32_to_field::<AB::F>(BF16_ZERO_EXPONENT);
         let min_normal_exponent = bf16_i32_to_field::<AB::F>(BF16_MIN_NORMAL_EXPONENT);
 
-        builder.assert_bool(program.op_code);
-        builder.receive_single(program.addrs.lhs, local.lhs.raw, program.is_real);
-        builder.receive_single(program.addrs.rhs, local.rhs.raw, program.is_real);
+        for (local, program) in zip(local.values, program.accesses) {
+            builder.assert_bool(program.op_code);
+            builder.receive_single(program.addrs.lhs, local.lhs.raw, program.is_real);
+            builder.receive_single(program.addrs.rhs, local.rhs.raw, program.is_real);
 
-        builder.send_bf16_init(
-            local.lhs.raw,
-            local.lhs.sign,
-            local.lhs.exponent,
-            local.lhs.mantissa,
-            program.is_real,
-        );
-        builder.send_bf16_init(
-            local.rhs.raw,
-            local.rhs.sign,
-            local.rhs.exponent,
-            local.rhs.mantissa,
-            program.is_real,
-        );
+            builder.send_bf16_init(
+                local.lhs.raw,
+                local.lhs.sign,
+                local.lhs.exponent,
+                local.lhs.mantissa,
+                program.is_real,
+            );
+            builder.send_bf16_init(
+                local.rhs.raw,
+                local.rhs.sign,
+                local.rhs.exponent,
+                local.rhs.mantissa,
+                program.is_real,
+            );
 
-        // Subtraction reuses the addition algorithm after flipping only the right sign.
-        builder.assert_eq(
-            local.effective_rhs_sign,
-            local.rhs.sign + program.op_code - local.rhs.sign * program.op_code * two,
-        );
+            // Subtraction reuses the addition algorithm after flipping only the right sign.
+            builder.assert_eq(
+                local.effective_rhs_sign,
+                local.rhs.sign + program.op_code - local.rhs.sign * program.op_code * two,
+            );
 
-        // t_e := RShift(3, 2^10 + (e_rhs - e_lhs - 1)).
-        builder.send_bf16_rshift(
-            3,
-            local.rhs.exponent - local.lhs.exponent + exponent_order_bias,
-            local.exponent_order,
-            program.is_real,
-        );
+            // t_e := RShift(3, 2^10 + (e_rhs - e_lhs - 1)).
+            builder.send_bf16_rshift(
+                3,
+                local.rhs.exponent - local.lhs.exponent + exponent_order_bias,
+                local.exponent_order,
+                program.is_real,
+            );
 
-        builder.assert_eq(
-            local.larger_sign,
-            local.lhs.sign + local.exponent_order * (local.effective_rhs_sign - local.lhs.sign),
-        );
-        let smaller_sign = local.lhs.sign + local.effective_rhs_sign - local.larger_sign;
-        builder.assert_eq(
-            local.larger_exponent,
-            local.lhs.exponent + local.exponent_order * (local.rhs.exponent - local.lhs.exponent),
-        );
-        let smaller_exponent = local.lhs.exponent + local.rhs.exponent - local.larger_exponent;
-        builder.assert_eq(
-            local.larger_mantissa,
-            local.lhs.mantissa + local.exponent_order * (local.rhs.mantissa - local.lhs.mantissa),
-        );
-        let smaller_mantissa = local.lhs.mantissa + local.rhs.mantissa - local.larger_mantissa;
+            builder.assert_eq(
+                local.larger_sign,
+                local.lhs.sign + local.exponent_order * (local.effective_rhs_sign - local.lhs.sign),
+            );
+            let smaller_sign = local.lhs.sign + local.effective_rhs_sign - local.larger_sign;
+            builder.assert_eq(
+                local.larger_exponent,
+                local.lhs.exponent
+                    + local.exponent_order * (local.rhs.exponent - local.lhs.exponent),
+            );
+            let smaller_exponent = local.lhs.exponent + local.rhs.exponent - local.larger_exponent;
+            builder.assert_eq(
+                local.larger_mantissa,
+                local.lhs.mantissa
+                    + local.exponent_order * (local.rhs.mantissa - local.lhs.mantissa),
+            );
+            let smaller_mantissa = local.lhs.mantissa + local.rhs.mantissa - local.larger_mantissa;
 
-        // d := Clamp(E_min_norm - e_1 + e_2).
-        builder.send_bf16_clamp(
-            smaller_exponent - local.larger_exponent + min_normal_exponent,
-            local.alignment,
-            program.is_real,
-        );
-        builder.send_bf16_rshift(
-            0,
-            smaller_mantissa.clone(),
-            local.smaller_nonzero,
-            program.is_real,
-        );
-        builder.send_bf16_rshift(
-            0,
-            (local.alignment + alignment_bias) * alignment_scale,
-            local.max_alignment,
-            program.is_real,
-        );
+            // d := Clamp(E_min_norm - e_1 + e_2).
+            builder.send_bf16_clamp(
+                smaller_exponent - local.larger_exponent + min_normal_exponent,
+                local.alignment,
+                program.is_real,
+            );
+            builder.send_bf16_rshift(
+                0,
+                smaller_mantissa.clone(),
+                local.smaller_nonzero,
+                program.is_real,
+            );
+            builder.send_bf16_rshift(
+                0,
+                (local.alignment + alignment_bias) * alignment_scale,
+                local.max_alignment,
+                program.is_real,
+            );
 
-        builder.assert_eq(
-            local.selected_smaller,
-            smaller_mantissa.clone()
-                + local.max_alignment * (local.smaller_nonzero - smaller_mantissa),
-        );
-        let shift = local.alignment - local.max_alignment;
-        builder.send_bf16_lshift(
-            shift.clone(),
-            local.larger_sign,
-            local.larger_mantissa,
-            local.shifted_larger,
-            program.is_real,
-        );
-        builder.assert_eq(
-            local.signed_smaller,
-            local.selected_smaller - smaller_sign * local.selected_smaller * two,
-        );
-        let signed_sum = local.shifted_larger + local.signed_smaller;
+            builder.assert_eq(
+                local.selected_smaller,
+                smaller_mantissa.clone()
+                    + local.max_alignment * (local.smaller_nonzero - smaller_mantissa),
+            );
+            let shift = local.alignment - local.max_alignment;
+            builder.send_bf16_lshift(
+                shift.clone(),
+                local.larger_sign,
+                local.larger_mantissa,
+                local.shifted_larger,
+                program.is_real,
+            );
+            builder.assert_eq(
+                local.signed_smaller,
+                local.selected_smaller - smaller_sign * local.selected_smaller * two,
+            );
+            let signed_sum = local.shifted_larger + local.signed_smaller;
 
-        builder.assert_eq(
-            local.unsigned_sum,
-            signed_sum.clone() - local.output.sign * signed_sum * two,
-        );
+            builder.assert_eq(
+                local.unsigned_sum,
+                signed_sum.clone() - local.output.sign * signed_sum * two,
+            );
 
-        builder.send_bf16_add(local.unsigned_sum, local.add_result, program.is_real);
-        builder.send_bf16_rshift(1, local.add_result, local.normalization_shift, program.is_real);
-        let normalized_mantissa = local.add_result - local.normalization_shift * mantissa_base;
-        builder.send_bf16_rshift(
-            0,
-            normalized_mantissa.clone(),
-            local.normalized_nonzero,
-            program.is_real,
-        );
+            builder.send_bf16_add(local.unsigned_sum, local.add_result, program.is_real);
+            builder.send_bf16_rshift(
+                1,
+                local.add_result,
+                local.normalization_shift,
+                program.is_real,
+            );
+            let normalized_mantissa = local.add_result - local.normalization_shift * mantissa_base;
+            builder.send_bf16_rshift(
+                0,
+                normalized_mantissa.clone(),
+                local.normalized_nonzero,
+                program.is_real,
+            );
 
-        let intermediate_exponent =
-            local.larger_exponent + mantissa_bits_plus_one - local.normalization_shift - shift
-                + zero_exponent
-                - local.normalized_nonzero * zero_exponent;
-        builder.send_bf16_exp(intermediate_exponent, local.output.exponent, program.is_real);
-        builder.send_bf16_rshift(
-            2,
-            local.output.exponent - zero_exponent,
-            local.abnormal,
-            program.is_real,
-        );
-        builder.assert_eq(
-            local.output.mantissa,
-            normalized_mantissa.clone() - local.abnormal * normalized_mantissa,
-        );
+            let intermediate_exponent =
+                local.larger_exponent + mantissa_bits_plus_one - local.normalization_shift - shift
+                    + zero_exponent
+                    - local.normalized_nonzero * zero_exponent;
+            builder.send_bf16_exp(intermediate_exponent, local.output.exponent, program.is_real);
+            builder.send_bf16_rshift(
+                2,
+                local.output.exponent - zero_exponent,
+                local.abnormal,
+                program.is_real,
+            );
+            builder.assert_eq(
+                local.output.mantissa,
+                normalized_mantissa.clone() - local.abnormal * normalized_mantissa,
+            );
 
-        builder.send_bf16_init(
-            local.output.raw,
-            local.output.sign,
-            local.output.exponent,
-            local.output.mantissa,
-            program.is_real,
-        );
-        builder.send_single(program.addrs.output, local.output.raw, program.mult);
+            builder.send_bf16_init(
+                local.output.raw,
+                local.output.sign,
+                local.output.exponent,
+                local.output.mantissa,
+                program.is_real,
+            );
+            builder.send_single(program.addrs.output, local.output.raw, program.mult);
+        }
     }
 }
 

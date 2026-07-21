@@ -47,3 +47,16 @@ The checkpoint parameters and public tensor dtype are BF16. Individual PyTorch
 kernels may still use wider internal accumulators, so this program is an inference
 reference, not a guarantee that every intermediate operation follows a custom
 bit-exact recursion arithmetic policy.
+
+## Export the embedding hidden state
+
+Export the BF16 vector after adding token and position embeddings, immediately
+before transformer block 0:
+
+```bash
+python infer/gpt2_embedding_bf16.py --prompt "once"
+```
+
+The default output is `crates/recursion/data/gpt2/once`. The hex file contains
+the flattened raw BF16 bit patterns; `metadata.json` records its shape, token IDs,
+file hashes, and the exact extraction stage.

@@ -1,5 +1,5 @@
 use core::borrow::Borrow;
-use std::{borrow::BorrowMut, mem::MaybeUninit};
+use std::{borrow::BorrowMut, iter::zip, mem::MaybeUninit};
 
 use slop_air::{Air, BaseAir, PairBuilder};
 use slop_algebra::{AbstractField, Field, PrimeField32};
@@ -15,13 +15,25 @@ use sp1_recursion_executor::{
 
 use crate::builder::SP1RecursionAirBuilder;
 
+/// Number of independent BF16 multiplication events stored in one trace row.
+pub const NUM_BF16_MUL_EVENTS_PER_ROW: usize = 12;
+
 pub const BF16_MUL_COLS: usize = core::mem::size_of::<Bf16MulCols<u8>>();
+pub const BF16_MUL_VALUE_COLS: usize = core::mem::size_of::<Bf16MulValueCols<u8>>();
 pub const BF16_MUL_PREPROCESSED_COLS: usize = core::mem::size_of::<Bf16MulPreprocessedCols<u8>>();
+pub const BF16_MUL_ACCESS_COLS: usize = core::mem::size_of::<Bf16MulAccessCols<u8>>();
 
 /// Main trace columns for lookup-based BF16 multiplication.
 #[derive(AlignedBorrow, Debug, Clone, Copy)]
 #[repr(C)]
 pub struct Bf16MulCols<T: Copy> {
+    pub values: [Bf16MulValueCols<T>; NUM_BF16_MUL_EVENTS_PER_ROW],
+}
+
+/// Main trace columns for one lookup-based BF16 multiplication.
+#[derive(AlignedBorrow, Debug, Clone, Copy)]
+#[repr(C)]
+pub struct Bf16MulValueCols<T: Copy> {
     pub lhs: Bf16CircuitValue<T>,
     pub rhs: Bf16CircuitValue<T>,
     pub output: Bf16CircuitValue<T>,
@@ -34,6 +46,13 @@ pub struct Bf16MulCols<T: Copy> {
 #[derive(AlignedBorrow, Debug, Clone, Copy)]
 #[repr(C)]
 pub struct Bf16MulPreprocessedCols<T: Copy> {
+    pub accesses: [Bf16MulAccessCols<T>; NUM_BF16_MUL_EVENTS_PER_ROW],
+}
+
+/// Program columns for one BF16 multiplication event.
+#[derive(AlignedBorrow, Debug, Clone, Copy)]
+#[repr(C)]
+pub struct Bf16MulAccessCols<T: Copy> {
     pub is_real: T,
     pub addrs: Bf16MulIo<Address<T>>,
     pub mult: T,
@@ -75,7 +94,8 @@ impl<F: PrimeField32> MachineAir<F> for Bf16MulChip {
         instrs_len: usize,
     ) -> Option<usize> {
         let height = program.shape.as_ref().and_then(|shape| shape.height(self));
-        Some(next_multiple_of_32(instrs_len, height))
+        let rows = instrs_len.div_ceil(NUM_BF16_MUL_EVENTS_PER_ROW);
+        Some(next_multiple_of_32(rows, height))
     }
 
     fn generate_preprocessed_trace_into(
@@ -106,7 +126,7 @@ impl<F: PrimeField32> MachineAir<F> for Bf16MulChip {
             )
         };
         unsafe {
-            let padding_start = instructions.len() * BF16_MUL_PREPROCESSED_COLS;
+            let padding_start = instructions.len() * BF16_MUL_ACCESS_COLS;
             core::ptr::write_bytes(
                 values[padding_start..].as_mut_ptr(),
                 0,
@@ -114,22 +134,22 @@ impl<F: PrimeField32> MachineAir<F> for Bf16MulChip {
             );
         }
 
-        let populated = instructions.len() * BF16_MUL_PREPROCESSED_COLS;
-        values[..populated]
-            .par_chunks_mut(BF16_MUL_PREPROCESSED_COLS)
-            .zip_eq(instructions)
-            .for_each(|(row, instruction)| {
+        let populated = instructions.len() * BF16_MUL_ACCESS_COLS;
+        values[..populated].par_chunks_mut(BF16_MUL_ACCESS_COLS).zip_eq(instructions).for_each(
+            |(row, instruction)| {
                 let Bf16MulInstr { addrs, mult } = instruction;
-                let cols: &mut Bf16MulPreprocessedCols<F> = row.borrow_mut();
-                *cols = Bf16MulPreprocessedCols { is_real: F::one(), addrs: *addrs, mult: *mult };
-            });
+                let cols: &mut Bf16MulAccessCols<F> = row.borrow_mut();
+                *cols = Bf16MulAccessCols { is_real: F::one(), addrs: *addrs, mult: *mult };
+            },
+        );
     }
 
     fn generate_dependencies(&self, _input: &Self::Record, _output: &mut Self::Record) {}
 
     fn num_rows(&self, input: &Self::Record) -> Option<usize> {
         let height = input.program.shape.as_ref().and_then(|shape| shape.height(self));
-        Some(next_multiple_of_32(input.bf16_mul_events.len(), height))
+        let rows = input.bf16_mul_events.len().div_ceil(NUM_BF16_MUL_EVENTS_PER_ROW);
+        Some(next_multiple_of_32(rows, height))
     }
 
     fn generate_trace_into(
@@ -150,7 +170,7 @@ impl<F: PrimeField32> MachineAir<F> for Bf16MulChip {
             core::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut F, rows * BF16_MUL_COLS)
         };
         unsafe {
-            let padding_start = events.len() * BF16_MUL_COLS;
+            let padding_start = events.len() * BF16_MUL_VALUE_COLS;
             core::ptr::write_bytes(
                 values[padding_start..].as_mut_ptr(),
                 0,
@@ -158,11 +178,11 @@ impl<F: PrimeField32> MachineAir<F> for Bf16MulChip {
             );
         }
 
-        let populated = events.len() * BF16_MUL_COLS;
-        values[..populated].par_chunks_mut(BF16_MUL_COLS).zip_eq(events).for_each(
+        let populated = events.len() * BF16_MUL_VALUE_COLS;
+        values[..populated].par_chunks_mut(BF16_MUL_VALUE_COLS).zip_eq(events).for_each(
             |(row, event)| {
-                let cols: &mut Bf16MulCols<F> = row.borrow_mut();
-                *cols = Bf16MulCols {
+                let cols: &mut Bf16MulValueCols<F> = row.borrow_mut();
+                *cols = Bf16MulValueCols {
                     lhs: event.lhs,
                     rhs: event.rhs,
                     output: event.output,
@@ -194,75 +214,77 @@ where
 
         let mantissa_base = AB::F::from_canonical_u16(1 << (BF16_MANTISSA_BITS + 1));
 
-        // The public chip interface is raw BF16: each input is read from recursion memory.
-        builder.receive_single(program.addrs.lhs, local.lhs.raw, program.is_real);
-        builder.receive_single(program.addrs.rhs, local.rhs.raw, program.is_real);
+        for (local, program) in zip(local.values, program.accesses) {
+            // The public chip interface is raw BF16: each input is read from recursion memory.
+            builder.receive_single(program.addrs.lhs, local.lhs.raw, program.is_real);
+            builder.receive_single(program.addrs.rhs, local.rhs.raw, program.is_real);
 
-        // Each raw input is converted to the circuit representation by exactly one lookup.
-        builder.send_bf16_init(
-            local.lhs.raw,
-            local.lhs.sign,
-            local.lhs.exponent,
-            local.lhs.mantissa,
-            program.is_real,
-        );
-        builder.send_bf16_init(
-            local.rhs.raw,
-            local.rhs.sign,
-            local.rhs.exponent,
-            local.rhs.mantissa,
-            program.is_real,
-        );
+            // Each raw input is converted to the circuit representation by exactly one lookup.
+            builder.send_bf16_init(
+                local.lhs.raw,
+                local.lhs.sign,
+                local.lhs.exponent,
+                local.lhs.mantissa,
+                program.is_real,
+            );
+            builder.send_bf16_init(
+                local.rhs.raw,
+                local.rhs.sign,
+                local.rhs.exponent,
+                local.rhs.mantissa,
+                program.is_real,
+            );
 
-        // p := Mul(m_lhs || m_rhs).
-        builder.send_bf16_mul(
-            local.lhs.mantissa,
-            local.rhs.mantissa,
-            local.product,
-            program.is_real,
-        );
+            // p := Mul(m_lhs || m_rhs).
+            builder.send_bf16_mul(
+                local.lhs.mantissa,
+                local.rhs.mantissa,
+                local.product,
+                program.is_real,
+            );
 
-        // carry := RShift(1, p); u := p - 2^(M+1) carry.
-        builder.send_bf16_rshift(1, local.product, local.carry, program.is_real);
-        let normalized_mantissa = local.product - local.carry * mantissa_base;
+            // carry := RShift(1, p); u := p - 2^(M+1) carry.
+            builder.send_bf16_rshift(1, local.product, local.carry, program.is_real);
+            let normalized_mantissa = local.product - local.carry * mantissa_base;
 
-        // e := e_lhs + e_rhs + carry.
-        let intermediate_exponent = local.lhs.exponent + local.rhs.exponent + local.carry;
+            // e := e_lhs + e_rhs + carry.
+            let intermediate_exponent = local.lhs.exponent + local.rhs.exponent + local.carry;
 
-        // output.exponent := Exp(e).
-        builder.send_bf16_exp(
-            intermediate_exponent.clone(),
-            local.output.exponent,
-            program.is_real,
-        );
+            // output.exponent := Exp(e).
+            builder.send_bf16_exp(
+                intermediate_exponent.clone(),
+                local.output.exponent,
+                program.is_real,
+            );
 
-        // clamp := Clamp(e).
-        builder.send_bf16_clamp(intermediate_exponent, local.clamp, program.is_real);
+            // clamp := Clamp(e).
+            builder.send_bf16_clamp(intermediate_exponent, local.clamp, program.is_real);
 
-        // output.sign := lhs.sign XOR rhs.sign.
-        builder.assert_eq(
-            local.output.sign,
-            local.lhs.sign + local.rhs.sign - local.lhs.sign * local.rhs.sign * AB::F::two(),
-        );
+            // output.sign := lhs.sign XOR rhs.sign.
+            builder.assert_eq(
+                local.output.sign,
+                local.lhs.sign + local.rhs.sign - local.lhs.sign * local.rhs.sign * AB::F::two(),
+            );
 
-        // output.mantissa := Round(clamp || u).
-        builder.send_bf16_round(
-            local.clamp,
-            normalized_mantissa,
-            local.output.mantissa,
-            program.is_real,
-        );
+            // output.mantissa := Round(clamp || u).
+            builder.send_bf16_round(
+                local.clamp,
+                normalized_mantissa,
+                local.output.mantissa,
+                program.is_real,
+            );
 
-        // Reuse the initialization relation in reverse to bind the circuit result to a valid raw
-        // BF16 output, then publish that raw value through recursion memory.
-        builder.send_bf16_init(
-            local.output.raw,
-            local.output.sign,
-            local.output.exponent,
-            local.output.mantissa,
-            program.is_real,
-        );
-        builder.send_single(program.addrs.output, local.output.raw, program.mult);
+            // Reuse the initialization relation in reverse to bind the circuit result to a valid
+            // raw BF16 output, then publish that raw value through recursion memory.
+            builder.send_bf16_init(
+                local.output.raw,
+                local.output.sign,
+                local.output.exponent,
+                local.output.mantissa,
+                program.is_real,
+            );
+            builder.send_single(program.addrs.output, local.output.raw, program.mult);
+        }
     }
 }
 

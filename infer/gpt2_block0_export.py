@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export GPT-2 block 0 as compact raw-BF16 files for the recursion example."""
+"""Export one GPT-2 block as compact raw-BF16 files for the recursion example."""
 
 from __future__ import annotations
 
@@ -26,36 +26,39 @@ DEFAULT_HIDDEN_STATE = (
     / "hidden_state.bf16.hex"
 )
 
-PARAMETERS = {
-    "ln_1_weight": "h.0.ln_1.weight",
-    "ln_1_bias": "h.0.ln_1.bias",
-    "attention_qkv_weight": "h.0.attn.c_attn.weight",
-    "attention_qkv_bias": "h.0.attn.c_attn.bias",
-    "attention_projection_weight": "h.0.attn.c_proj.weight",
-    "attention_projection_bias": "h.0.attn.c_proj.bias",
-    "ln_2_weight": "h.0.ln_2.weight",
-    "ln_2_bias": "h.0.ln_2.bias",
-    "mlp_expansion_weight": "h.0.mlp.c_fc.weight",
-    "mlp_expansion_bias": "h.0.mlp.c_fc.bias",
-    "mlp_projection_weight": "h.0.mlp.c_proj.weight",
-    "mlp_projection_bias": "h.0.mlp.c_proj.bias",
-}
+def parameter_keys(block: int) -> dict[str, str]:
+    prefix = f"h.{block}"
+    return {
+        "ln_1_weight": f"{prefix}.ln_1.weight",
+        "ln_1_bias": f"{prefix}.ln_1.bias",
+        "attention_qkv_weight": f"{prefix}.attn.c_attn.weight",
+        "attention_qkv_bias": f"{prefix}.attn.c_attn.bias",
+        "attention_projection_weight": f"{prefix}.attn.c_proj.weight",
+        "attention_projection_bias": f"{prefix}.attn.c_proj.bias",
+        "ln_2_weight": f"{prefix}.ln_2.weight",
+        "ln_2_bias": f"{prefix}.ln_2.bias",
+        "mlp_expansion_weight": f"{prefix}.mlp.c_fc.weight",
+        "mlp_expansion_bias": f"{prefix}.mlp.c_fc.bias",
+        "mlp_projection_weight": f"{prefix}.mlp.c_proj.weight",
+        "mlp_projection_bias": f"{prefix}.mlp.c_proj.bias",
+    }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Export real GPT-2 block-0 BF16 tensors without copying the checkpoint "
+            "Export real GPT-2 block BF16 tensors without copying the checkpoint "
             "into the repository."
         )
     )
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
     parser.add_argument("--hidden-state", type=Path, default=DEFAULT_HIDDEN_STATE)
+    parser.add_argument("--block", type=int, default=0)
     parser.add_argument(
         "--output-dir",
         type=Path,
         help=(
-            "default: MODEL_DIR/recursion/block0-once; use /tmp while testing the exporter"
+            "default: MODEL_DIR/recursion/blockN-once; use /tmp while testing the exporter"
         ),
     )
     return parser.parse_args()
@@ -103,7 +106,7 @@ def gelu_new(values: torch.Tensor) -> torch.Tensor:
     return 0.5 * values * (1.0 + torch.tanh(coefficient * (values + 0.044715 * values**3)))
 
 
-def pytorch_block0_reference(
+def pytorch_block_reference(
     hidden: torch.Tensor,
     parameters: dict[str, torch.Tensor],
     num_heads: int,
@@ -195,27 +198,32 @@ def main() -> None:
     model_path = model_dir / "model.safetensors"
     config_path = model_dir / "config.json"
     hidden_path = args.hidden_state.expanduser().resolve()
-    output_dir = (
-        args.output_dir.expanduser().resolve()
-        if args.output_dir is not None
-        else model_dir / "recursion" / "block0-once"
-    )
     for path in (model_path, config_path, hidden_path):
         if not path.is_file():
             raise SystemExit(f"missing required file: {path}")
 
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    block = args.block
+    num_layers = int(config["n_layer"])
+    if not 0 <= block < num_layers:
+        raise SystemExit(f"block must be in [0, {num_layers}), found {block}")
+    parameters_by_name = parameter_keys(block)
+    output_dir = (
+        args.output_dir.expanduser().resolve()
+        if args.output_dir is not None
+        else model_dir / "recursion" / f"block{block}-once"
+    )
     hidden_size = int(config["n_embd"])
     num_heads = int(config["n_head"])
     inner_size = int(config.get("n_inner") or 4 * hidden_size)
     epsilon = float(config["layer_norm_epsilon"])
     hidden = read_bf16_hex(hidden_path)
     with safe_open(model_path, framework="pt", device="cpu") as file:
-        parameters = {name: file.get_tensor(key) for name, key in PARAMETERS.items()}
+        parameters = {name: file.get_tensor(key) for name, key in parameters_by_name.items()}
     validate_shapes(hidden, parameters, hidden_size, inner_size)
 
     with torch.inference_mode():
-        pytorch_output, pytorch_attention_max_hints = pytorch_block0_reference(
+        pytorch_output, pytorch_attention_max_hints = pytorch_block_reference(
             hidden, parameters, num_heads, epsilon
         )
 
@@ -226,7 +234,7 @@ def main() -> None:
     )
     for name, tensor in parameters.items():
         descriptor = write_bf16_binary(output_dir / f"{name}.bf16.bin", tensor)
-        descriptor["safetensors_key"] = PARAMETERS[name]
+        descriptor["safetensors_key"] = parameters_by_name[name]
         files[name] = descriptor
     files["pytorch_attention_max_hints"] = write_bf16_binary(
         output_dir / "pytorch_attention_max_hints.bf16.bin",
@@ -244,7 +252,7 @@ def main() -> None:
     metadata = {
         "format_version": 1,
         "model_type": config["model_type"],
-        "block": 0,
+        "block": block,
         "prompt_stage": "token_embedding_plus_position_embedding",
         "dtype": "bfloat16",
         "encoding": "IEEE 754 BF16 raw u16",
@@ -279,7 +287,7 @@ def main() -> None:
     parameter_count = sum(tensor.numel() for tensor in parameters.values())
     print(f"model={model_path}")
     print(f"hidden_state={hidden_path}")
-    print(f"block=0 parameters={parameter_count} bytes={parameter_count * 2}")
+    print(f"block={block} parameters={parameter_count} bytes={parameter_count * 2}")
     print(f"pytorch_max_hints={pytorch_attention_max_hints.numel()}")
     print(f"output_dir={output_dir}")
     print(f"metadata={metadata_path}")
