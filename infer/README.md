@@ -498,3 +498,15 @@ The same chained-leaf circuit supports every later layer. It verifies the
 immediately preceding block-output proof once on the host, constrains that
 private output inside every leaf, and includes the previous block transcript in
 each new public attention transcript.
+
+Join layer two's 12 attention leaves before its c_proj stage:
+
+```bash
+target/release/examples/zkgpt_attention_join \
+  --prove --layer 2 \
+  --leaf-dir /tmp/sp1-zkgpt-layer2-attention \
+  --output-dir /tmp/sp1-zkgpt-layer2-attention-join
+```
+
+The resulting proof preserves the Block 1 upstream transcript and binds the
+ordered private head outputs into layer two's `[30, 768]` attention tensor.
