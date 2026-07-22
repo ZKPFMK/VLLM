@@ -239,3 +239,23 @@ and proves exactly the c_proj group transcript already recorded by the tile
 batch. As with the Attention fan-in, child STARK verification remains on the
 host; the join circuit cryptographically binds the verified child public
 transcripts to the combined private output.
+
+Prove the second LayerNorm once over the complete c_proj output:
+
+```bash
+cargo build -p sp1-recursion-compiler --release \
+  --example zkgpt_ln2_leaf
+
+RAYON_NUM_THREADS=8 target/release/examples/zkgpt_ln2_leaf \
+  --prove --layer 0 \
+  --c-proj-dir /tmp/sp1-zkgpt-layer0-c-proj \
+  --join-dir /tmp/sp1-zkgpt-layer0-c-proj-join \
+  --output-dir /tmp/sp1-zkgpt-layer0-ln2
+```
+
+The host verifies the c_proj join proof, and the LN2 circuit recomputes the
+private `[30, 768]` input commitment before applying the real private
+`ln_2_weight` and `ln_2_bias` tensors with bit-exact BF16 operations. LayerNorm
+is independent across tokens and this complete stage fits in `2^16` rows, so it
+uses one proof and needs no fan-in join. Its private `[30, 768]` output is the
+shared input to the following MLP-expansion tiles.
