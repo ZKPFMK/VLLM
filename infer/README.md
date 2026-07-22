@@ -411,3 +411,18 @@ This is the same bounded fan-in circuit used for layer zero. It verifies the
 four tile proofs on the host, enforces ordered and complete output-column
 coverage in the join circuit, and preserves the layer-one attention upstream
 transcript for the following `ln_2` proof.
+
+Prove layer one's complete second LayerNorm over the joined c_proj output:
+
+```bash
+RAYON_NUM_THREADS=8 target/release/examples/zkgpt_ln2_leaf \
+  --prove --layer 1 \
+  --c-proj-dir /tmp/sp1-zkgpt-layer1-c-proj \
+  --join-dir /tmp/sp1-zkgpt-layer1-c-proj-join \
+  --output-dir /tmp/sp1-zkgpt-layer1-ln2
+```
+
+The host verifies the layer-one c_proj join proof, while the LN2 circuit binds
+its private output tensor and applies the real BF16 `ln_2_weight` and
+`ln_2_bias` values from checkpoint layer one. The proved `[30, 768]` output is
+the common input for layer one's MLP-expansion shards.
