@@ -341,3 +341,24 @@ the verified child statements but does not recursively verify the child STARKs
 inside the circuit. Because this comparison architecture omits the residual,
 the joined projection tensor is the simplified block output and can be chained
 to the next layer's attention leaf shards.
+
+Start the next block by using the preceding projection tensor instead of the
+genesis embedding input:
+
+```bash
+cargo build -p sp1-recursion-compiler --release --example zkgpt_leaf
+
+RAYON_NUM_THREADS=8 target/release/examples/zkgpt_leaf \
+  --all-heads --prove --layer 1 \
+  --previous-block-dir /tmp/sp1-zkgpt-layer0-mlp-projection \
+  --previous-block-join-dir /tmp/sp1-zkgpt-layer0-mlp-projection-join \
+  --output-dir /tmp/sp1-zkgpt-layer1-attention
+```
+
+For layer 1 or later, the host verifies the previous layer's block-output join
+proof once and checks that its private `[30, 768]` tensor hashes to the proved
+output commitment. Each attention leaf repeats that hash constraint inside the
+circuit and includes both the preceding block transcript and output commitment
+in its own public transcript. Layer zero retains the original genesis-input
+transcript layout. Previous-proof verification remains host-side rather than an
+in-circuit recursive STARK verification.
