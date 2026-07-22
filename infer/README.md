@@ -381,3 +381,19 @@ requires all heads to use the same previous-block transcript and input
 commitment, binds every private head output, and proves the chained attention
 group transcript. The resulting proof and private attention tensor can be fed
 to `zkgpt_c_proj_leaf` with the same layer index.
+
+For example, prove layer one's four attention-projection tiles with the chained
+attention artifacts above:
+
+```bash
+RAYON_NUM_THREADS=8 target/release/examples/zkgpt_c_proj_leaf \
+  --all-tiles --prove --layer 1 \
+  --attention-dir /tmp/sp1-zkgpt-layer1-attention \
+  --join-dir /tmp/sp1-zkgpt-layer1-attention-join \
+  --output-dir /tmp/sp1-zkgpt-layer1-c-proj
+```
+
+The existing c_proj leaf protocol is layer-independent: it verifies the
+matching attention join proof, constrains the private attention tensor to that
+join's output commitment, and loads the real projection weights from the
+requested checkpoint layer.
