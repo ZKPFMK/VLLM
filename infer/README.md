@@ -279,3 +279,21 @@ input commitment and use the corresponding private column slices of the real
 `mlp_expansion_weight.bf16.bin`. Their ordered private outputs are concatenated
 into `[30, 2304]`; the generated group manifest remains host-computed until the
 following MLP-expansion fan-in proof binds all child transcripts.
+
+Bind the 12 expansion+GELU outputs into one proved `[30, 2304]` tensor:
+
+```bash
+cargo build -p sp1-recursion-compiler --release \
+  --example zkgpt_mlp_expansion_join
+
+target/release/examples/zkgpt_mlp_expansion_join \
+  --prove --layer 0 \
+  --tile-dir /tmp/sp1-zkgpt-layer0-mlp-expansion \
+  --output-dir /tmp/sp1-zkgpt-layer0-mlp-expansion-join
+```
+
+The host verifies all 12 expansion proofs with their shared verifying key. The
+join circuit checks the private tile-output commitments and transcripts,
+enforces a common LN2 input and ordered, complete output-column coverage, and
+proves the same group transcript as the tile batch. Its verified `[30, 2304]`
+output is the input to the following MLP projection shards.
