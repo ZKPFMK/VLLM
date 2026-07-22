@@ -362,3 +362,22 @@ circuit and includes both the preceding block transcript and output commitment
 in its own public transcript. Layer zero retains the original genesis-input
 transcript layout. Previous-proof verification remains host-side rather than an
 in-circuit recursive STARK verification.
+
+Join the 12 chained attention leaves before continuing with layer one's
+attention projection:
+
+```bash
+cargo build -p sp1-recursion-compiler --release \
+  --example zkgpt_attention_join
+
+target/release/examples/zkgpt_attention_join \
+  --prove --layer 1 \
+  --leaf-dir /tmp/sp1-zkgpt-layer1-attention \
+  --output-dir /tmp/sp1-zkgpt-layer1-attention-join
+```
+
+For a non-genesis layer, the join circuit reconstructs the chained leaf stage,
+requires all heads to use the same previous-block transcript and input
+commitment, binds every private head output, and proves the chained attention
+group transcript. The resulting proof and private attention tensor can be fed
+to `zkgpt_c_proj_leaf` with the same layer index.

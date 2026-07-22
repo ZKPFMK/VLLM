@@ -40,7 +40,9 @@ const GPT2_LAYER_NORM_EPSILON: u16 = 0x3727;
 const GPT2_ATTENTION_SCALE: u16 = 0x3e00;
 const LEAF_VERSION: u32 = 1;
 const LEAF_STAGE_QKV_ATTENTION: u32 = 1;
+const LEAF_STAGE_CHAINED_QKV_ATTENTION: u32 = 10;
 const ATTENTION_GROUP_STAGE: u32 = 2;
+const ATTENTION_CHAINED_GROUP_STAGE: u32 = 11;
 const DOMAIN_OUTPUT: u32 = 0x1004;
 const DOMAIN_TRANSCRIPT: u32 = 0x1005;
 const DOMAIN_ATTENTION_GROUP_PARAMETERS: u32 = 0x1101;
@@ -123,10 +125,17 @@ struct Arguments {
     output_dir: PathBuf,
 }
 
+impl Arguments {
+    fn chained(&self) -> bool {
+        self.layer > 0
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct LeafManifest {
     layer: usize,
     head: usize,
+    upstream: Option<Digest>,
     input: Digest,
     parameters: Digest,
     hints: Digest,
@@ -145,17 +154,28 @@ struct JoinHeadData {
 
 #[derive(Clone, Debug)]
 struct JoinData {
+    upstream: Option<Digest>,
     input: Digest,
     heads: Vec<JoinHeadData>,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct GroupCommitments {
+    upstream: Option<Digest>,
     input: Digest,
     parameters: Digest,
     hints: Digest,
     output: Digest,
     transcript: Digest,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LeafTranscriptInputs {
+    upstream: Option<Digest>,
+    input: Digest,
+    parameters: Digest,
+    hints: Digest,
+    output: Digest,
 }
 
 #[derive(Debug, Default)]
@@ -261,7 +281,14 @@ fn parse_leaf_manifest(path: &Path) -> LeafManifest {
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
         .collect::<BTreeMap<_, _>>();
     assert_eq!(required_field(&fields, "version", path), LEAF_VERSION.to_string());
-    assert_eq!(required_field(&fields, "stage", path), "qkv_attention");
+    let upstream = match required_field(&fields, "stage", path) {
+        "qkv_attention" => {
+            assert!(!fields.contains_key("upstream"), "genesis leaf must not declare upstream");
+            None
+        }
+        "qkv_attention_chained" => Some(parse_digest(required_field(&fields, "upstream", path))),
+        stage => panic!("{} has unsupported leaf stage {stage}", path.display()),
+    };
     let parse_index = |name: &str| {
         required_field(&fields, name, path)
             .parse()
@@ -270,6 +297,7 @@ fn parse_leaf_manifest(path: &Path) -> LeafManifest {
     LeafManifest {
         layer: parse_index("layer"),
         head: parse_index("head"),
+        upstream,
         input: parse_digest(required_field(&fields, "input", path)),
         parameters: parse_digest(required_field(&fields, "parameters", path)),
         hints: parse_digest(required_field(&fields, "hints", path)),
@@ -301,14 +329,15 @@ fn leaf_transcript_fields_host(
     shape: Shape,
     layer: usize,
     head: usize,
-    input: Digest,
-    parameters: Digest,
-    hints: Digest,
-    output: Digest,
+    commitments: LeafTranscriptInputs,
 ) -> Vec<SP1Field> {
     let mut fields = [
         LEAF_VERSION,
-        LEAF_STAGE_QKV_ATTENTION,
+        if commitments.upstream.is_some() {
+            LEAF_STAGE_CHAINED_QKV_ATTENTION
+        } else {
+            LEAF_STAGE_QKV_ATTENTION
+        },
         layer as u32,
         head as u32,
         shape.sequence_length as u32,
@@ -320,10 +349,13 @@ fn leaf_transcript_fields_host(
     ]
     .map(SP1Field::from_canonical_u32)
     .to_vec();
-    fields.extend(input);
-    fields.extend(parameters);
-    fields.extend(hints);
-    fields.extend(output);
+    if let Some(upstream) = commitments.upstream {
+        fields.extend(upstream);
+    }
+    fields.extend(commitments.input);
+    fields.extend(commitments.parameters);
+    fields.extend(commitments.hints);
+    fields.extend(commitments.output);
     fields
 }
 
@@ -331,14 +363,11 @@ fn compute_leaf_transcript(
     shape: Shape,
     layer: usize,
     head: usize,
-    input: Digest,
-    parameters: Digest,
-    hints: Digest,
-    output: Digest,
+    commitments: LeafTranscriptInputs,
 ) -> Digest {
     host_commit_fields(
         DOMAIN_TRANSCRIPT,
-        &leaf_transcript_fields_host(shape, layer, head, input, parameters, hints, output),
+        &leaf_transcript_fields_host(shape, layer, head, commitments),
     )
 }
 
@@ -372,6 +401,11 @@ fn concatenate_attention_output(shape: Shape, heads: &[JoinHeadData]) -> Vec<u16
 
 fn validate_join_data(shape: Shape, layer: usize, data: &JoinData) -> GroupCommitments {
     assert_eq!(data.heads.len(), shape.num_heads, "join requires every attention head");
+    assert_eq!(
+        data.upstream.is_some(),
+        layer > 0,
+        "only layer 1 or later may use a previous-block transcript"
+    );
     let mut parameter_fields = Vec::with_capacity(shape.num_heads * (DIGEST_SIZE + 1));
     let mut hint_fields = Vec::with_capacity(shape.num_heads * (DIGEST_SIZE + 1));
     for (expected_head, head) in data.heads.iter().enumerate() {
@@ -381,10 +415,13 @@ fn validate_join_data(shape: Shape, layer: usize, data: &JoinData) -> GroupCommi
             shape,
             layer,
             expected_head,
-            data.input,
-            head.parameters,
-            head.hints,
-            output,
+            LeafTranscriptInputs {
+                upstream: data.upstream,
+                input: data.input,
+                parameters: head.parameters,
+                hints: head.hints,
+                output,
+            },
         );
         assert_eq!(transcript, head.transcript, "head {expected_head} transcript mismatch");
         let head_field = SP1Field::from_canonical_usize(expected_head);
@@ -400,7 +437,7 @@ fn validate_join_data(shape: Shape, layer: usize, data: &JoinData) -> GroupCommi
     let output = host_commit_u16(DOMAIN_ATTENTION_GROUP_OUTPUT, &concatenated);
     let mut transcript_fields = [
         LEAF_VERSION,
-        ATTENTION_GROUP_STAGE,
+        if data.upstream.is_some() { ATTENTION_CHAINED_GROUP_STAGE } else { ATTENTION_GROUP_STAGE },
         layer as u32,
         shape.sequence_length as u32,
         shape.hidden_size as u32,
@@ -409,6 +446,9 @@ fn validate_join_data(shape: Shape, layer: usize, data: &JoinData) -> GroupCommi
     ]
     .map(SP1Field::from_canonical_u32)
     .to_vec();
+    if let Some(upstream) = data.upstream {
+        transcript_fields.extend(upstream);
+    }
     transcript_fields.extend(data.input);
     transcript_fields.extend(parameters);
     transcript_fields.extend(hints);
@@ -418,7 +458,14 @@ fn validate_join_data(shape: Shape, layer: usize, data: &JoinData) -> GroupCommi
         transcript_fields.extend(head.transcript);
     }
     let transcript = host_commit_fields(DOMAIN_ATTENTION_GROUP_TRANSCRIPT, &transcript_fields);
-    GroupCommitments { input: data.input, parameters, hints, output, transcript }
+    GroupCommitments {
+        upstream: data.upstream,
+        input: data.input,
+        parameters,
+        hints,
+        output,
+        transcript,
+    }
 }
 
 fn load_join_data(arguments: &Arguments) -> JoinData {
@@ -428,6 +475,7 @@ fn load_join_data(arguments: &Arguments) -> JoinData {
     let combined = read_bf16_binary(&output_path);
     let head_outputs = split_attention_output(arguments.shape, &combined);
 
+    let mut common_upstream = None;
     let mut common_input = None;
     let mut heads = Vec::with_capacity(arguments.shape.num_heads);
     for (head, output) in head_outputs.into_iter().enumerate() {
@@ -437,6 +485,11 @@ fn load_join_data(arguments: &Arguments) -> JoinData {
         let manifest = parse_leaf_manifest(&manifest_path);
         assert_eq!(manifest.layer, arguments.layer, "leaf layer mismatch");
         assert_eq!(manifest.head, head, "leaf head mismatch");
+        if let Some(expected) = common_upstream {
+            assert_eq!(manifest.upstream, expected, "leaf upstream transcripts differ");
+        } else {
+            common_upstream = Some(manifest.upstream);
+        }
         if let Some(expected) = common_input {
             assert_eq!(manifest.input, expected, "leaf input commitments differ");
         } else {
@@ -448,10 +501,13 @@ fn load_join_data(arguments: &Arguments) -> JoinData {
             arguments.shape,
             arguments.layer,
             head,
-            manifest.input,
-            manifest.parameters,
-            manifest.hints,
-            output_digest,
+            LeafTranscriptInputs {
+                upstream: manifest.upstream,
+                input: manifest.input,
+                parameters: manifest.parameters,
+                hints: manifest.hints,
+                output: output_digest,
+            },
         );
         assert_eq!(transcript, manifest.transcript, "head {head} manifest transcript mismatch");
         heads.push(JoinHeadData {
@@ -462,7 +518,16 @@ fn load_join_data(arguments: &Arguments) -> JoinData {
             output,
         });
     }
-    let data = JoinData { input: common_input.expect("join requires an input"), heads };
+    let data = JoinData {
+        upstream: common_upstream.expect("join requires an upstream mode"),
+        input: common_input.expect("join requires an input"),
+        heads,
+    };
+    assert_eq!(
+        data.upstream.is_some(),
+        arguments.chained(),
+        "leaf stage does not match the requested layer"
+    );
     validate_join_data(arguments.shape, arguments.layer, &data);
     data
 }
@@ -485,8 +550,11 @@ fn circuit_commit_fields(
     state[..DIGEST_SIZE].try_into().unwrap()
 }
 
-fn build_join(builder: &mut JoinBuilder, shape: Shape) {
+fn build_join(builder: &mut JoinBuilder, shape: Shape, chained: bool) {
     let layer = builder.hint_felts_v2(1)[0];
+    let upstream: Option<[Felt<SP1Field>; DIGEST_SIZE]> = chained.then(|| {
+        builder.hint_felts_v2(DIGEST_SIZE).try_into().expect("upstream digest has fixed size")
+    });
     let input: [Felt<SP1Field>; DIGEST_SIZE] =
         builder.hint_felts_v2(DIGEST_SIZE).try_into().unwrap();
     let mut parameter_digests = Vec::with_capacity(shape.num_heads);
@@ -506,7 +574,7 @@ fn build_join(builder: &mut JoinBuilder, shape: Shape) {
 
         let constants = [
             LEAF_VERSION,
-            LEAF_STAGE_QKV_ATTENTION,
+            if chained { LEAF_STAGE_CHAINED_QKV_ATTENTION } else { LEAF_STAGE_QKV_ATTENTION },
             head as u32,
             shape.sequence_length as u32,
             shape.hidden_size as u32,
@@ -518,6 +586,9 @@ fn build_join(builder: &mut JoinBuilder, shape: Shape) {
         .map(|value| builder.constant(SP1Field::from_canonical_u32(value)));
         let mut transcript_fields = vec![constants[0], constants[1], layer, constants[2]];
         transcript_fields.extend_from_slice(&constants[3..]);
+        if let Some(upstream) = upstream {
+            transcript_fields.extend(upstream);
+        }
         transcript_fields.extend(input);
         transcript_fields.extend(parameters);
         transcript_fields.extend(hints);
@@ -559,7 +630,7 @@ fn build_join(builder: &mut JoinBuilder, shape: Shape) {
 
     let constants = [
         LEAF_VERSION,
-        ATTENTION_GROUP_STAGE,
+        if chained { ATTENTION_CHAINED_GROUP_STAGE } else { ATTENTION_GROUP_STAGE },
         shape.sequence_length as u32,
         shape.hidden_size as u32,
         shape.num_heads as u32,
@@ -568,6 +639,9 @@ fn build_join(builder: &mut JoinBuilder, shape: Shape) {
     .map(|value| builder.constant(SP1Field::from_canonical_u32(value)));
     let mut group_fields = vec![constants[0], constants[1], layer];
     group_fields.extend_from_slice(&constants[2..]);
+    if let Some(upstream) = upstream {
+        group_fields.extend(upstream);
+    }
     group_fields.extend(input);
     group_fields.extend(parameters);
     group_fields.extend(hints);
@@ -593,8 +667,13 @@ fn witness_stream(
     data: &JoinData,
 ) -> Vec<sp1_recursion_executor::Block<SP1Field>> {
     let values_per_head = 3 * DIGEST_SIZE + shape.sequence_length * shape.head_dimension();
-    let mut values = Vec::with_capacity(1 + DIGEST_SIZE + shape.num_heads * values_per_head);
+    let upstream_values = usize::from(data.upstream.is_some()) * DIGEST_SIZE;
+    let mut values =
+        Vec::with_capacity(1 + upstream_values + DIGEST_SIZE + shape.num_heads * values_per_head);
     values.push(SP1Field::from_canonical_usize(layer));
+    if let Some(upstream) = data.upstream {
+        values.extend(upstream);
+    }
     values.extend(data.input);
     for (expected_head, head) in data.heads.iter().enumerate() {
         assert_eq!(head.head, expected_head);
@@ -678,6 +757,9 @@ fn write_join_manifest(
     let optional_bytes = |path: Option<&Path>| {
         path.map_or_else(|| "null".to_owned(), |path| fs::metadata(path).unwrap().len().to_string())
     };
+    let optional_digest = |digest: Option<Digest>| {
+        digest.map_or_else(|| "null".to_owned(), |digest| format!("\"{}\"", digest_hex(&digest)))
+    };
     let child_transcripts = data
         .heads
         .iter()
@@ -693,6 +775,7 @@ fn write_join_manifest(
             "  \"sequence_length\": {},\n",
             "  \"hidden_size\": {},\n",
             "  \"num_heads\": {},\n",
+            "  \"upstream_transcript\": {},\n",
             "  \"input_commitment\": \"{}\",\n",
             "  \"parameters_commitment\": \"{}\",\n",
             "  \"hints_commitment\": \"{}\",\n",
@@ -715,6 +798,7 @@ fn write_join_manifest(
         arguments.shape.sequence_length,
         arguments.shape.hidden_size,
         arguments.shape.num_heads,
+        optional_digest(commitments.upstream),
         digest_hex(&commitments.input),
         digest_hex(&commitments.parameters),
         digest_hex(&commitments.hints),
@@ -832,7 +916,7 @@ async fn main() {
     let total_started = Instant::now();
     let build_started = Instant::now();
     let mut builder: JoinBuilder = AsmBuilder::default();
-    build_join(&mut builder, arguments.shape);
+    build_join(&mut builder, arguments.shape, arguments.chained());
     let block = builder.into_root_block();
     let build_seconds = build_started.elapsed().as_secs_f64();
     println!("built join: ir_ops={} elapsed={build_seconds:.3}s", block.ops.len());
@@ -845,6 +929,9 @@ async fn main() {
     let data = load_join_data(&arguments);
     let commitments = validate_join_data(arguments.shape, arguments.layer, &data);
     println!("loaded and checked join data: elapsed={:.3}s", load_started.elapsed().as_secs_f64());
+    if let Some(upstream) = commitments.upstream {
+        println!("previous-block transcript: {}", digest_hex(&upstream));
+    }
     println!("attention output commitment: {}", digest_hex(&commitments.output));
     println!("attention group transcript: {}", digest_hex(&commitments.transcript));
     verify_child_proofs(&arguments, &data);
@@ -890,7 +977,8 @@ async fn main() {
 mod tests {
     use super::*;
 
-    fn synthetic_data(shape: Shape) -> JoinData {
+    fn synthetic_data(shape: Shape, layer: usize) -> JoinData {
+        let upstream = (layer > 0).then(|| host_commit_u16(0x2000, &[layer as u16, 99]));
         let input = host_commit_u16(0x2001, &[1, 2, 3, 4]);
         let heads = (0..shape.num_heads)
             .map(|head| {
@@ -902,27 +990,30 @@ mod tests {
                 let output_digest = host_commit_u16(DOMAIN_OUTPUT, &output);
                 let transcript = compute_leaf_transcript(
                     shape,
-                    DEFAULT_LAYER,
+                    layer,
                     head,
-                    input,
-                    parameters,
-                    hints,
-                    output_digest,
+                    LeafTranscriptInputs {
+                        upstream,
+                        input,
+                        parameters,
+                        hints,
+                        output: output_digest,
+                    },
                 );
                 JoinHeadData { head, parameters, hints, transcript, output }
             })
             .collect();
-        JoinData { input, heads }
+        JoinData { upstream, input, heads }
     }
 
     #[test]
     fn join_circuit_rejects_tampered_child_data() {
         let shape = Shape::small();
-        let valid = synthetic_data(shape);
+        let valid = synthetic_data(shape, DEFAULT_LAYER);
         let expected = validate_join_data(shape, DEFAULT_LAYER, &valid);
 
         let mut builder: JoinBuilder = AsmBuilder::default();
-        build_join(&mut builder, shape);
+        build_join(&mut builder, shape, false);
         let mut compiler = AsmCompiler::default();
         let program = Arc::new(
             compiler.compile_inner(builder.into_root_block()).validate().expect("valid join IR"),
@@ -964,11 +1055,69 @@ mod tests {
             shape,
             DEFAULT_LAYER,
             1,
-            alternate_input,
-            head.parameters,
-            head.hints,
-            output_digest,
+            LeafTranscriptInputs {
+                upstream: None,
+                input: alternate_input,
+                parameters: head.parameters,
+                hints: head.hints,
+                output: output_digest,
+            },
         );
         assert!(!execute(&different_input).0, "different child input commitment must fail");
+    }
+
+    #[test]
+    fn chained_join_binds_previous_block_transcript() {
+        let shape = Shape::small();
+        let layer = 1;
+        let valid = synthetic_data(shape, layer);
+        let expected = validate_join_data(shape, layer, &valid);
+
+        let mut builder: JoinBuilder = AsmBuilder::default();
+        build_join(&mut builder, shape, true);
+        let mut compiler = AsmCompiler::default();
+        let program = Arc::new(
+            compiler.compile_inner(builder.into_root_block()).validate().expect("valid join IR"),
+        );
+        let execute = |data: &JoinData| {
+            let mut executor = Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(
+                program.clone(),
+                inner_perm(),
+            );
+            executor.witness_stream = witness_stream(shape, layer, data).into();
+            let result = executor.run();
+            (result.is_ok(), executor.record.public_values.digest)
+        };
+
+        let (succeeded, digest) = execute(&valid);
+        assert!(succeeded);
+        assert_eq!(digest, expected.transcript);
+
+        let mut modified_upstream = valid.clone();
+        modified_upstream.upstream.as_mut().unwrap()[0] += SP1Field::one();
+        assert!(
+            !execute(&modified_upstream).0,
+            "upstream differing from every child transcript must fail"
+        );
+
+        let mut rebound_upstream = modified_upstream;
+        for head in &mut rebound_upstream.heads {
+            let output = host_commit_u16(DOMAIN_OUTPUT, &head.output);
+            head.transcript = compute_leaf_transcript(
+                shape,
+                layer,
+                head.head,
+                LeafTranscriptInputs {
+                    upstream: rebound_upstream.upstream,
+                    input: rebound_upstream.input,
+                    parameters: head.parameters,
+                    hints: head.hints,
+                    output,
+                },
+            );
+        }
+        let (succeeded, rebound_digest) = execute(&rebound_upstream);
+        assert!(succeeded);
+        assert_ne!(rebound_digest, expected.transcript);
     }
 }
