@@ -483,3 +483,18 @@ This produces the second complete block-output commitment in the chained proof
 sequence. To start layer two, pass the projection tile directory as
 `--previous-block-dir` and this join directory as
 `--previous-block-join-dir` to `zkgpt_leaf --layer 2`.
+
+For example, start layer two with 12 chained attention proofs:
+
+```bash
+RAYON_NUM_THREADS=8 target/release/examples/zkgpt_leaf \
+  --all-heads --prove --layer 2 \
+  --previous-block-dir /tmp/sp1-zkgpt-layer1-mlp-projection \
+  --previous-block-join-dir /tmp/sp1-zkgpt-layer1-mlp-projection-join \
+  --output-dir /tmp/sp1-zkgpt-layer2-attention
+```
+
+The same chained-leaf circuit supports every later layer. It verifies the
+immediately preceding block-output proof once on the host, constrains that
+private output inside every leaf, and includes the previous block transcript in
+each new public attention transcript.
