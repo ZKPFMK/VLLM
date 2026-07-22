@@ -454,3 +454,18 @@ The join verifies all expansion proofs on the host and proves their common LN2
 input, upstream transcript, output-column order, private tile commitments, and
 group transcript. Its output is the shared input to layer one's 12 MLP
 projection tiles.
+
+Prove layer one's 12 bias-free MLP projection tiles with one shared setup:
+
+```bash
+RAYON_NUM_THREADS=8 target/release/examples/zkgpt_mlp_projection_leaf \
+  --all-tiles --prove --layer 1 \
+  --expansion-dir /tmp/sp1-zkgpt-layer1-mlp-expansion \
+  --join-dir /tmp/sp1-zkgpt-layer1-mlp-expansion-join \
+  --output-dir /tmp/sp1-zkgpt-layer1-mlp-projection
+```
+
+Each tile verifies the expansion join proof on the host, constrains the private
+`[30, 2304]` input, and applies the matching real BF16 projection-weight
+columns. The 12 ordered `[30, 64]` outputs form layer one's private `[30, 768]`
+block output, ready for the final block-output join.
