@@ -216,5 +216,26 @@ Each tile computes `[30, 768] x [768, 192] -> [30, 192]`, using the real BF16
 column slice of `attention_projection_weight.bf16.bin`. The circuit recomputes
 the private input commitment and constrains it to the verified Attention join
 output. Four ordered outputs are concatenated into a private `[30, 768]` file;
-their group manifest is host-generated pending the next lightweight fan-in
+their group manifest is host-generated for the following lightweight fan-in
 proof.
+
+Bind the four private tile outputs and their proof transcripts into one proved
+`[30, 768]` c_proj output:
+
+```bash
+cargo build -p sp1-recursion-compiler --release \
+  --example zkgpt_c_proj_join
+
+target/release/examples/zkgpt_c_proj_join \
+  --prove --layer 0 \
+  --tile-dir /tmp/sp1-zkgpt-layer0-c-proj \
+  --output-dir /tmp/sp1-zkgpt-layer0-c-proj-join
+```
+
+The host verifies all four tile proofs with their shared verifying key. The join
+circuit recomputes every tile-output commitment and tile transcript, enforces a
+common Attention input and upstream transcript, preserves output-column order,
+and proves exactly the c_proj group transcript already recorded by the tile
+batch. As with the Attention fan-in, child STARK verification remains on the
+host; the join circuit cryptographically binds the verified child public
+transcripts to the combined private output.
