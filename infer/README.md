@@ -259,3 +259,23 @@ private `[30, 768]` input commitment before applying the real private
 is independent across tokens and this complete stage fits in `2^16` rows, so it
 uses one proof and needs no fan-in join. Its private `[30, 768]` output is the
 shared input to the following MLP-expansion tiles.
+
+Prove the bias-free MLP expansion and `gelu_new` activation as 12 output-column
+tiles with one shared setup:
+
+```bash
+cargo build -p sp1-recursion-compiler --release \
+  --example zkgpt_mlp_expansion_leaf
+
+RAYON_NUM_THREADS=8 target/release/examples/zkgpt_mlp_expansion_leaf \
+  --all-tiles --prove --layer 0 \
+  --ln2-dir /tmp/sp1-zkgpt-layer0-ln2 \
+  --output-dir /tmp/sp1-zkgpt-layer0-mlp-expansion
+```
+
+Each tile computes `[30, 768] x [768, 192] -> [30, 192]` and applies the BF16
+`gelu_new` lookup to all 5,760 results. The 12 circuits share the verified LN2
+input commitment and use the corresponding private column slices of the real
+`mlp_expansion_weight.bf16.bin`. Their ordered private outputs are concatenated
+into `[30, 2304]`; the generated group manifest remains host-computed until the
+following MLP-expansion fan-in proof binds all child transcripts.
