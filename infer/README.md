@@ -426,3 +426,17 @@ The host verifies the layer-one c_proj join proof, while the LN2 circuit binds
 its private output tensor and applies the real BF16 `ln_2_weight` and
 `ln_2_bias` values from checkpoint layer one. The proved `[30, 768]` output is
 the common input for layer one's MLP-expansion shards.
+
+Prove layer one's 12 MLP expansion and GELU tiles with one shared setup:
+
+```bash
+RAYON_NUM_THREADS=8 target/release/examples/zkgpt_mlp_expansion_leaf \
+  --all-tiles --prove --layer 1 \
+  --ln2-dir /tmp/sp1-zkgpt-layer1-ln2 \
+  --output-dir /tmp/sp1-zkgpt-layer1-mlp-expansion
+```
+
+Each tile verifies the common layer-one LN2 proof on the host, constrains its
+private `[30, 768]` input to the LN2 output commitment, and applies the matching
+real BF16 expansion-weight columns followed by `gelu_new`. The 12 ordered
+outputs form the private `[30, 2304]` tensor consumed by the expansion join.
