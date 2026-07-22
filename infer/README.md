@@ -469,3 +469,17 @@ Each tile verifies the expansion join proof on the host, constrains the private
 `[30, 2304]` input, and applies the matching real BF16 projection-weight
 columns. The 12 ordered `[30, 64]` outputs form layer one's private `[30, 768]`
 block output, ready for the final block-output join.
+
+Complete layer one by binding those 12 outputs into its block-output proof:
+
+```bash
+target/release/examples/zkgpt_mlp_projection_join \
+  --prove --layer 1 \
+  --tile-dir /tmp/sp1-zkgpt-layer1-mlp-projection \
+  --output-dir /tmp/sp1-zkgpt-layer1-mlp-projection-join
+```
+
+This produces the second complete block-output commitment in the chained proof
+sequence. To start layer two, pass the projection tile directory as
+`--previous-block-dir` and this join directory as
+`--previous-block-join-dir` to `zkgpt_leaf --layer 2`.
