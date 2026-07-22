@@ -440,3 +440,17 @@ Each tile verifies the common layer-one LN2 proof on the host, constrains its
 private `[30, 768]` input to the LN2 output commitment, and applies the matching
 real BF16 expansion-weight columns followed by `gelu_new`. The 12 ordered
 outputs form the private `[30, 2304]` tensor consumed by the expansion join.
+
+Bind the 12 layer-one expansion outputs into one proved `[30, 2304]` tensor:
+
+```bash
+target/release/examples/zkgpt_mlp_expansion_join \
+  --prove --layer 1 \
+  --tile-dir /tmp/sp1-zkgpt-layer1-mlp-expansion \
+  --output-dir /tmp/sp1-zkgpt-layer1-mlp-expansion-join
+```
+
+The join verifies all expansion proofs on the host and proves their common LN2
+input, upstream transcript, output-column order, private tile commitments, and
+group transcript. Its output is the shared input to layer one's 12 MLP
+projection tiles.
