@@ -177,3 +177,23 @@ and writes a JSON manifest containing the ordered child commitments, proof
 timings, artifact sizes, and an attention-group output commitment. The group
 concatenation is currently checked by the host; it is not yet a recursive
 aggregation proof.
+
+Generate the cryptographic fan-in proof after the 12 leaf artifacts exist:
+
+```bash
+cargo build -p sp1-recursion-compiler --release \
+  --example zkgpt_attention_join
+
+target/release/examples/zkgpt_attention_join \
+  --prove --layer 0 \
+  --leaf-dir /tmp/sp1-zkgpt-layer0-attention \
+  --output-dir /tmp/sp1-zkgpt-layer0-attention-join
+```
+
+The host first verifies all 12 leaf proofs with their shared verifying key. The
+join circuit then recomputes every private head-output commitment and leaf
+transcript, enforces head order, concatenates the outputs, and proves the group
+output commitment. The resulting manifest records the ordered child transcript
+digests needed to verify the multi-proof statement. This stage composes the
+proofs cryptographically but does not yet verify the child STARKs recursively
+inside one circuit.
