@@ -15,7 +15,7 @@ pub(crate) use arithmetic::*;
 pub use bf16::{
     Bf16Gpt2AttentionMaxHints, Bf16Gpt2BlockOutput, Bf16Gpt2BlockParams, Bf16Gpt2Cache,
     Bf16Gpt2ModelOutput, Bf16Gpt2ModelParams, Bf16Gpt2TransformerOutput, Bf16Gpt2TransformerParams,
-    Bf16KvCache,
+    Bf16KvCache, Bf16ZkGptAttentionMaxHints, Bf16ZkGptBlockParams, Bf16ZkGptStackParams,
 };
 pub use builder::*;
 pub use instructions::*;

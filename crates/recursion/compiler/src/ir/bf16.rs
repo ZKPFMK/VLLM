@@ -1,7 +1,7 @@
 use slop_algebra::AbstractField;
 use sp1_primitives::SP1Field;
 
-use super::{Builder, Config, DslIr, Felt};
+use super::{Builder, Config, DslIr, Felt, IrIter};
 
 /// Per-head key/value cache for one GPT-2 transformer layer.
 #[derive(Clone, Debug, Default)]
@@ -136,6 +136,45 @@ pub struct Bf16Gpt2ModelOutput {
     pub cache: Bf16Gpt2Cache,
 }
 
+/// Borrowed BF16 parameters for one zkGPT-style transformer layer.
+///
+/// This deliberately follows the simplified computation implemented by the zkGPT prototype:
+/// four bias-free matrices, no residual connections, an MLP width equal to the QKV width, and no
+/// final layer normalization or language-model head. The input and output are flattened row-major
+/// `[sequence_length, hidden_size]` matrices.
+#[derive(Clone, Copy, Debug)]
+pub struct Bf16ZkGptBlockParams<'a> {
+    pub layer_norm_1_weight: &'a [Felt<SP1Field>],
+    pub layer_norm_1_bias: &'a [Felt<SP1Field>],
+    /// Bias-free `[hidden_size, 3 * hidden_size]` QKV projection.
+    pub attention_qkv_weight: &'a [Felt<SP1Field>],
+    /// Bias-free `[hidden_size, hidden_size]` attention projection.
+    pub attention_projection_weight: &'a [Felt<SP1Field>],
+    pub layer_norm_2_weight: &'a [Felt<SP1Field>],
+    pub layer_norm_2_bias: &'a [Felt<SP1Field>],
+    /// Bias-free `[hidden_size, linear_size]` MLP expansion.
+    pub mlp_expansion_weight: &'a [Felt<SP1Field>],
+    /// Bias-free `[linear_size, hidden_size]` MLP projection.
+    pub mlp_projection_weight: &'a [Felt<SP1Field>],
+    pub layer_norm_epsilon: Felt<SP1Field>,
+    pub attention_scale: Felt<SP1Field>,
+    pub num_heads: usize,
+}
+
+/// Externally supplied causal-attention maxima for a zkGPT-style transformer stack.
+///
+/// `layers[layer]` is row-major `[sequence_length, num_heads]`.
+#[derive(Clone, Debug, Default)]
+pub struct Bf16ZkGptAttentionMaxHints {
+    pub layers: Vec<Vec<Felt<SP1Field>>>,
+}
+
+/// Borrowed parameters for a stack of zkGPT-style transformer layers.
+#[derive(Clone, Copy, Debug)]
+pub struct Bf16ZkGptStackParams<'a> {
+    pub blocks: &'a [Bf16ZkGptBlockParams<'a>],
+}
+
 /// Encode a positive integer as BF16 using the same round-toward-zero policy as the arithmetic
 /// chips. The common GPT-2 dimensions (including 768 and 3072) are represented exactly.
 fn usize_to_bf16_raw(value: usize) -> u16 {
@@ -258,6 +297,60 @@ impl<C: Config> Builder<C> {
             output.push(self.bf16_add(dot, bias[output_index]));
         }
         output
+    }
+
+    /// Apply a bias-free BF16 linear transformation.
+    ///
+    /// `weight` is row-major `[input_features, output_features]`. This matches the matrix boundary
+    /// used by the zkGPT prototype, whose fully connected circuit explicitly omits bias terms.
+    pub fn bf16_linear_no_bias(
+        &mut self,
+        input: &[Felt<SP1Field>],
+        weight: &[Felt<SP1Field>],
+        output_features: usize,
+    ) -> Vec<Felt<SP1Field>> {
+        assert!(!input.is_empty(), "bias-free BF16 linear requires at least one input feature");
+        assert!(output_features > 0, "bias-free BF16 linear requires an output feature");
+        let expected_weight_len = input
+            .len()
+            .checked_mul(output_features)
+            .expect("bias-free BF16 linear weight dimensions overflow");
+        assert_eq!(
+            weight.len(),
+            expected_weight_len,
+            "bias-free BF16 linear weight shape mismatch"
+        );
+
+        (0..output_features)
+            .map(|output_index| {
+                let column = weight
+                    .chunks_exact(output_features)
+                    .map(|row| row[output_index])
+                    .collect::<Vec<_>>();
+                self.bf16_dot(input, &column)
+            })
+            .collect()
+    }
+
+    /// Apply one shared bias-free matrix to every row of a flattened BF16 matrix.
+    pub fn bf16_linear_rows_no_bias(
+        &mut self,
+        input: &[Felt<SP1Field>],
+        input_features: usize,
+        weight: &[Felt<SP1Field>],
+    ) -> Vec<Felt<SP1Field>> {
+        assert!(input_features > 0, "BF16 row-wise linear requires an input feature");
+        assert!(!input.is_empty(), "BF16 row-wise linear requires at least one row");
+        assert_eq!(input.len() % input_features, 0, "BF16 row-wise linear input shape mismatch");
+        assert_eq!(weight.len() % input_features, 0, "BF16 row-wise linear weight shape mismatch");
+        let output_features = weight.len() / input_features;
+        assert!(output_features > 0, "BF16 row-wise linear requires an output feature");
+
+        let rows: Vec<Vec<_>> =
+            input.chunks_exact(input_features).ir_par_map_collect(self, |builder, row| {
+                builder.bf16_linear_no_bias(row, weight, output_features)
+            });
+        rows.into_iter().flatten().collect()
     }
 
     /// Split one GPT-2 QKV projection into query, key, and value heads.
@@ -454,6 +547,22 @@ impl<C: Config> Builder<C> {
     pub fn bf16_gelu_new_vector(&mut self, values: &[Felt<SP1Field>]) -> Vec<Felt<SP1Field>> {
         assert!(!values.is_empty(), "BF16 GELU requires at least one value");
         values.iter().map(|&value| self.bf16_gelu_new(value)).collect()
+    }
+
+    /// Apply GPT-2's `gelu_new` activation independently to every row of a flattened matrix.
+    pub fn bf16_gelu_new_rows(
+        &mut self,
+        values: &[Felt<SP1Field>],
+        row_size: usize,
+    ) -> Vec<Felt<SP1Field>> {
+        assert!(row_size > 0, "BF16 row-wise GELU requires a nonzero row size");
+        assert!(!values.is_empty(), "BF16 row-wise GELU requires at least one row");
+        assert_eq!(values.len() % row_size, 0, "BF16 row-wise GELU input shape mismatch");
+
+        let rows: Vec<Vec<_>> = values
+            .chunks_exact(row_size)
+            .ir_par_map_collect(self, |builder, row| builder.bf16_gelu_new_vector(row));
+        rows.into_iter().flatten().collect()
     }
 
     /// Evaluate GPT-2's pre-normalized MLP sub-block and residual connection.
@@ -663,6 +772,185 @@ impl<C: Config> Builder<C> {
         );
 
         Bf16Gpt2BlockOutput { hidden_state, cache: updated_cache }
+    }
+
+    /// Apply one shared BF16 layer normalization to every row of a flattened matrix.
+    pub fn bf16_layer_norm_rows(
+        &mut self,
+        values: &[Felt<SP1Field>],
+        row_size: usize,
+        weight: &[Felt<SP1Field>],
+        bias: &[Felt<SP1Field>],
+        epsilon: Felt<SP1Field>,
+    ) -> Vec<Felt<SP1Field>> {
+        assert!(row_size > 0, "BF16 row-wise layer norm requires a nonzero row size");
+        assert!(!values.is_empty(), "BF16 row-wise layer norm requires at least one row");
+        assert_eq!(values.len() % row_size, 0, "BF16 row-wise layer norm input shape mismatch");
+        assert_eq!(weight.len(), row_size, "BF16 row-wise layer norm weight shape mismatch");
+        assert_eq!(bias.len(), row_size, "BF16 row-wise layer norm bias shape mismatch");
+
+        let rows: Vec<Vec<_>> =
+            values.chunks_exact(row_size).ir_par_map_collect(self, |builder, row| {
+                builder.bf16_layer_norm(row, weight, bias, epsilon)
+            });
+        rows.into_iter().flatten().collect()
+    }
+
+    /// Evaluate one full-sequence transformer layer with the simplified zkGPT architecture.
+    ///
+    /// Unlike [`Self::bf16_gpt2_block`], this method consumes every token at once, constructs the
+    /// complete causal attention triangle, omits all four linear biases and both residual additions,
+    /// and uses the QKV width as the MLP expansion width. These are the computation boundaries in
+    /// the zkGPT prototype; BF16 arithmetic remains in use so the proof-system comparison changes
+    /// one independent variable at a time.
+    pub fn bf16_zkgpt_block(
+        &mut self,
+        hidden_states: &[Felt<SP1Field>],
+        attention_max_hints: &[Felt<SP1Field>],
+        params: &Bf16ZkGptBlockParams<'_>,
+    ) -> Vec<Felt<SP1Field>> {
+        assert!(!hidden_states.is_empty(), "BF16 zkGPT block requires a hidden-state matrix");
+        assert!(params.num_heads > 0, "BF16 zkGPT block requires at least one attention head");
+
+        let hidden_size = params.layer_norm_1_weight.len();
+        assert!(hidden_size > 0, "BF16 zkGPT block requires a nonzero hidden size");
+        assert_eq!(hidden_states.len() % hidden_size, 0, "BF16 zkGPT hidden-state shape mismatch");
+        assert_eq!(
+            hidden_size % params.num_heads,
+            0,
+            "BF16 zkGPT hidden size must be divisible by its head count"
+        );
+        let sequence_length = hidden_states.len() / hidden_size;
+        let head_dimension = hidden_size / params.num_heads;
+        assert_eq!(
+            attention_max_hints.len(),
+            sequence_length * params.num_heads,
+            "BF16 zkGPT attention max hint shape mismatch"
+        );
+        assert_eq!(
+            params.layer_norm_1_bias.len(),
+            hidden_size,
+            "BF16 zkGPT ln_1 bias shape mismatch"
+        );
+        assert_eq!(
+            params.layer_norm_2_weight.len(),
+            hidden_size,
+            "BF16 zkGPT ln_2 weight shape mismatch"
+        );
+        assert_eq!(
+            params.layer_norm_2_bias.len(),
+            hidden_size,
+            "BF16 zkGPT ln_2 bias shape mismatch"
+        );
+        let qkv_size = hidden_size.checked_mul(3).expect("BF16 zkGPT QKV dimensions overflow");
+        assert_eq!(
+            params.attention_qkv_weight.len(),
+            hidden_size * qkv_size,
+            "BF16 zkGPT QKV weight shape mismatch"
+        );
+        assert_eq!(
+            params.attention_projection_weight.len(),
+            hidden_size * hidden_size,
+            "BF16 zkGPT attention projection weight shape mismatch"
+        );
+        assert_eq!(
+            params.mlp_expansion_weight.len() % hidden_size,
+            0,
+            "BF16 zkGPT MLP expansion weight shape mismatch"
+        );
+        let linear_size = params.mlp_expansion_weight.len() / hidden_size;
+        assert_eq!(
+            linear_size, qkv_size,
+            "zkGPT uses one shared 3 * hidden width for QKV and MLP expansion"
+        );
+        assert_eq!(
+            params.mlp_projection_weight.len(),
+            linear_size * hidden_size,
+            "BF16 zkGPT MLP projection weight shape mismatch"
+        );
+
+        let normalized = self.bf16_layer_norm_rows(
+            hidden_states,
+            hidden_size,
+            params.layer_norm_1_weight,
+            params.layer_norm_1_bias,
+            params.layer_norm_epsilon,
+        );
+        let qkv =
+            self.bf16_linear_rows_no_bias(&normalized, hidden_size, params.attention_qkv_weight);
+
+        let attention_rows: Vec<Vec<_>> =
+            (0..sequence_length).ir_par_map_collect(self, |builder, query_token| {
+                let query_row = &qkv[query_token * qkv_size..(query_token + 1) * qkv_size];
+                let mut token_heads = Vec::with_capacity(params.num_heads);
+                for head in 0..params.num_heads {
+                    let head_start = head * head_dimension;
+                    let head_end = head_start + head_dimension;
+                    let query = &query_row[head_start..head_end];
+                    let mut causal_keys = Vec::with_capacity((query_token + 1) * head_dimension);
+                    let mut causal_values = Vec::with_capacity((query_token + 1) * head_dimension);
+                    for key_token in 0..=query_token {
+                        let key_value_row = &qkv[key_token * qkv_size..(key_token + 1) * qkv_size];
+                        causal_keys.extend_from_slice(
+                            &key_value_row[hidden_size + head_start..hidden_size + head_end],
+                        );
+                        causal_values.extend_from_slice(
+                            &key_value_row
+                                [2 * hidden_size + head_start..2 * hidden_size + head_end],
+                        );
+                    }
+                    token_heads.push(builder.bf16_attention_head(
+                        query,
+                        &causal_keys,
+                        &causal_values,
+                        params.attention_scale,
+                        attention_max_hints[query_token * params.num_heads + head],
+                    ));
+                }
+                builder.bf16_merge_attention_heads(&token_heads)
+            });
+        let attention_context = attention_rows.into_iter().flatten().collect::<Vec<_>>();
+
+        let projected_attention = self.bf16_linear_rows_no_bias(
+            &attention_context,
+            hidden_size,
+            params.attention_projection_weight,
+        );
+        let normalized_mlp = self.bf16_layer_norm_rows(
+            &projected_attention,
+            hidden_size,
+            params.layer_norm_2_weight,
+            params.layer_norm_2_bias,
+            params.layer_norm_epsilon,
+        );
+        let expanded = self.bf16_linear_rows_no_bias(
+            &normalized_mlp,
+            hidden_size,
+            params.mlp_expansion_weight,
+        );
+        let activated = self.bf16_gelu_new_rows(&expanded, linear_size);
+        self.bf16_linear_rows_no_bias(&activated, linear_size, params.mlp_projection_weight)
+    }
+
+    /// Evaluate a complete stack of simplified zkGPT-style transformer layers.
+    pub fn bf16_zkgpt_stack(
+        &mut self,
+        hidden_states: &[Felt<SP1Field>],
+        attention_max_hints: &Bf16ZkGptAttentionMaxHints,
+        params: &Bf16ZkGptStackParams<'_>,
+    ) -> Vec<Felt<SP1Field>> {
+        assert!(!params.blocks.is_empty(), "BF16 zkGPT stack requires at least one block");
+        assert_eq!(
+            attention_max_hints.layers.len(),
+            params.blocks.len(),
+            "BF16 zkGPT attention hint layer count mismatch"
+        );
+
+        let mut hidden_states = hidden_states.to_vec();
+        for (block, layer_hints) in params.blocks.iter().zip(&attention_max_hints.layers) {
+            hidden_states = self.bf16_zkgpt_block(&hidden_states, layer_hints, block);
+        }
+        hidden_states
     }
 
     /// Evaluate one token through all GPT-2 transformer blocks and the final `ln_f`.
@@ -1622,6 +1910,76 @@ mod tests {
         assert_eq!(executor.record.bf16_add_sub_events.len(), 44);
         assert_eq!(executor.record.bf16_unary_events.len(), 9);
         assert_eq!(executor.record.bf16_div_events.len(), 5);
+    }
+
+    #[test]
+    fn compiles_and_executes_bf16_zkgpt_stack() {
+        const SEQUENCE_LENGTH: usize = 2;
+        const HIDDEN_SIZE: usize = 4;
+        const NUM_HEADS: usize = 2;
+        const LINEAR_SIZE: usize = 3 * HIDDEN_SIZE;
+        const NUM_BLOCKS: usize = 2;
+
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let hidden_states =
+            bf16_constants(&mut builder, &vec![0x0000; SEQUENCE_LENGTH * HIDDEN_SIZE]);
+        let layer_norm_weight = bf16_constants(&mut builder, &vec![0x3f80; HIDDEN_SIZE]);
+        let layer_norm_bias = bf16_constants(&mut builder, &vec![0x0000; HIDDEN_SIZE]);
+        let attention_qkv_weight =
+            bf16_constants(&mut builder, &vec![0x3f80; HIDDEN_SIZE * 3 * HIDDEN_SIZE]);
+        let attention_projection_weight =
+            bf16_constants(&mut builder, &vec![0x3f80; HIDDEN_SIZE * HIDDEN_SIZE]);
+        let mlp_expansion_weight =
+            bf16_constants(&mut builder, &vec![0x3f80; HIDDEN_SIZE * LINEAR_SIZE]);
+        let mlp_projection_weight =
+            bf16_constants(&mut builder, &vec![0x3f80; LINEAR_SIZE * HIDDEN_SIZE]);
+        let epsilon = builder.constant(SP1Field::from_canonical_u16(0x3f80));
+        let attention_scale = builder.constant(SP1Field::from_canonical_u16(0x3f80));
+        let zero = builder.constant(SP1Field::zero());
+        let block = Bf16ZkGptBlockParams {
+            layer_norm_1_weight: &layer_norm_weight,
+            layer_norm_1_bias: &layer_norm_bias,
+            attention_qkv_weight: &attention_qkv_weight,
+            attention_projection_weight: &attention_projection_weight,
+            layer_norm_2_weight: &layer_norm_weight,
+            layer_norm_2_bias: &layer_norm_bias,
+            mlp_expansion_weight: &mlp_expansion_weight,
+            mlp_projection_weight: &mlp_projection_weight,
+            layer_norm_epsilon: epsilon,
+            attention_scale,
+            num_heads: NUM_HEADS,
+        };
+        let blocks = [block; NUM_BLOCKS];
+        let params = Bf16ZkGptStackParams { blocks: &blocks };
+        let attention_max_hints = Bf16ZkGptAttentionMaxHints {
+            layers: vec![vec![zero; SEQUENCE_LENGTH * NUM_HEADS]; NUM_BLOCKS],
+        };
+        let output = builder.bf16_zkgpt_stack(&hidden_states, &attention_max_hints, &params);
+        assert_eq!(output.len(), hidden_states.len());
+        for &value in &output {
+            builder.assert_felt_eq(value, SP1Field::zero());
+        }
+
+        let root_block = builder.into_root_block();
+        let parallel_stages = root_block
+            .ops
+            .iter()
+            .filter(|op| matches!(op, DslIr::Parallel(rows) if rows.len() == SEQUENCE_LENGTH))
+            .count();
+        assert_eq!(parallel_stages, 8 * NUM_BLOCKS);
+
+        let mut compiler = AsmCompiler::default();
+        let program = Arc::new(compiler.compile_inner(root_block).validate().unwrap());
+        let mut executor =
+            Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
+        executor.run().unwrap();
+
+        // One block has 382 multiplications, 334 additions/subtractions, 50 unary lookups, and
+        // 14 divisions for this shape. The stack must repeat the exact computation twice.
+        assert_eq!(executor.record.bf16_mul_events.len(), 382 * NUM_BLOCKS);
+        assert_eq!(executor.record.bf16_add_sub_events.len(), 334 * NUM_BLOCKS);
+        assert_eq!(executor.record.bf16_unary_events.len(), 50 * NUM_BLOCKS);
+        assert_eq!(executor.record.bf16_div_events.len(), 14 * NUM_BLOCKS);
     }
 
     #[test]
