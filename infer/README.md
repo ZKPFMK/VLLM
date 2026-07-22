@@ -297,3 +297,24 @@ join circuit checks the private tile-output commitments and transcripts,
 enforces a common LN2 input and ordered, complete output-column coverage, and
 proves the same group transcript as the tile batch. Its verified `[30, 2304]`
 output is the input to the following MLP projection shards.
+
+Prove the bias-free MLP projection as 12 output-column tiles with one shared
+setup:
+
+```bash
+cargo build -p sp1-recursion-compiler --release \
+  --example zkgpt_mlp_projection_leaf
+
+RAYON_NUM_THREADS=8 target/release/examples/zkgpt_mlp_projection_leaf \
+  --all-tiles --prove --layer 0 \
+  --expansion-dir /tmp/sp1-zkgpt-layer0-mlp-expansion \
+  --join-dir /tmp/sp1-zkgpt-layer0-mlp-expansion-join \
+  --output-dir /tmp/sp1-zkgpt-layer0-mlp-projection
+```
+
+Each tile computes `[30, 2304] x [2304, 64] -> [30, 64]` using the matching
+private output-column slice of the real `mlp_projection_weight.bf16.bin`. There
+is no second activation, linear bias, or residual addition in the simplified
+zkGPT comparison architecture. The 12 ordered private outputs are concatenated
+into the block's `[30, 768]` output; its host group manifest is bound by the
+following block-output join proof.
