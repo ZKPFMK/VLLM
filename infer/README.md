@@ -197,3 +197,24 @@ output commitment. The resulting manifest records the ordered child transcript
 digests needed to verify the multi-proof statement. This stage composes the
 proofs cryptographically but does not yet verify the child STARKs recursively
 inside one circuit.
+
+Prove the following bias-free attention projection as four bounded output-column
+tiles, reusing one setup:
+
+```bash
+cargo build -p sp1-recursion-compiler --release \
+  --example zkgpt_c_proj_leaf
+
+RAYON_NUM_THREADS=8 target/release/examples/zkgpt_c_proj_leaf \
+  --all-tiles --prove --layer 0 \
+  --attention-dir /tmp/sp1-zkgpt-layer0-attention \
+  --join-dir /tmp/sp1-zkgpt-layer0-attention-join \
+  --output-dir /tmp/sp1-zkgpt-layer0-c-proj
+```
+
+Each tile computes `[30, 768] x [768, 192] -> [30, 192]`, using the real BF16
+column slice of `attention_projection_weight.bf16.bin`. The circuit recomputes
+the private input commitment and constrains it to the verified Attention join
+output. Four ordered outputs are concatenated into a private `[30, 768]` file;
+their group manifest is host-generated pending the next lightweight fan-in
+proof.
