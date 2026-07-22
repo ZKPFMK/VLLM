@@ -397,3 +397,17 @@ The existing c_proj leaf protocol is layer-independent: it verifies the
 matching attention join proof, constrains the private attention tensor to that
 join's output commitment, and loads the real projection weights from the
 requested checkpoint layer.
+
+Bind those four layer-one tiles into a single proved c_proj output:
+
+```bash
+target/release/examples/zkgpt_c_proj_join \
+  --prove --layer 1 \
+  --tile-dir /tmp/sp1-zkgpt-layer1-c-proj \
+  --output-dir /tmp/sp1-zkgpt-layer1-c-proj-join
+```
+
+This is the same bounded fan-in circuit used for layer zero. It verifies the
+four tile proofs on the host, enforces ordered and complete output-column
+coverage in the join circuit, and preserves the layer-one attention upstream
+transcript for the following `ln_2` proof.
