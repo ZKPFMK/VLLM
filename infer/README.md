@@ -318,3 +318,26 @@ is no second activation, linear bias, or residual addition in the simplified
 zkGPT comparison architecture. The 12 ordered private outputs are concatenated
 into the block's `[30, 768]` output; its host group manifest is bound by the
 following block-output join proof.
+
+Verify the 12 projection proofs and bind their ordered outputs into the final
+proved `[30, 768]` output of layer zero:
+
+```bash
+cargo build -p sp1-recursion-compiler --release \
+  --example zkgpt_mlp_projection_join
+
+target/release/examples/zkgpt_mlp_projection_join \
+  --prove --layer 0 \
+  --tile-dir /tmp/sp1-zkgpt-layer0-mlp-projection \
+  --output-dir /tmp/sp1-zkgpt-layer0-mlp-projection-join
+```
+
+The host verifies all 12 projection proofs with their shared verifying key. The
+join circuit recomputes every private `[30, 64]` output commitment and child
+transcript, enforces the common MLP-expansion input and tile order, concatenates
+the columns, and proves the block-output transcript. As with the preceding join
+stages, child STARK verification is currently host-side; the join circuit binds
+the verified child statements but does not recursively verify the child STARKs
+inside the circuit. Because this comparison architecture omits the residual,
+the joined projection tensor is the simplified block output and can be chained
+to the next layer's attention leaf shards.
