@@ -156,16 +156,22 @@ not run the full command on an ordinary workstation.
 ### One proof per Block and one final recursion proof
 
 The server-oriented path avoids the 12-Block monolithic trace. Each invocation
-of `zkgpt_like --block N` proves exactly one complete GPT-2 Block and commits its
-input, private parameters, hints, output, and the previous Block transcript.
-The following Block verifies the previous proof on the host, consumes its
-committed private output, and proves the next link.
+of `zkgpt_like --block N` proves exactly one complete GPT-2 Block. The public
+hidden-state input is placed in `MemoryConst`; model parameters and attention
+hints enter through the private witness stream. There are no separate Poseidon
+commitments for input, output, parameters, or hints. The PCS trace commitment
+binds the private witness values used by that individual proof.
+
+The following Block verifies the previous proof on the host and consumes its
+host-carried private output. Because the output has no explicit public
+commitment, this experimental mode does not cryptographically enforce equality
+between one Block's output file and the next Block's input.
 
 After all 12 Block proofs exist, `zkgpt_block_recursion` performs actual
 in-circuit child-STARK verification. Every join verifies two child proofs and
-their verifying-key hashes, checks the Block range and the input/output and
-transcript boundaries, and emits one recursion proof. The runner constructs the
-binary reduction:
+their verifying-key hashes, checks that their Block ranges are adjacent, and
+emits one recursion proof. It does not check an input/output commitment
+boundary. The runner constructs the binary reduction:
 
 ```text
 12 Block proofs -> 6 -> 3 -> 2 -> 1 final recursion proof
@@ -185,10 +191,11 @@ python3 infer/zkgpt_block_recursion.py \
   --output-root /home/dj/proofs/zkgpt-12-block-recursion
 ```
 
-`--resume` validates and skips completed Block and recursion manifests. The
+`--resume` validates artifact metadata and adjacent Block ranges, then skips
+completed Block and recursion manifests. The
 runner writes `zkgpt_block_recursion.run.json` and prints the final recursion
 manifest path. After completion, verify the serialized final proof, its public
-transcript, and its verifying-key commitment again with:
+recursion transcript, and its verifying-key commitment again with:
 
 ```bash
 python3 infer/zkgpt_block_recursion.py \

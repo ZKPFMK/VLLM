@@ -16,17 +16,12 @@ from zkgpt_block_recursion import (
 )
 
 
-def node(start: int, end: int, input_value: str, output_value: str) -> Node:
-    transcript = f"transcript-{end}"
+def node(start: int, end: int) -> Node:
     return Node(
         manifest=Path(f"/proofs/{start}-{end}.json"),
         kind="block" if end - start == 1 else "recursion",
         start_block=start,
         end_block=end,
-        input_commitment=input_value,
-        output_commitment=output_value,
-        first_upstream_transcript=None if start == 0 else f"transcript-{start}",
-        last_block_transcript=transcript,
         transcript_commitment=f"node-{start}-{end}",
     )
 
@@ -57,23 +52,19 @@ class BlockRecursionRunnerTests(unittest.TestCase):
         self.assertIn("/proofs/blocks/block-06", command)
         self.assertIn("/proofs/blocks/block-07", command)
 
-    def test_boundary_requires_both_output_and_transcript_continuity(self) -> None:
-        left = node(0, 1, "input-0", "boundary")
-        right = node(1, 2, "boundary", "output-2")
+    def test_boundary_requires_adjacent_block_ranges(self) -> None:
+        left = node(0, 1)
+        right = node(1, 2)
         validate_adjacent(left, right)
 
         broken = Node(
             manifest=right.manifest,
             kind=right.kind,
-            start_block=right.start_block,
-            end_block=right.end_block,
-            input_commitment=right.input_commitment,
-            output_commitment=right.output_commitment,
-            first_upstream_transcript="wrong",
-            last_block_transcript=right.last_block_transcript,
+            start_block=2,
+            end_block=3,
             transcript_commitment=right.transcript_commitment,
         )
-        with self.assertRaisesRegex(ValidationError, "transcript chain"):
+        with self.assertRaisesRegex(ValidationError, "non-adjacent"):
             validate_adjacent(left, broken)
 
 

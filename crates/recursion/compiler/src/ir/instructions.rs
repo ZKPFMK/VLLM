@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     ops::{Deref, Range},
+    sync::Arc,
 };
 
 use backtrace::Backtrace;
@@ -9,6 +10,70 @@ use sp1_primitives::{SP1ExtensionField, SP1Field};
 use sp1_recursion_executor::RecursionPublicValues;
 
 use super::{Config, Ext, Felt, Var};
+
+/// A compact DSL representation of one left-to-right BF16 dot product.
+#[derive(Debug, Clone)]
+pub struct Bf16DotProductOp {
+    pub(crate) lhs: Box<[Felt<SP1Field>]>,
+    pub(crate) rhs: Box<[Felt<SP1Field>]>,
+    pub(crate) first_destination: u32,
+}
+
+impl Bf16DotProductOp {
+    /// Number of scalar assembly instructions emitted by this compact operation.
+    pub(crate) fn scalar_instruction_count(&self) -> usize {
+        self.lhs
+            .len()
+            .checked_mul(2)
+            .and_then(|count| count.checked_sub(1))
+            .expect("BF16 dot product instruction count overflow")
+    }
+}
+
+/// A compact DSL representation of a bias-free BF16 linear transformation.
+///
+/// The input is one row and `weight` is row-major `[input_features, output_features]`. Instead of
+/// materializing one [`DslIr::Bf16Mul`] or [`DslIr::Bf16Add`] node per scalar operation, the
+/// assembly compiler expands this descriptor directly into the same scalar instructions. The
+/// virtual destinations are reserved eagerly so later DSL operations can consume the outputs.
+#[derive(Debug, Clone)]
+pub struct Bf16LinearNoBiasOp {
+    pub(crate) input: Box<[Felt<SP1Field>]>,
+    pub(crate) weight: Arc<[Felt<SP1Field>]>,
+    pub(crate) output_features: usize,
+    pub(crate) first_destination: u32,
+}
+
+impl Bf16LinearNoBiasOp {
+    /// Number of scalar assembly instructions emitted by this compact operation.
+    pub(crate) fn scalar_instruction_count(&self) -> usize {
+        let instructions_per_output = self
+            .input
+            .len()
+            .checked_mul(2)
+            .and_then(|count| count.checked_sub(1))
+            .expect("bias-free BF16 linear instruction count overflow");
+        instructions_per_output
+            .checked_mul(self.output_features)
+            .expect("bias-free BF16 linear instruction count overflow")
+    }
+}
+
+/// A compact DSL representation of one left-to-right BF16 mean.
+#[derive(Debug, Clone)]
+pub struct Bf16MeanOp {
+    pub(crate) values: Box<[Felt<SP1Field>]>,
+    pub(crate) divisor: SP1Field,
+    pub(crate) first_destination: u32,
+}
+
+impl Bf16MeanOp {
+    /// Number of scalar assembly instructions emitted by this compact operation.
+    pub(crate) fn scalar_instruction_count(&self) -> usize {
+        // `n - 1` additions, one divisor constant, and one division.
+        self.values.len().checked_add(1).expect("BF16 mean instruction count overflow")
+    }
+}
 
 /// An intermeddiate instruction set for implementing programs.
 ///
@@ -137,6 +202,15 @@ pub enum DslIr<C: Config> {
 
     /// Multiplies two raw 16-bit BF16 values with the `VeriLLM` recursion chip.
     Bf16Mul(Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>),
+    /// Computes one compact left-to-right BF16 dot product.
+    ///
+    /// This is lowered to the existing scalar BF16 multiply/add instructions before execution.
+    Bf16DotProduct(Box<Bf16DotProductOp>),
+    /// Applies one compact bias-free BF16 linear transformation.
+    ///
+    /// This is lowered to the existing scalar BF16 multiply/add instructions before execution, so
+    /// it does not change proof events or chip constraints.
+    Bf16LinearNoBias(Box<Bf16LinearNoBiasOp>),
     /// Squares one raw 16-bit BF16 value with a direct lookup.
     Bf16Square(Felt<SP1Field>, Felt<SP1Field>),
     /// Computes the reciprocal square root of one raw 16-bit BF16 value with a direct lookup.
@@ -151,6 +225,10 @@ pub enum DslIr<C: Config> {
     Bf16Add(Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>),
     /// Subtracts two raw 16-bit BF16 values with the unified Algorithm 3 chip.
     Bf16Sub(Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>),
+    /// Computes one compact left-to-right BF16 mean.
+    ///
+    /// This is lowered to the existing add, constant-write, and divide instructions.
+    Bf16Mean(Box<Bf16MeanOp>),
 
     // Assertions.
     /// Assert that two variables are equal (var == var).

@@ -1,7 +1,11 @@
+use std::sync::Arc;
+
 use slop_algebra::AbstractField;
 use sp1_primitives::SP1Field;
 
-use super::{Builder, Config, DslIr, Felt, IrIter};
+use super::{
+    Bf16DotProductOp, Bf16LinearNoBiasOp, Bf16MeanOp, Builder, Config, DslIr, Felt, IrIter,
+};
 
 /// Per-head key/value cache for one GPT-2 transformer layer.
 #[derive(Clone, Debug, Default)]
@@ -258,12 +262,26 @@ impl<C: Config> Builder<C> {
         assert!(!lhs.is_empty(), "BF16 dot product requires at least one value");
         assert_eq!(lhs.len(), rhs.len(), "BF16 dot product length mismatch");
 
-        let mut sum = self.bf16_mul(lhs[0], rhs[0]);
-        for (&lhs, &rhs) in lhs[1..].iter().zip(&rhs[1..]) {
-            let product = self.bf16_mul(lhs, rhs);
-            sum = self.bf16_add(sum, product);
-        }
-        sum
+        let destination_count = lhs
+            .len()
+            .checked_mul(2)
+            .and_then(|count| count.checked_sub(1))
+            .expect("BF16 dot product destination count overflow");
+        let destination_count =
+            u32::try_from(destination_count).expect("BF16 dot product has too many variables");
+        let first_destination = self.variable_count();
+        let next_destination = first_destination
+            .checked_add(destination_count)
+            .expect("BF16 dot product variable address overflow");
+        self.inner.get_mut().variable_count = next_destination;
+
+        let output = Felt::new(next_destination - 1, self.felt_handle.as_mut());
+        self.push_op(DslIr::Bf16DotProduct(Box::new(Bf16DotProductOp {
+            lhs: lhs.into(),
+            rhs: rhs.into(),
+            first_destination,
+        })));
+        output
     }
 
     /// Apply a BF16 linear transformation with a bias.
@@ -309,6 +327,17 @@ impl<C: Config> Builder<C> {
         weight: &[Felt<SP1Field>],
         output_features: usize,
     ) -> Vec<Felt<SP1Field>> {
+        self.bf16_linear_no_bias_shared(input, Arc::from(weight), output_features)
+    }
+
+    /// Build a compact bias-free BF16 linear operation while sharing the matrix allocation between
+    /// parallel input rows.
+    fn bf16_linear_no_bias_shared(
+        &mut self,
+        input: &[Felt<SP1Field>],
+        weight: Arc<[Felt<SP1Field>]>,
+        output_features: usize,
+    ) -> Vec<Felt<SP1Field>> {
         assert!(!input.is_empty(), "bias-free BF16 linear requires at least one input feature");
         assert!(output_features > 0, "bias-free BF16 linear requires an output feature");
         let expected_weight_len = input
@@ -321,15 +350,44 @@ impl<C: Config> Builder<C> {
             "bias-free BF16 linear weight shape mismatch"
         );
 
-        (0..output_features)
+        // One left-to-right dot product allocates one multiplication result for its first element,
+        // then one multiplication and one addition result for every remaining element.
+        let destinations_per_output = input
+            .len()
+            .checked_mul(2)
+            .and_then(|count| count.checked_sub(1))
+            .expect("bias-free BF16 linear destination count overflow");
+        let destination_count = destinations_per_output
+            .checked_mul(output_features)
+            .expect("bias-free BF16 linear destination count overflow");
+        let destination_count =
+            u32::try_from(destination_count).expect("bias-free BF16 linear has too many variables");
+        let first_destination = self.variable_count();
+        let next_destination = first_destination
+            .checked_add(destination_count)
+            .expect("bias-free BF16 linear variable address overflow");
+        self.inner.get_mut().variable_count = next_destination;
+
+        let handle = self.felt_handle.as_mut() as *mut _;
+        let outputs = (0..output_features)
             .map(|output_index| {
-                let column = weight
-                    .chunks_exact(output_features)
-                    .map(|row| row[output_index])
-                    .collect::<Vec<_>>();
-                self.bf16_dot(input, &column)
+                let output_offset = output_index
+                    .checked_mul(destinations_per_output)
+                    .and_then(|offset| offset.checked_add(destinations_per_output - 1))
+                    .expect("bias-free BF16 linear output address overflow");
+                let output_offset = u32::try_from(output_offset)
+                    .expect("bias-free BF16 linear output address does not fit u32");
+                Felt::new(first_destination + output_offset, handle)
             })
-            .collect()
+            .collect();
+
+        self.push_op(DslIr::Bf16LinearNoBias(Box::new(Bf16LinearNoBiasOp {
+            input: input.into(),
+            weight,
+            output_features,
+            first_destination,
+        })));
+        outputs
     }
 
     /// Apply one shared bias-free matrix to every row of a flattened BF16 matrix.
@@ -345,10 +403,11 @@ impl<C: Config> Builder<C> {
         assert_eq!(weight.len() % input_features, 0, "BF16 row-wise linear weight shape mismatch");
         let output_features = weight.len() / input_features;
         assert!(output_features > 0, "BF16 row-wise linear requires an output feature");
+        let weight: Arc<[Felt<SP1Field>]> = Arc::from(weight);
 
         let rows: Vec<Vec<_>> =
             input.chunks_exact(input_features).ir_par_map_collect(self, |builder, row| {
-                builder.bf16_linear_no_bias(row, weight, output_features)
+                builder.bf16_linear_no_bias_shared(row, Arc::clone(&weight), output_features)
             });
         rows.into_iter().flatten().collect()
     }
@@ -1094,14 +1153,27 @@ impl<C: Config> Builder<C> {
     pub fn bf16_mean(&mut self, values: &[Felt<SP1Field>]) -> Felt<SP1Field> {
         assert!(!values.is_empty(), "BF16 mean requires at least one value");
 
-        let mut sum = values[0];
-        for &value in &values[1..] {
-            sum = self.bf16_add(sum, value);
-        }
-
         let divisor_raw = usize_to_bf16_raw(values.len());
-        let divisor: Felt<SP1Field> = self.constant(SP1Field::from_canonical_u16(divisor_raw));
-        self.bf16_div(sum, divisor)
+        // Reserve `n - 1` addition destinations, one divisor constant, and the final division
+        // destination. This is exactly the address order produced by the former scalar builder.
+        let destination_count = values
+            .len()
+            .checked_add(1)
+            .and_then(|count| u32::try_from(count).ok())
+            .expect("BF16 mean has too many variables");
+        let first_destination = self.variable_count();
+        let next_destination = first_destination
+            .checked_add(destination_count)
+            .expect("BF16 mean variable address overflow");
+        self.inner.get_mut().variable_count = next_destination;
+
+        let output = Felt::new(next_destination - 1, self.felt_handle.as_mut());
+        self.push_op(DslIr::Bf16Mean(Box::new(Bf16MeanOp {
+            values: values.into(),
+            divisor: SP1Field::from_canonical_u16(divisor_raw),
+            first_destination,
+        })));
+        output
     }
 
     /// Compute the population variance of a non-empty BF16 vector around `mean`.
@@ -1223,6 +1295,22 @@ mod tests {
                     .collect::<Vec<_>>();
                 let dot = reference_bf16_dot(input, &column);
                 reference_bf16_add(dot, bias[output_index])
+            })
+            .collect()
+    }
+
+    fn reference_bf16_linear_no_bias(
+        input: &[u16],
+        weight: &[u16],
+        output_features: usize,
+    ) -> Vec<u16> {
+        (0..output_features)
+            .map(|output_index| {
+                let column = weight
+                    .chunks_exact(output_features)
+                    .map(|row| row[output_index])
+                    .collect::<Vec<_>>();
+                reference_bf16_dot(input, &column)
             })
             .collect()
     }
@@ -1490,9 +1578,13 @@ mod tests {
         let output = builder.bf16_dot(&lhs, &rhs);
         builder.assert_felt_eq(output, SP1Field::from_canonical_u16(expected));
 
+        let root_block = builder.into_root_block();
+        assert!(
+            root_block.ops.iter().any(|op| matches!(op, DslIr::Bf16DotProduct(_))),
+            "dot product must remain compact until assembly lowering"
+        );
         let mut compiler = AsmCompiler::default();
-        let program =
-            Arc::new(compiler.compile_inner(builder.into_root_block()).validate().unwrap());
+        let program = Arc::new(compiler.compile_inner(root_block).validate().unwrap());
         let mut executor =
             Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
         executor.run().unwrap();
@@ -1538,6 +1630,61 @@ mod tests {
         executor.run().unwrap();
         assert_eq!(executor.record.bf16_mul_events.len(), raw_input.len() * raw_bias.len());
         assert_eq!(executor.record.bf16_add_sub_events.len(), raw_input.len() * raw_bias.len());
+    }
+
+    #[test]
+    fn compact_bf16_linear_rows_preserve_results_and_events() {
+        const INPUT_FEATURES: usize = 2;
+        const OUTPUT_FEATURES: usize = 3;
+        let raw_input = [
+            0x3f80, 0x4000, // row 0
+            0xbf00, 0x4040, // row 1
+        ];
+        let raw_weight = [
+            0x3f80, 0x4000, 0xbf80, // input feature 0
+            0x4040, 0xbf80, 0x3f00, // input feature 1
+        ];
+        let expected = raw_input
+            .chunks_exact(INPUT_FEATURES)
+            .flat_map(|row| reference_bf16_linear_no_bias(row, &raw_weight, OUTPUT_FEATURES))
+            .collect::<Vec<_>>();
+
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let input = bf16_constants(&mut builder, &raw_input);
+        let weight = bf16_constants(&mut builder, &raw_weight);
+        let output = builder.bf16_linear_rows_no_bias(&input, INPUT_FEATURES, &weight);
+        for (&output, &expected) in output.iter().zip(&expected) {
+            builder.assert_felt_eq(output, SP1Field::from_canonical_u16(expected));
+        }
+
+        let root_block = builder.into_root_block();
+        let linear_rows = root_block
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                DslIr::Parallel(rows)
+                    if rows.len() == raw_input.len() / INPUT_FEATURES
+                        && rows.iter().all(|row| {
+                            matches!(row.ops.as_slice(), [DslIr::Bf16LinearNoBias(_)])
+                        }) =>
+                {
+                    Some(rows)
+                }
+                _ => None,
+            })
+            .expect("row-wise linear must use one compact DSL operation per row");
+        assert_eq!(linear_rows.len(), 2);
+
+        let mut compiler = AsmCompiler::default();
+        let program = Arc::new(compiler.compile_inner(root_block).validate().unwrap());
+        let mut executor =
+            Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
+        executor.run().unwrap();
+        assert_eq!(executor.record.bf16_mul_events.len(), 2 * INPUT_FEATURES * OUTPUT_FEATURES);
+        assert_eq!(
+            executor.record.bf16_add_sub_events.len(),
+            2 * (INPUT_FEATURES - 1) * OUTPUT_FEATURES
+        );
     }
 
     #[test]
@@ -2100,9 +2247,13 @@ mod tests {
         let mean = builder.bf16_mean(&values);
         builder.assert_felt_eq(mean, SP1Field::from_canonical_u16(0xbb3d));
 
+        let root_block = builder.into_root_block();
+        assert!(
+            root_block.ops.iter().any(|op| matches!(op, DslIr::Bf16Mean(_))),
+            "mean must remain compact until assembly lowering"
+        );
         let mut compiler = AsmCompiler::default();
-        let program =
-            Arc::new(compiler.compile_inner(builder.into_root_block()).validate().unwrap());
+        let program = Arc::new(compiler.compile_inner(root_block).validate().unwrap());
         let mut executor =
             Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
         executor.run().unwrap();

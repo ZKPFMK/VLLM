@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate 12 one-Block GPT-2 proofs and reduce them to one recursion proof.
 
-The Block proofs are sequential because Block N consumes the private committed
-output of Block N-1.  Once all 12 leaves exist, recursion proofs are generated
+The Block proofs are sequential because Block N consumes the host-carried
+private output of Block N-1. Once all 12 leaves exist, recursion proofs are generated
 as a binary tree.  With 12 leaves the tree contains 11 joins:
 
     12 -> 6 -> 3 -> 2 -> 1
@@ -36,7 +36,7 @@ RUN_MANIFEST = "zkgpt_block_recursion.run.json"
 
 
 class ValidationError(RuntimeError):
-    """A proof artifact or commitment-chain invariant is invalid."""
+    """A proof artifact or recursion-range invariant is invalid."""
 
 
 @dataclass(frozen=True)
@@ -45,11 +45,7 @@ class Node:
     kind: str
     start_block: int
     end_block: int
-    input_commitment: str
-    output_commitment: str
-    first_upstream_transcript: str | None
-    last_block_transcript: str
-    transcript_commitment: str
+    transcript_commitment: str | None
 
 
 @dataclass(frozen=True)
@@ -160,24 +156,26 @@ def load_block_node(path: Path, expected_block: int) -> Node:
     directory = path.parent
     require_file(directory, data.get("proof_file"), "proof", path)
     require_file(directory, data.get("verifying_key_file"), "verifying key", path)
-    upstream = data.get("upstream_transcript")
-    if upstream is not None:
-        upstream = require_digest(data, "upstream_transcript", path)
-    if expected_block == 0 and upstream is not None:
-        raise ValidationError(f"{path}: Block 0 must not have an upstream transcript")
-    if expected_block > 0 and upstream is None:
-        raise ValidationError(f"{path}: Block {expected_block} is missing its upstream")
-    transcript = require_digest(data, "transcript_commitment", path)
+    require_file(directory, data.get("private_output_file"), "private output", path)
+    if data.get("version") != 2:
+        raise ValidationError(f"{path}: expected Block protocol version 2")
+    if data.get("explicit_value_commitments") is not False:
+        raise ValidationError(f"{path}: explicit value commitments must be disabled")
+    expected_storage = {
+        "public_input_storage": "memory_const",
+        "private_parameters_storage": "hint",
+        "private_auxiliary_hints_storage": "hint",
+        "private_values_binding": "execution_trace_commitment",
+    }
+    for key, expected in expected_storage.items():
+        if data.get(key) != expected:
+            raise ValidationError(f"{path}: expected {key}={expected!r}")
     return Node(
         manifest=path,
         kind="block",
         start_block=expected_block,
         end_block=expected_block + 1,
-        input_commitment=require_digest(data, "input_commitment", path),
-        output_commitment=require_digest(data, "output_commitment", path),
-        first_upstream_transcript=upstream,
-        last_block_transcript=transcript,
-        transcript_commitment=transcript,
+        transcript_commitment=None,
     )
 
 
@@ -185,6 +183,8 @@ def load_recursion_node(path: Path, expected_start: int, expected_end: int) -> N
     data = read_json(path)
     if data.get("stage") != RECURSION_STAGE:
         raise ValidationError(f"{path}: not a Block recursion manifest")
+    if data.get("version") != 2:
+        raise ValidationError(f"{path}: expected recursion protocol version 2")
     require_shape(data, path)
     if data.get("start_block") != expected_start or data.get("end_block") != expected_end:
         raise ValidationError(
@@ -194,18 +194,11 @@ def load_recursion_node(path: Path, expected_start: int, expected_end: int) -> N
     directory = path.parent
     require_file(directory, data.get("proof_file"), "proof", path)
     require_file(directory, data.get("verifying_key_file"), "verifying key", path)
-    upstream = data.get("first_upstream_transcript")
-    if upstream is not None:
-        upstream = require_digest(data, "first_upstream_transcript", path)
     return Node(
         manifest=path,
         kind="recursion",
         start_block=expected_start,
         end_block=expected_end,
-        input_commitment=require_digest(data, "input_commitment", path),
-        output_commitment=require_digest(data, "output_commitment", path),
-        first_upstream_transcript=upstream,
-        last_block_transcript=require_digest(data, "last_block_transcript", path),
         transcript_commitment=require_digest(data, "transcript_commitment", path),
     )
 
@@ -215,14 +208,6 @@ def validate_adjacent(left: Node, right: Node) -> None:
         raise ValidationError(
             f"non-adjacent ranges {left.start_block}..{left.end_block} and "
             f"{right.start_block}..{right.end_block}"
-        )
-    if left.output_commitment != right.input_commitment:
-        raise ValidationError(
-            f"Block boundary {left.end_block}: output/input commitments differ"
-        )
-    if right.first_upstream_transcript != left.last_block_transcript:
-        raise ValidationError(
-            f"Block boundary {left.end_block}: transcript chain is broken"
         )
 
 
@@ -374,10 +359,6 @@ def reduce_nodes(
                     kind="recursion",
                     start_block=left.start_block,
                     end_block=right.end_block,
-                    input_commitment=left.input_commitment,
-                    output_commitment=right.output_commitment,
-                    first_upstream_transcript=left.first_upstream_transcript,
-                    last_block_transcript=right.last_block_transcript,
                     transcript_commitment="<generated>",
                 )
             else:
@@ -433,7 +414,7 @@ def write_run_manifest(
 ) -> None:
     final_data = read_json(final.manifest)
     value = {
-        "version": 1,
+        "version": 2,
         "stage": "zkgpt_full_block_recursion",
         "blocks": NUM_BLOCKS,
         "block_proofs": NUM_BLOCKS,
@@ -441,7 +422,9 @@ def write_run_manifest(
         "total_proofs": 2 * NUM_BLOCKS - 1,
         "data_dir": str(data_dir),
         "final_manifest": str(final.manifest),
-        "final_transcript_commitment": final.transcript_commitment,
+        "final_transcript_commitment": require_digest(
+            final_data, "transcript_commitment", final.manifest
+        ),
         "final_verifying_key_commitment": require_digest(
             final_data, "verifying_key_commitment", final.manifest
         ),
@@ -533,9 +516,10 @@ def run(args: argparse.Namespace) -> int:
             cwd=root,
             check=True,
         )
+        final_data = read_json(final.manifest)
         print(
             f"[runner] valid final proof range=0..{NUM_BLOCKS} "
-            f"transcript={final.transcript_commitment}"
+            f"transcript={require_digest(final_data, 'transcript_commitment', final.manifest)}"
         )
         return 0
 
@@ -576,11 +560,7 @@ def run(args: argparse.Namespace) -> int:
                 kind="block",
                 start_block=block,
                 end_block=block + 1,
-                input_commitment="<generated>",
-                output_commitment="<generated>",
-                first_upstream_transcript=None if block == 0 else "<generated>",
-                last_block_transcript="<generated>",
-                transcript_commitment="<generated>",
+                transcript_commitment=None,
             )
         else:
             output = block_dir(output_root, block)

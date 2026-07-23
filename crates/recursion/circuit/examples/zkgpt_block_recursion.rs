@@ -46,19 +46,13 @@ const DEFAULT_SEQUENCE_LENGTH: usize = 30;
 const DEFAULT_HIDDEN_SIZE: usize = 768;
 const DEFAULT_NUM_HEADS: usize = 12;
 const DEFAULT_LINEAR_SIZE: usize = 2304;
-const GPT2_LAYER_NORM_EPSILON: u16 = 0x3727;
-const GPT2_ATTENTION_SCALE: u16 = 0x3e00;
-
 const PROOF_LOG_BLOWUP: usize = 1;
 const PROOF_LOG_STACKING_HEIGHT: u32 = 22;
 const PROOF_MAX_LOG_ROW_COUNT: usize = 28;
 
-const BLOCK_PROTOCOL_VERSION: u32 = 1;
-const BLOCK_STAGE_GENESIS: u32 = 0x1600;
-const BLOCK_STAGE_CHAINED: u32 = 0x1601;
-const DOMAIN_BLOCK_TRANSCRIPT: u32 = 0x1614;
+const BLOCK_PROTOCOL_VERSION: u32 = 2;
 
-const RECURSION_PROTOCOL_VERSION: u32 = 1;
+const RECURSION_PROTOCOL_VERSION: u32 = 2;
 const RECURSION_STAGE: u32 = 0x1620;
 const DOMAIN_RECURSION_TRANSCRIPT: u32 = 0x1621;
 const NODE_KIND_BLOCK: u32 = 0x1622;
@@ -130,10 +124,6 @@ struct NodeDescriptor {
     kind: NodeKind,
     start_block: usize,
     end_block: usize,
-    input: Digest,
-    output: Digest,
-    first_upstream: Option<Digest>,
-    last_block_transcript: Digest,
     transcript: Digest,
     verifying_key: Digest,
 }
@@ -156,12 +146,11 @@ struct BlockManifest {
     num_heads: usize,
     linear_size: usize,
     shards: usize,
-    upstream_transcript: Option<String>,
-    input_commitment: String,
-    parameters_commitment: String,
-    hints_commitment: String,
-    output_commitment: String,
-    transcript_commitment: String,
+    explicit_value_commitments: bool,
+    public_input_storage: String,
+    private_parameters_storage: String,
+    private_auxiliary_hints_storage: String,
+    private_values_binding: String,
     proof_file: String,
     verifying_key_file: String,
 }
@@ -171,10 +160,6 @@ struct ManifestNodeDescriptor {
     kind: NodeKind,
     start_block: usize,
     end_block: usize,
-    input_commitment: String,
-    output_commitment: String,
-    first_upstream_transcript: Option<String>,
-    last_block_transcript: String,
     transcript_commitment: String,
     verifying_key_commitment: String,
 }
@@ -190,10 +175,6 @@ struct RecursionManifest {
     shards: usize,
     start_block: usize,
     end_block: usize,
-    input_commitment: String,
-    output_commitment: String,
-    first_upstream_transcript: Option<String>,
-    last_block_transcript: String,
     transcript_commitment: String,
     verifying_key_commitment: String,
     left: ManifestNodeDescriptor,
@@ -315,53 +296,12 @@ fn circuit_commit_fields(
     state[..DIGEST_SIZE].try_into().unwrap()
 }
 
-fn block_transcript(manifest: &BlockManifest) -> Digest {
-    assert_eq!(manifest.version, BLOCK_PROTOCOL_VERSION, "unsupported Block protocol");
-    assert_eq!(manifest.stage, "zkgpt_block", "invalid Block stage");
-    assert_eq!(manifest.shards, 1, "a Block proof must contain one shard");
-    let upstream = manifest
-        .upstream_transcript
-        .as_deref()
-        .map(|value| parse_digest(value, "upstream transcript"));
-    if manifest.block == 0 {
-        assert!(upstream.is_none(), "Block 0 must not have an upstream transcript");
-    } else {
-        assert!(upstream.is_some(), "Block {} must have an upstream transcript", manifest.block);
-    }
-    let mut fields = [
-        BLOCK_PROTOCOL_VERSION,
-        if manifest.block == 0 { BLOCK_STAGE_GENESIS } else { BLOCK_STAGE_CHAINED },
-        manifest.block as u32,
-        manifest.sequence_length as u32,
-        manifest.hidden_size as u32,
-        manifest.num_heads as u32,
-        manifest.linear_size as u32,
-        GPT2_LAYER_NORM_EPSILON as u32,
-        GPT2_ATTENTION_SCALE as u32,
-    ]
-    .map(SP1Field::from_canonical_u32)
-    .to_vec();
-    if let Some(upstream) = upstream {
-        fields.extend(upstream);
-    }
-    fields.extend(parse_digest(&manifest.input_commitment, "Block input"));
-    fields.extend(parse_digest(&manifest.parameters_commitment, "Block parameters"));
-    fields.extend(parse_digest(&manifest.hints_commitment, "Block hints"));
-    fields.extend(parse_digest(&manifest.output_commitment, "Block output"));
-    host_commit_fields(DOMAIN_BLOCK_TRANSCRIPT, &fields)
-}
-
 fn descriptor_fields(descriptor: &NodeDescriptor) -> Vec<SP1Field> {
     let mut fields = vec![
         SP1Field::from_canonical_u32(descriptor.kind.tag()),
         SP1Field::from_canonical_usize(descriptor.start_block),
         SP1Field::from_canonical_usize(descriptor.end_block),
-        SP1Field::from_bool(descriptor.first_upstream.is_some()),
     ];
-    fields.extend(descriptor.input);
-    fields.extend(descriptor.output);
-    fields.extend(descriptor.first_upstream.unwrap_or([SP1Field::zero(); DIGEST_SIZE]));
-    fields.extend(descriptor.last_block_transcript);
     fields.extend(descriptor.transcript);
     fields.extend(descriptor.verifying_key);
     fields
@@ -390,16 +330,6 @@ fn descriptor_from_manifest(value: &ManifestNodeDescriptor) -> NodeDescriptor {
         kind: value.kind,
         start_block: value.start_block,
         end_block: value.end_block,
-        input: parse_digest(&value.input_commitment, "node input"),
-        output: parse_digest(&value.output_commitment, "node output"),
-        first_upstream: value
-            .first_upstream_transcript
-            .as_deref()
-            .map(|digest| parse_digest(digest, "node first upstream")),
-        last_block_transcript: parse_digest(
-            &value.last_block_transcript,
-            "node last Block transcript",
-        ),
         transcript: parse_digest(&value.transcript_commitment, "node transcript"),
         verifying_key: parse_digest(&value.verifying_key_commitment, "node verifying key"),
     }
@@ -410,10 +340,6 @@ fn manifest_descriptor(value: NodeDescriptor) -> ManifestNodeDescriptor {
         kind: value.kind,
         start_block: value.start_block,
         end_block: value.end_block,
-        input_commitment: digest_hex(&value.input),
-        output_commitment: digest_hex(&value.output),
-        first_upstream_transcript: value.first_upstream.map(|digest| digest_hex(&digest)),
-        last_block_transcript: digest_hex(&value.last_block_transcript),
         transcript_commitment: digest_hex(&value.transcript),
         verifying_key_commitment: digest_hex(&value.verifying_key),
     }
@@ -421,12 +347,6 @@ fn manifest_descriptor(value: NodeDescriptor) -> ManifestNodeDescriptor {
 
 fn validate_adjacent(left: &NodeDescriptor, right: &NodeDescriptor) {
     assert_eq!(left.end_block, right.start_block, "child Block ranges are not adjacent");
-    assert_eq!(left.output, right.input, "left output does not equal right input");
-    assert_eq!(
-        right.first_upstream,
-        Some(left.last_block_transcript),
-        "right Block chain does not continue from the left child"
-    );
 }
 
 fn safe_artifact_path(manifest_path: &Path, file: &str, label: &str) -> PathBuf {
@@ -490,12 +410,17 @@ fn load_child(manifest_path: &Path) -> ChildArtifact {
         "zkgpt_block" => {
             let manifest: BlockManifest = serde_json::from_value(value)
                 .unwrap_or_else(|error| panic!("invalid Block manifest: {error}"));
-            let transcript = block_transcript(&manifest);
-            assert_eq!(
-                transcript,
-                parse_digest(&manifest.transcript_commitment, "Block transcript"),
-                "Block manifest transcript is inconsistent"
+            assert_eq!(manifest.version, BLOCK_PROTOCOL_VERSION, "unsupported Block protocol");
+            assert_eq!(manifest.stage, "zkgpt_block", "invalid Block stage");
+            assert_eq!(manifest.shards, 1, "a Block proof must contain one shard");
+            assert!(
+                !manifest.explicit_value_commitments,
+                "Block must not contain explicit value commitments"
             );
+            assert_eq!(manifest.public_input_storage, "memory_const");
+            assert_eq!(manifest.private_parameters_storage, "hint");
+            assert_eq!(manifest.private_auxiliary_hints_storage, "hint");
+            assert_eq!(manifest.private_values_binding, "execution_trace_commitment");
             let shape = Shape {
                 sequence_length: manifest.sequence_length,
                 hidden_size: manifest.hidden_size,
@@ -507,18 +432,14 @@ fn load_child(manifest_path: &Path) -> ChildArtifact {
                 &manifest.proof_file,
                 &manifest.verifying_key_file,
             );
+            assert_eq!(proof.shard_proofs.len(), 1, "Block proof must contain one shard");
+            let public_values: &RecursionPublicValues<SP1Field> =
+                proof.shard_proofs[0].public_values.as_slice().borrow();
             let descriptor = NodeDescriptor {
                 kind: NodeKind::Block,
                 start_block: manifest.block,
                 end_block: manifest.block + 1,
-                input: parse_digest(&manifest.input_commitment, "Block input"),
-                output: parse_digest(&manifest.output_commitment, "Block output"),
-                first_upstream: manifest
-                    .upstream_transcript
-                    .as_deref()
-                    .map(|digest| parse_digest(digest, "Block upstream")),
-                last_block_transcript: transcript,
-                transcript,
+                transcript: public_values.digest,
                 verifying_key: [SP1Field::zero(); DIGEST_SIZE],
             };
             (descriptor, shape, proof, vk, None)
@@ -530,6 +451,7 @@ fn load_child(manifest_path: &Path) -> ChildArtifact {
                 manifest.version, RECURSION_PROTOCOL_VERSION,
                 "unsupported recursion protocol"
             );
+            assert_eq!(manifest.stage, "zkgpt_block_recursion", "invalid recursion stage");
             assert_eq!(manifest.shards, 1, "a recursion proof must contain one shard");
             let shape = Shape {
                 sequence_length: manifest.sequence_length,
@@ -552,23 +474,9 @@ fn load_child(manifest_path: &Path) -> ChildArtifact {
                 kind: NodeKind::Recursion,
                 start_block: manifest.start_block,
                 end_block: manifest.end_block,
-                input: parse_digest(&manifest.input_commitment, "recursion input"),
-                output: parse_digest(&manifest.output_commitment, "recursion output"),
-                first_upstream: manifest
-                    .first_upstream_transcript
-                    .as_deref()
-                    .map(|digest| parse_digest(digest, "recursion first upstream")),
-                last_block_transcript: parse_digest(
-                    &manifest.last_block_transcript,
-                    "recursion last Block transcript",
-                ),
                 transcript,
                 verifying_key: [SP1Field::zero(); DIGEST_SIZE],
             };
-            assert_eq!(descriptor.input, left.input);
-            assert_eq!(descriptor.output, right.output);
-            assert_eq!(descriptor.first_upstream, left.first_upstream);
-            assert_eq!(descriptor.last_block_transcript, right.last_block_transcript);
             let (proof, vk) = read_proof_artifacts(
                 manifest_path,
                 &manifest.proof_file,
@@ -672,22 +580,10 @@ fn circuit_descriptor_fields(
     transcript: [Felt<SP1Field>; DIGEST_SIZE],
     verifying_key: [Felt<SP1Field>; DIGEST_SIZE],
 ) -> Vec<Felt<SP1Field>> {
-    let mut fields = [
-        descriptor.kind.tag(),
-        descriptor.start_block as u32,
-        descriptor.end_block as u32,
-        u32::from(descriptor.first_upstream.is_some()),
-    ]
-    .map(|value| builder.constant(SP1Field::from_canonical_u32(value)))
-    .to_vec();
-    for digest in [
-        descriptor.input,
-        descriptor.output,
-        descriptor.first_upstream.unwrap_or([SP1Field::zero(); DIGEST_SIZE]),
-        descriptor.last_block_transcript,
-    ] {
-        fields.extend(digest.map(|value| -> Felt<SP1Field> { builder.constant(value) }));
-    }
+    let mut fields =
+        [descriptor.kind.tag(), descriptor.start_block as u32, descriptor.end_block as u32]
+            .map(|value| builder.constant(SP1Field::from_canonical_u32(value)))
+            .to_vec();
     fields.extend(transcript);
     fields.extend(verifying_key);
     fields
@@ -711,21 +607,6 @@ fn build_program(
         verify_child_in_circuit(&mut builder, left, &left_vk, &left_proof);
     let (right_transcript, right_vk_digest) =
         verify_child_in_circuit(&mut builder, right, &right_vk, &right_proof);
-
-    for (left_output, right_input) in left.descriptor.output.into_iter().zip(right.descriptor.input)
-    {
-        let left_output: Felt<SP1Field> = builder.constant(left_output);
-        builder.assert_felt_eq(left_output, right_input);
-    }
-    for (left_transcript, right_upstream) in left
-        .descriptor
-        .last_block_transcript
-        .into_iter()
-        .zip(right.descriptor.first_upstream.expect("right child must have an upstream"))
-    {
-        let left_transcript: Felt<SP1Field> = builder.constant(left_transcript);
-        builder.assert_felt_eq(left_transcript, right_upstream);
-    }
 
     let mut fields = [
         RECURSION_PROTOCOL_VERSION,
@@ -804,10 +685,6 @@ fn write_manifest(
         "shards": 1,
         "start_block": start_block,
         "end_block": end_block,
-        "input_commitment": digest_hex(&left.descriptor.input),
-        "output_commitment": digest_hex(&right.descriptor.output),
-        "first_upstream_transcript": left.descriptor.first_upstream.map(|digest| digest_hex(&digest)),
-        "last_block_transcript": digest_hex(&right.descriptor.last_block_transcript),
         "transcript_commitment": digest_hex(&transcript),
         "verifying_key_commitment": digest_hex(&vk.hash_koalabear()),
         "left_manifest": left.manifest_path.display().to_string(),
@@ -866,7 +743,7 @@ async fn run(arguments: Arguments) {
         right.descriptor.end_block
     );
     if arguments.mode == Mode::Check {
-        println!("children and commitment chain verified");
+        println!("child proofs and adjacent Block ranges verified");
         return;
     }
 
@@ -962,12 +839,8 @@ mod tests {
             kind,
             start_block: start,
             end_block: end,
-            input: digest(seed),
-            output: digest(seed + 10),
-            first_upstream: (start != 0).then(|| digest(seed - 10)),
-            last_block_transcript: digest(seed + 20),
-            transcript: digest(seed + 30),
-            verifying_key: digest(seed + 40),
+            transcript: digest(seed),
+            verifying_key: digest(seed + 10),
         }
     }
 
@@ -976,19 +849,16 @@ mod tests {
         let shape = Shape::default();
         let left = node(NodeKind::Block, 0, 1, 100);
         let mut right = node(NodeKind::Block, 1, 2, 200);
-        right.input = left.output;
-        right.first_upstream = Some(left.last_block_transcript);
         let expected = aggregate_transcript(shape, &left, &right);
         right.kind = NodeKind::Recursion;
         assert_ne!(expected, aggregate_transcript(shape, &left, &right));
     }
 
     #[test]
-    #[should_panic(expected = "right Block chain")]
-    fn adjacent_ranges_reject_a_broken_transcript_chain() {
+    #[should_panic(expected = "ranges are not adjacent")]
+    fn adjacent_ranges_reject_a_gap() {
         let left = node(NodeKind::Block, 0, 1, 100);
-        let mut right = node(NodeKind::Block, 1, 2, 200);
-        right.input = left.output;
+        let right = node(NodeKind::Block, 2, 3, 200);
         validate_adjacent(&left, &right);
     }
 }

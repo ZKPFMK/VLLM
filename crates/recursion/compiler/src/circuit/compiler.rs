@@ -387,6 +387,64 @@ where
         })
     }
 
+    /// Lower a compact dot product while preserving scalar BF16 rounding after every operation.
+    fn bf16_dot_product(
+        &mut self,
+        op: Bf16DotProductOp,
+        mut consumer: impl FnMut(Instruction<SP1Field>),
+    ) {
+        debug_assert!(!op.lhs.is_empty());
+        debug_assert_eq!(op.lhs.len(), op.rhs.len());
+
+        let mut sum = VirtualFelt::new(op.first_destination as usize);
+        consumer(self.bf16_mul(sum, op.lhs[0], op.rhs[0]));
+        for input_index in 1..op.lhs.len() {
+            let product = VirtualFelt::new(op.first_destination as usize + 2 * input_index - 1);
+            consumer(self.bf16_mul(product, op.lhs[input_index], op.rhs[input_index]));
+            let next_sum = VirtualFelt::new(op.first_destination as usize + 2 * input_index);
+            consumer(self.bf16_add_sub(Bf16AddSubOpcode::Add, next_sum, sum, product));
+            sum = next_sum;
+        }
+    }
+
+    /// Lower a compact BF16 linear DSL operation to the existing scalar instructions.
+    ///
+    /// Keeping this expansion at the assembly boundary avoids allocating hundreds of millions of
+    /// scalar `DslIr` nodes while preserving the exact instruction order, virtual addresses, BF16
+    /// rounding points, execution events, and proof-chip inputs.
+    fn bf16_linear_no_bias(
+        &mut self,
+        op: Bf16LinearNoBiasOp,
+        mut consumer: impl FnMut(Instruction<SP1Field>),
+    ) {
+        let input_features = op.input.len();
+        debug_assert!(input_features > 0);
+        debug_assert!(op.output_features > 0);
+        debug_assert_eq!(op.weight.len(), input_features * op.output_features);
+
+        let destinations_per_output = 2 * input_features - 1;
+        for output_index in 0..op.output_features {
+            let dot_destination =
+                op.first_destination as usize + output_index * destinations_per_output;
+            let mut sum = VirtualFelt::new(dot_destination);
+            consumer(self.bf16_mul(sum, op.input[0], op.weight[output_index]));
+
+            for input_index in 1..input_features {
+                // Match `Builder::bf16_dot` exactly: product and running-sum destinations are
+                // interleaved, and accumulation proceeds strictly from left to right.
+                let product = VirtualFelt::new(dot_destination + 2 * input_index - 1);
+                consumer(self.bf16_mul(
+                    product,
+                    op.input[input_index],
+                    op.weight[input_index * op.output_features + output_index],
+                ));
+                let next_sum = VirtualFelt::new(dot_destination + 2 * input_index);
+                consumer(self.bf16_add_sub(Bf16AddSubOpcode::Add, next_sum, sum, product));
+                sum = next_sum;
+            }
+        }
+    }
+
     #[inline(always)]
     fn bf16_square(&mut self, dst: impl Reg, input: impl Reg) -> Instruction<SP1Field> {
         Instruction::Bf16Unary(Bf16UnaryInstr {
@@ -421,6 +479,35 @@ where
             addrs: Bf16UnaryIo { output: dst.write(self), input: input.read(self) },
             mult: SP1Field::zero(),
         })
+    }
+
+    /// Lower a compact mean to left-to-right BF16 additions followed by one BF16 division.
+    fn bf16_mean(&mut self, op: Bf16MeanOp, mut consumer: impl FnMut(Instruction<SP1Field>)) {
+        debug_assert!(!op.values.is_empty());
+
+        let divisor = VirtualFelt::new(op.first_destination as usize + op.values.len() - 1);
+        let output = VirtualFelt::new(op.first_destination as usize + op.values.len());
+        if op.values.len() == 1 {
+            consumer(self.mem_write_const(divisor, Imm::F(op.divisor)));
+            consumer(self.bf16_div(output, op.values[0], divisor));
+            return;
+        }
+
+        let mut sum = VirtualFelt::new(op.first_destination as usize);
+        consumer(self.bf16_add_sub(Bf16AddSubOpcode::Add, sum, op.values[0], op.values[1]));
+        for input_index in 2..op.values.len() {
+            let next_sum = VirtualFelt::new(op.first_destination as usize + input_index - 1);
+            consumer(self.bf16_add_sub(
+                Bf16AddSubOpcode::Add,
+                next_sum,
+                sum,
+                op.values[input_index],
+            ));
+            sum = next_sum;
+        }
+
+        consumer(self.mem_write_const(divisor, Imm::F(op.divisor)));
+        consumer(self.bf16_div(output, sum, divisor));
     }
 
     #[inline(always)]
@@ -639,6 +726,8 @@ where
 
             DslIr::Select(bit, dst1, dst2, lhs, rhs) => f(self.select(bit, dst1, dst2, lhs, rhs)),
             DslIr::Bf16Mul(dst, lhs, rhs) => f(self.bf16_mul(dst, lhs, rhs)),
+            DslIr::Bf16DotProduct(op) => self.bf16_dot_product(*op, f),
+            DslIr::Bf16LinearNoBias(op) => self.bf16_linear_no_bias(*op, f),
             DslIr::Bf16Square(dst, input) => f(self.bf16_square(dst, input)),
             DslIr::Bf16Rsqrt(dst, input) => f(self.bf16_rsqrt(dst, input)),
             DslIr::Bf16Exponential(dst, input) => f(self.bf16_exponential(dst, input)),
@@ -650,6 +739,7 @@ where
             DslIr::Bf16Sub(dst, lhs, rhs) => {
                 f(self.bf16_add_sub(Bf16AddSubOpcode::Sub, dst, lhs, rhs))
             }
+            DslIr::Bf16Mean(op) => self.bf16_mean(*op, f),
 
             DslIr::AssertEqV(lhs, rhs) => self.base_assert_eq(lhs, rhs, f),
             DslIr::AssertEqF(lhs, rhs) => self.base_assert_eq(lhs, rhs, f),
@@ -746,6 +836,15 @@ where
                 }
                 op => {
                     let bb = maybe_bb.get_or_insert_with(Default::default);
+                    let instruction_count = match &op {
+                        DslIr::Bf16DotProduct(op) => op.scalar_instruction_count(),
+                        DslIr::Bf16LinearNoBias(op) => op.scalar_instruction_count(),
+                        DslIr::Bf16Mean(op) => op.scalar_instruction_count(),
+                        _ => 0,
+                    };
+                    // A compact node can expand to millions of scalar instructions. Reserve once
+                    // to avoid repeated allocation and copying while lowering it.
+                    bb.instrs.reserve(instruction_count);
                     self.compile_one(op, |item| match item {
                         Ok(instr) => {
                             #[cfg(feature = "debug")]
@@ -1042,6 +1141,18 @@ trait Reg {
     fn write_many(&self, compiler: &mut AsmCompiler, len: usize) -> Vec<Address<SP1Field>>;
 }
 
+/// A virtual BF16 destination reserved by a compact DSL operation.
+#[derive(Clone, Copy)]
+struct VirtualFelt {
+    idx: u32,
+}
+
+impl VirtualFelt {
+    fn new(idx: usize) -> Self {
+        Self { idx: u32::try_from(idx).expect("virtual BF16 address does not fit u32") }
+    }
+}
+
 macro_rules! impl_reg_vaddr {
     ($a:ty) => {
         impl Reg for $a {
@@ -1066,6 +1177,7 @@ macro_rules! impl_reg_vaddr {
 impl_reg_vaddr!(Var<SP1Field>);
 impl_reg_vaddr!(Felt<SP1Field>);
 impl_reg_vaddr!(Ext<SP1Field, SP1ExtensionField>);
+impl_reg_vaddr!(VirtualFelt);
 
 impl Reg for Imm<SP1Field, SP1ExtensionField> {
     fn read(&self, compiler: &mut AsmCompiler) -> Address<SP1Field> {

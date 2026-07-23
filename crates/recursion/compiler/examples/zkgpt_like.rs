@@ -1,7 +1,6 @@
 #![allow(clippy::print_stdout)]
 
 use std::{
-    borrow::{Borrow, BorrowMut},
     fmt::Write as _,
     fs::{self, File},
     path::{Path, PathBuf},
@@ -9,9 +8,8 @@ use std::{
     time::Instant,
 };
 
-use slop_algebra::{AbstractField, PrimeField32};
+use slop_algebra::AbstractField;
 use slop_basefold::FriConfig;
-use slop_symmetric::Permutation;
 use sp1_hypercube::{
     air::MachineAir, inner_perm, prover::simple_prover, MachineProof, MachineVerifyingKey,
     SP1PcsProofInner, ShardVerifier,
@@ -25,9 +23,8 @@ use sp1_recursion_compiler::{
     prelude::{Bf16ZkGptBlockParams, Builder, Felt},
 };
 use sp1_recursion_executor::{
-    Bf16AddSubEvent, Bf16DivEvent, Bf16MulEvent, Bf16UnaryEvent, ExecutionRecord, Executor,
-    RecursionProgram, RecursionPublicValues, DIGEST_SIZE, HASH_RATE, PERMUTATION_WIDTH,
-    RECURSIVE_PROOF_NUM_PV_ELTS,
+    Bf16AddSubEvent, Bf16DivEvent, Bf16MulEvent, Bf16UnaryEvent, Block, ExecutionRecord, Executor,
+    RecursionProgram,
 };
 use sp1_recursion_machine::{
     chips::bf16::{NUM_BF16_ADD_SUB_EVENTS_PER_ROW, NUM_BF16_MUL_EVENTS_PER_ROW},
@@ -47,16 +44,8 @@ const PROOF_LOG_STACKING_HEIGHT: u32 = 22;
 // The full 12 x 30 computation has about 2^28 rows in its largest BF16 chips. The verifier
 // requires max_log_row_count < 29, so 28 is both necessary and the largest supported value.
 const PROOF_MAX_LOG_ROW_COUNT: usize = 28;
-const BLOCK_PROTOCOL_VERSION: u32 = 1;
-const BLOCK_STAGE_GENESIS: u32 = 0x1600;
-const BLOCK_STAGE_CHAINED: u32 = 0x1601;
-const DOMAIN_BLOCK_INPUT: u32 = 0x1610;
-const DOMAIN_BLOCK_PARAMETERS: u32 = 0x1611;
-const DOMAIN_BLOCK_HINTS: u32 = 0x1612;
-const DOMAIN_BLOCK_OUTPUT: u32 = 0x1613;
-const DOMAIN_BLOCK_TRANSCRIPT: u32 = 0x1614;
+const BLOCK_PROTOCOL_VERSION: u32 = 2;
 
-type Digest = [SP1Field; DIGEST_SIZE];
 type StoredProof = MachineProof<SP1GlobalContext, SP1PcsProofInner>;
 type StoredVerifyingKey = MachineVerifyingKey<SP1GlobalContext>;
 
@@ -236,22 +225,6 @@ struct RealData {
     layers: Vec<RealLayerData>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct UpstreamCommitments {
-    output: Digest,
-    transcript: Digest,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct BlockCommitments {
-    upstream: Option<Digest>,
-    input: Digest,
-    parameters: Digest,
-    hints: Digest,
-    output: Digest,
-    transcript: Digest,
-}
-
 #[derive(Debug)]
 struct ProofArtifacts {
     proof_file: String,
@@ -279,19 +252,6 @@ fn parse_usize(argument: Option<std::ffi::OsString>, option: &str) -> usize {
         .unwrap_or_else(|| panic!("{option} must be valid UTF-8"))
         .parse()
         .unwrap_or_else(|error| panic!("invalid {option}: {error}"))
-}
-
-fn parse_digest(value: &str) -> Digest {
-    let limbs = value
-        .split(':')
-        .map(|limb| {
-            let limb = limb.strip_prefix("0x").unwrap_or(limb);
-            u32::from_str_radix(limb, 16)
-                .unwrap_or_else(|error| panic!("invalid digest limb {limb}: {error}"))
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(limbs.len(), DIGEST_SIZE, "a digest requires {DIGEST_SIZE} limbs");
-    limbs.into_iter().map(SP1Field::from_canonical_u32).collect::<Vec<_>>().try_into().unwrap()
 }
 
 fn parse_arguments() -> Arguments {
@@ -394,14 +354,6 @@ fn read_bf16_binary(path: &Path) -> Vec<u16> {
     bytes.chunks_exact(2).map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]])).collect()
 }
 
-fn digest_hex(digest: &Digest) -> String {
-    digest
-        .iter()
-        .map(|value| format!("{:08X}", value.as_canonical_u32()))
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
 fn json_string_field(path: &Path, key: &str) -> String {
     let contents = fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
@@ -424,7 +376,7 @@ fn block_stem(block: usize) -> String {
     format!("zkgpt_block_l{block:02}")
 }
 
-fn verify_and_load_previous_block(arguments: &Arguments) -> (Vec<u16>, UpstreamCommitments) {
+fn verify_and_load_previous_block(arguments: &Arguments) -> Vec<u16> {
     type A = RecursionAir<SP1Field, 3, 2>;
 
     let block = arguments.block.expect("previous Block verification requires --block");
@@ -440,6 +392,11 @@ fn verify_and_load_previous_block(arguments: &Arguments) -> (Vec<u16>, UpstreamC
         json_string_field(&manifest_path, "stage"),
         "zkgpt_block",
         "previous Block manifest has the wrong stage"
+    );
+    assert_eq!(
+        json_usize_field(&manifest_path, "version"),
+        BLOCK_PROTOCOL_VERSION as usize,
+        "previous Block manifest uses the old explicit-commitment protocol"
     );
     assert_eq!(
         json_usize_field(&manifest_path, "block"),
@@ -461,11 +418,6 @@ fn verify_and_load_previous_block(arguments: &Arguments) -> (Vec<u16>, UpstreamC
         1,
         "previous Block proof must contain exactly one shard"
     );
-    let upstream = UpstreamCommitments {
-        output: parse_digest(&json_string_field(&manifest_path, "output_commitment")),
-        transcript: parse_digest(&json_string_field(&manifest_path, "transcript_commitment")),
-    };
-
     let proof_path = directory.join(json_string_field(&manifest_path, "proof_file"));
     let vk_path = directory.join(json_string_field(&manifest_path, "verifying_key_file"));
     let proof: StoredProof = bincode::deserialize_from(
@@ -479,12 +431,6 @@ fn verify_and_load_previous_block(arguments: &Arguments) -> (Vec<u16>, UpstreamC
     )
     .unwrap_or_else(|error| panic!("failed to decode {}: {error}", vk_path.display()));
     assert_eq!(proof.shard_proofs.len(), 1, "previous Block proof must contain one shard");
-    let public_values: &RecursionPublicValues<SP1Field> =
-        proof.shard_proofs[0].public_values.as_slice().borrow();
-    assert_eq!(
-        public_values.digest, upstream.transcript,
-        "previous Block proof public digest differs from its manifest"
-    );
     let verifier = ShardVerifier::from_basefold_parameters(
         FriConfig::new(
             PROOF_LOG_BLOWUP,
@@ -506,16 +452,11 @@ fn verify_and_load_previous_block(arguments: &Arguments) -> (Vec<u16>, UpstreamC
         arguments.shape.sequence_length * arguments.shape.hidden_size,
         "previous Block private output shape differs"
     );
-    assert_eq!(
-        host_commit_u16(DOMAIN_BLOCK_OUTPUT, &hidden_states),
-        upstream.output,
-        "previous Block private output differs from its proved commitment"
-    );
     println!(
-        "previous Block verified: block={previous} transcript={}",
-        digest_hex(&upstream.transcript)
+        "previous Block proof verified and private output loaded: block={previous}; \
+         explicit output commitment disabled"
     );
-    (hidden_states, upstream)
+    hidden_states
 }
 
 fn load_real_data(
@@ -610,6 +551,10 @@ fn print_estimate(shape: Shape, events: EventCounts) {
     );
     println!("semantics: bias=false residual=false ln_f=false lm_head=false arithmetic=BF16");
     println!(
+        "privacy: public_input=MemoryConst private_parameters=Hint \
+         attention_hints=Hint explicit_value_commitments=false"
+    );
+    println!(
         "parameters: per_layer={parameter_values_per_layer} total={}",
         parameter_values_per_layer * shape.layers
     );
@@ -671,15 +616,6 @@ fn size_of_u128<T>() -> u128 {
     std::mem::size_of::<T>() as u128
 }
 
-fn repeated_constants(
-    builder: &mut Builder<sp1_recursion_compiler::circuit::AsmConfig>,
-    raw: u16,
-    count: usize,
-) -> Vec<Felt<SP1Field>> {
-    let value = SP1Field::from_canonical_u16(raw);
-    (0..count).map(|_| builder.constant(value)).collect()
-}
-
 fn constants(
     builder: &mut Builder<sp1_recursion_compiler::circuit::AsmConfig>,
     values: &[u16],
@@ -687,179 +623,27 @@ fn constants(
     values.iter().map(|&value| builder.constant(SP1Field::from_canonical_u16(value))).collect()
 }
 
-fn host_commit_fields(domain: u32, values: &[SP1Field]) -> Digest {
-    let mut state = [SP1Field::zero(); PERMUTATION_WIDTH];
-    state[0] = SP1Field::from_canonical_u32(domain);
-    state[1] = SP1Field::from_canonical_usize(values.len());
-    inner_perm().permute_mut(&mut state);
-    for chunk in values.chunks(HASH_RATE) {
-        state[..HASH_RATE].fill(SP1Field::zero());
-        state[..chunk.len()].copy_from_slice(chunk);
-        inner_perm().permute_mut(&mut state);
-    }
-    state[..DIGEST_SIZE].try_into().unwrap()
-}
-
-fn host_commit_u16(domain: u32, values: &[u16]) -> Digest {
-    let values =
-        values.iter().map(|&value| SP1Field::from_canonical_u16(value)).collect::<Vec<_>>();
-    host_commit_fields(domain, &values)
-}
-
-fn circuit_commit_fields(
+fn private_bf16_hints(
     builder: &mut Builder<sp1_recursion_compiler::circuit::AsmConfig>,
-    domain: u32,
-    values: &[Felt<SP1Field>],
-) -> [Felt<SP1Field>; DIGEST_SIZE] {
-    let zero = builder.constant(SP1Field::zero());
-    let mut state = [zero; PERMUTATION_WIDTH];
-    state[0] = builder.constant(SP1Field::from_canonical_u32(domain));
-    state[1] = builder.constant(SP1Field::from_canonical_usize(values.len()));
-    state = builder.poseidon2_permute_v2(state);
-    for chunk in values.chunks(HASH_RATE) {
-        state[..HASH_RATE].fill(zero);
-        state[..chunk.len()].copy_from_slice(chunk);
-        state = builder.poseidon2_permute_v2(state);
-    }
-    state[..DIGEST_SIZE].try_into().unwrap()
+    values: &[u16],
+    witness_stream: &mut Vec<Block<SP1Field>>,
+) -> Vec<Felt<SP1Field>> {
+    let hinted = builder.hint_felts_v2(values.len());
+    witness_stream
+        .extend(values.iter().map(|&value| Block::from(SP1Field::from_canonical_u16(value))));
+    hinted
 }
 
-fn block_transcript_fields_host(
-    arguments: &Arguments,
-    upstream: Option<Digest>,
-    input: Digest,
-    parameters: Digest,
-    hints: Digest,
-    output: Digest,
-) -> Vec<SP1Field> {
-    let block = arguments.block.expect("Block transcript requires --block");
-    let mut fields = [
-        BLOCK_PROTOCOL_VERSION,
-        if block == 0 { BLOCK_STAGE_GENESIS } else { BLOCK_STAGE_CHAINED },
-        block as u32,
-        arguments.shape.sequence_length as u32,
-        arguments.shape.hidden_size as u32,
-        arguments.shape.num_heads as u32,
-        arguments.shape.linear_size as u32,
-        GPT2_LAYER_NORM_EPSILON as u32,
-        GPT2_ATTENTION_SCALE as u32,
-    ]
-    .map(SP1Field::from_canonical_u32)
-    .to_vec();
-    if let Some(upstream) = upstream {
-        fields.extend(upstream);
-    }
-    fields.extend(input);
-    fields.extend(parameters);
-    fields.extend(hints);
-    fields.extend(output);
-    fields
-}
-
-fn compute_host_block_commitments(
-    arguments: &Arguments,
-    upstream: Option<UpstreamCommitments>,
-    input: &[u16],
-    parameters: &[u16],
-    hints: &[u16],
-    output: &[u16],
-) -> BlockCommitments {
-    let block = arguments.block.expect("Block commitments require --block");
-    let input_domain = if block == 0 { DOMAIN_BLOCK_INPUT } else { DOMAIN_BLOCK_OUTPUT };
-    let input = host_commit_u16(input_domain, input);
-    if let Some(upstream) = upstream {
-        assert_eq!(input, upstream.output, "Block input differs from previous Block output");
-    }
-    let parameters = host_commit_u16(DOMAIN_BLOCK_PARAMETERS, parameters);
-    let hints = host_commit_u16(DOMAIN_BLOCK_HINTS, hints);
-    let output = host_commit_u16(DOMAIN_BLOCK_OUTPUT, output);
-    let upstream_transcript = upstream.map(|value| value.transcript);
-    let transcript = host_commit_fields(
-        DOMAIN_BLOCK_TRANSCRIPT,
-        &block_transcript_fields_host(
-            arguments,
-            upstream_transcript,
-            input,
-            parameters,
-            hints,
-            output,
-        ),
-    );
-    BlockCommitments { upstream: upstream_transcript, input, parameters, hints, output, transcript }
-}
-
-fn commit_block_transcript(
+fn repeated_private_bf16_hints(
     builder: &mut Builder<sp1_recursion_compiler::circuit::AsmConfig>,
-    arguments: &Arguments,
-    upstream: Option<UpstreamCommitments>,
-    input: &[Felt<SP1Field>],
-    parameters: &[Felt<SP1Field>],
-    hints: &[Felt<SP1Field>],
-    output: &[Felt<SP1Field>],
-) {
-    let block = arguments.block.expect("Block transcript requires --block");
-    let input_domain = if block == 0 { DOMAIN_BLOCK_INPUT } else { DOMAIN_BLOCK_OUTPUT };
-    let input_digest = circuit_commit_fields(builder, input_domain, input);
-    if let Some(upstream) = upstream {
-        for (&computed, expected) in input_digest.iter().zip(upstream.output) {
-            builder.assert_felt_eq(computed, expected);
-        }
-    }
-    let parameters_digest = circuit_commit_fields(builder, DOMAIN_BLOCK_PARAMETERS, parameters);
-    let hints_digest = circuit_commit_fields(builder, DOMAIN_BLOCK_HINTS, hints);
-    let output_digest = circuit_commit_fields(builder, DOMAIN_BLOCK_OUTPUT, output);
-
-    let constants = [
-        BLOCK_PROTOCOL_VERSION,
-        if block == 0 { BLOCK_STAGE_GENESIS } else { BLOCK_STAGE_CHAINED },
-        block as u32,
-        arguments.shape.sequence_length as u32,
-        arguments.shape.hidden_size as u32,
-        arguments.shape.num_heads as u32,
-        arguments.shape.linear_size as u32,
-        GPT2_LAYER_NORM_EPSILON as u32,
-        GPT2_ATTENTION_SCALE as u32,
-    ]
-    .map(|value| builder.constant(SP1Field::from_canonical_u32(value)));
-    let mut transcript_fields = constants.to_vec();
-    if let Some(upstream) = upstream {
-        transcript_fields.extend(
-            upstream
-                .transcript
-                .into_iter()
-                .map(|value| builder.constant::<Felt<SP1Field>>(value)),
-        );
-    }
-    transcript_fields.extend(input_digest);
-    transcript_fields.extend(parameters_digest);
-    transcript_fields.extend(hints_digest);
-    transcript_fields.extend(output_digest);
-    let transcript = circuit_commit_fields(builder, DOMAIN_BLOCK_TRANSCRIPT, &transcript_fields);
-
-    let zero = builder.constant(SP1Field::zero());
-    let mut public_value_elements = [zero; RECURSIVE_PROOF_NUM_PV_ELTS];
-    let public_values: &mut RecursionPublicValues<Felt<SP1Field>> =
-        public_value_elements.as_mut_slice().borrow_mut();
-    public_values.digest = transcript;
-    builder.commit_public_values_v2(*public_values);
-}
-
-fn commit_bf16_output(
-    builder: &mut Builder<sp1_recursion_compiler::circuit::AsmConfig>,
-    values: &[Felt<SP1Field>],
-) {
-    let zero = builder.constant(SP1Field::zero());
-    let mut state = [zero; PERMUTATION_WIDTH];
-    for chunk in values.chunks(HASH_RATE) {
-        state[..chunk.len()].copy_from_slice(chunk);
-        state = builder.poseidon2_permute_v2(state);
-    }
-    let digest: [Felt<SP1Field>; DIGEST_SIZE] = state[..DIGEST_SIZE].try_into().unwrap();
-    let mut public_value_elements = [zero; RECURSIVE_PROOF_NUM_PV_ELTS];
-    let public_values: &mut RecursionPublicValues<Felt<SP1Field>> =
-        public_value_elements.as_mut_slice().borrow_mut();
-    public_values.digest = digest;
-    builder.commit_public_values_v2(*public_values);
+    raw: u16,
+    count: usize,
+    witness_stream: &mut Vec<Block<SP1Field>>,
+) -> Vec<Felt<SP1Field>> {
+    let hinted = builder.hint_felts_v2(count);
+    let value = SP1Field::from_canonical_u16(raw);
+    witness_stream.extend((0..count).map(|_| Block::from(value)));
+    hinted
 }
 
 async fn prove_and_verify(
@@ -944,28 +728,6 @@ async fn prove_and_verify(
     ProofArtifacts { proof_file, proof_bytes, verifying_key_file, verifying_key_bytes }
 }
 
-fn raw_block_parameters(data: &RealLayerData) -> Vec<u16> {
-    let mut values = Vec::with_capacity(
-        data.layer_norm_1_weight.len()
-            + data.layer_norm_1_bias.len()
-            + data.attention_qkv_weight.len()
-            + data.attention_projection_weight.len()
-            + data.layer_norm_2_weight.len()
-            + data.layer_norm_2_bias.len()
-            + data.mlp_expansion_weight.len()
-            + data.mlp_projection_weight.len(),
-    );
-    values.extend_from_slice(&data.layer_norm_1_weight);
-    values.extend_from_slice(&data.layer_norm_1_bias);
-    values.extend_from_slice(&data.attention_qkv_weight);
-    values.extend_from_slice(&data.attention_projection_weight);
-    values.extend_from_slice(&data.layer_norm_2_weight);
-    values.extend_from_slice(&data.layer_norm_2_bias);
-    values.extend_from_slice(&data.mlp_expansion_weight);
-    values.extend_from_slice(&data.mlp_projection_weight);
-    values
-}
-
 fn read_printed_bf16(path: &Path) -> Vec<u16> {
     fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
@@ -990,18 +752,10 @@ fn write_private_block_output(output_dir: &Path, block: usize, output: &[u16]) -
     output_file
 }
 
-fn write_block_manifest(
-    arguments: &Arguments,
-    commitments: BlockCommitments,
-    private_output_file: &str,
-    proof: &ProofArtifacts,
-) {
+fn write_block_manifest(arguments: &Arguments, private_output_file: &str, proof: &ProofArtifacts) {
     let block = arguments.block.expect("Block manifest requires --block");
     let stem = block_stem(block);
     let manifest_path = arguments.output_dir.join(format!("{stem}.manifest.json"));
-    let upstream = commitments
-        .upstream
-        .map_or_else(|| "null".to_owned(), |digest| format!("\"{}\"", digest_hex(&digest)));
     let mut manifest = String::new();
     writeln!(manifest, "{{").unwrap();
     writeln!(manifest, "  \"version\": {BLOCK_PROTOCOL_VERSION},").unwrap();
@@ -1012,15 +766,11 @@ fn write_block_manifest(
     writeln!(manifest, "  \"num_heads\": {},", arguments.shape.num_heads).unwrap();
     writeln!(manifest, "  \"linear_size\": {},", arguments.shape.linear_size).unwrap();
     writeln!(manifest, "  \"shards\": 1,").unwrap();
-    writeln!(manifest, "  \"upstream_transcript\": {upstream},").unwrap();
-    writeln!(manifest, "  \"input_commitment\": \"{}\",", digest_hex(&commitments.input)).unwrap();
-    writeln!(manifest, "  \"parameters_commitment\": \"{}\",", digest_hex(&commitments.parameters))
-        .unwrap();
-    writeln!(manifest, "  \"hints_commitment\": \"{}\",", digest_hex(&commitments.hints)).unwrap();
-    writeln!(manifest, "  \"output_commitment\": \"{}\",", digest_hex(&commitments.output))
-        .unwrap();
-    writeln!(manifest, "  \"transcript_commitment\": \"{}\",", digest_hex(&commitments.transcript))
-        .unwrap();
+    writeln!(manifest, "  \"explicit_value_commitments\": false,").unwrap();
+    writeln!(manifest, "  \"public_input_storage\": \"memory_const\",").unwrap();
+    writeln!(manifest, "  \"private_parameters_storage\": \"hint\",").unwrap();
+    writeln!(manifest, "  \"private_auxiliary_hints_storage\": \"hint\",").unwrap();
+    writeln!(manifest, "  \"private_values_binding\": \"execution_trace_commitment\",").unwrap();
     writeln!(manifest, "  \"private_output_file\": \"{private_output_file}\",").unwrap();
     writeln!(
         manifest,
@@ -1048,12 +798,9 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
     }
 
     let shape = arguments.shape;
-    let (block_input, upstream) = match arguments.block {
-        Some(0) | None => (None, None),
-        Some(_) => {
-            let (hidden_states, upstream) = verify_and_load_previous_block(arguments);
-            (Some(hidden_states), Some(upstream))
-        }
+    let block_input = match arguments.block {
+        Some(0) | None => None,
+        Some(_) => Some(verify_and_load_previous_block(arguments)),
     };
     let real_data = if arguments.synthetic {
         println!(
@@ -1073,18 +820,15 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
     let total_started = Instant::now();
     let build_started = Instant::now();
     let mut builder: Builder<sp1_recursion_compiler::circuit::AsmConfig> = AsmBuilder::default();
+    let mut witness_stream = Vec::<Block<SP1Field>>::new();
     let raw_input = match (&real_data, block_input) {
         (Some(data), _) => data.hidden_states.clone(),
         (None, Some(hidden_states)) => hidden_states,
         (None, None) => vec![0x0000; shape.sequence_length * shape.hidden_size],
     };
     let mut hidden_states = constants(&mut builder, &raw_input);
-    let initial_hidden_states = hidden_states.clone();
     let epsilon = builder.constant(SP1Field::from_canonical_u16(GPT2_LAYER_NORM_EPSILON));
     let attention_scale = builder.constant(SP1Field::from_canonical_u16(GPT2_ATTENTION_SCALE));
-    let zero = builder.constant(SP1Field::zero());
-    let mut committed_parameters = Vec::new();
-    let mut committed_hints = Vec::new();
 
     for layer in 0..shape.layers {
         let layer_started = Instant::now();
@@ -1102,40 +846,110 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
             Some(data) => {
                 let layer_data = &data.layers[layer];
                 (
-                    constants(&mut builder, &layer_data.layer_norm_1_weight),
-                    constants(&mut builder, &layer_data.layer_norm_1_bias),
-                    constants(&mut builder, &layer_data.attention_qkv_weight),
-                    constants(&mut builder, &layer_data.attention_projection_weight),
-                    constants(&mut builder, &layer_data.layer_norm_2_weight),
-                    constants(&mut builder, &layer_data.layer_norm_2_bias),
-                    constants(&mut builder, &layer_data.mlp_expansion_weight),
-                    constants(&mut builder, &layer_data.mlp_projection_weight),
-                    constants(&mut builder, &layer_data.attention_max_hints),
+                    private_bf16_hints(
+                        &mut builder,
+                        &layer_data.layer_norm_1_weight,
+                        &mut witness_stream,
+                    ),
+                    private_bf16_hints(
+                        &mut builder,
+                        &layer_data.layer_norm_1_bias,
+                        &mut witness_stream,
+                    ),
+                    private_bf16_hints(
+                        &mut builder,
+                        &layer_data.attention_qkv_weight,
+                        &mut witness_stream,
+                    ),
+                    private_bf16_hints(
+                        &mut builder,
+                        &layer_data.attention_projection_weight,
+                        &mut witness_stream,
+                    ),
+                    private_bf16_hints(
+                        &mut builder,
+                        &layer_data.layer_norm_2_weight,
+                        &mut witness_stream,
+                    ),
+                    private_bf16_hints(
+                        &mut builder,
+                        &layer_data.layer_norm_2_bias,
+                        &mut witness_stream,
+                    ),
+                    private_bf16_hints(
+                        &mut builder,
+                        &layer_data.mlp_expansion_weight,
+                        &mut witness_stream,
+                    ),
+                    private_bf16_hints(
+                        &mut builder,
+                        &layer_data.mlp_projection_weight,
+                        &mut witness_stream,
+                    ),
+                    private_bf16_hints(
+                        &mut builder,
+                        &layer_data.attention_max_hints,
+                        &mut witness_stream,
+                    ),
                 )
             }
             None => (
-                repeated_constants(&mut builder, 0x3f80, shape.hidden_size),
-                repeated_constants(&mut builder, 0x0000, shape.hidden_size),
-                repeated_constants(&mut builder, 0x3f80, shape.hidden_size * 3 * shape.hidden_size),
-                repeated_constants(&mut builder, 0x3f80, shape.hidden_size * shape.hidden_size),
-                repeated_constants(&mut builder, 0x3f80, shape.hidden_size),
-                repeated_constants(&mut builder, 0x0000, shape.hidden_size),
-                repeated_constants(&mut builder, 0x3f80, shape.hidden_size * shape.linear_size),
-                repeated_constants(&mut builder, 0x3f80, shape.linear_size * shape.hidden_size),
-                vec![zero; shape.sequence_length * shape.num_heads],
+                repeated_private_bf16_hints(
+                    &mut builder,
+                    0x3f80,
+                    shape.hidden_size,
+                    &mut witness_stream,
+                ),
+                repeated_private_bf16_hints(
+                    &mut builder,
+                    0x0000,
+                    shape.hidden_size,
+                    &mut witness_stream,
+                ),
+                repeated_private_bf16_hints(
+                    &mut builder,
+                    0x3f80,
+                    shape.hidden_size * 3 * shape.hidden_size,
+                    &mut witness_stream,
+                ),
+                repeated_private_bf16_hints(
+                    &mut builder,
+                    0x3f80,
+                    shape.hidden_size * shape.hidden_size,
+                    &mut witness_stream,
+                ),
+                repeated_private_bf16_hints(
+                    &mut builder,
+                    0x3f80,
+                    shape.hidden_size,
+                    &mut witness_stream,
+                ),
+                repeated_private_bf16_hints(
+                    &mut builder,
+                    0x0000,
+                    shape.hidden_size,
+                    &mut witness_stream,
+                ),
+                repeated_private_bf16_hints(
+                    &mut builder,
+                    0x3f80,
+                    shape.hidden_size * shape.linear_size,
+                    &mut witness_stream,
+                ),
+                repeated_private_bf16_hints(
+                    &mut builder,
+                    0x3f80,
+                    shape.linear_size * shape.hidden_size,
+                    &mut witness_stream,
+                ),
+                repeated_private_bf16_hints(
+                    &mut builder,
+                    0x0000,
+                    shape.sequence_length * shape.num_heads,
+                    &mut witness_stream,
+                ),
             ),
         };
-        if arguments.block.is_some() {
-            committed_parameters.extend_from_slice(&layer_norm_1_weight);
-            committed_parameters.extend_from_slice(&layer_norm_1_bias);
-            committed_parameters.extend_from_slice(&attention_qkv_weight);
-            committed_parameters.extend_from_slice(&attention_projection_weight);
-            committed_parameters.extend_from_slice(&layer_norm_2_weight);
-            committed_parameters.extend_from_slice(&layer_norm_2_bias);
-            committed_parameters.extend_from_slice(&mlp_expansion_weight);
-            committed_parameters.extend_from_slice(&mlp_projection_weight);
-            committed_hints.extend_from_slice(&hints);
-        }
         let params = Bf16ZkGptBlockParams {
             layer_norm_1_weight: &layer_norm_1_weight,
             layer_norm_1_bias: &layer_norm_1_bias,
@@ -1158,21 +972,14 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
         }
     }
     if arguments.block.is_some() {
-        commit_block_transcript(
-            &mut builder,
-            arguments,
-            upstream,
-            &initial_hidden_states,
-            &committed_parameters,
-            &committed_hints,
-            &hidden_states,
-        );
         for &value in &hidden_states {
             builder.print_f(value);
         }
-    } else {
-        commit_bf16_output(&mut builder, &hidden_states);
     }
+    println!(
+        "private witness stream: values={} (model parameters and attention hints)",
+        witness_stream.len()
+    );
     let block = builder.into_root_block();
     println!(
         "built: ir_ops={} elapsed={:.3}s",
@@ -1199,6 +1006,7 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
         program.clone(),
         inner_perm(),
     );
+    executor.witness_stream = witness_stream.into();
     if let Some(path) = &print_path {
         executor.debug_stdout = Box::new(
             File::create(path)
@@ -1218,12 +1026,7 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
         executor.record.bf16_unary_events.len(),
         executor.record.bf16_div_events.len(),
     );
-    let public_digest = executor.record.public_values.digest;
-    println!(
-        "public {} digest: {}",
-        if arguments.block.is_some() { "Block transcript" } else { "output" },
-        digest_hex(&public_digest),
-    );
+    println!("explicit input/output/parameter/hint commitments: disabled");
     let proof_record =
         (arguments.mode == Mode::Prove).then(|| std::mem::take(&mut executor.record));
     drop(executor);
@@ -1235,46 +1038,17 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
             shape.sequence_length * shape.hidden_size,
             "Block circuit output shape mismatch"
         );
-        let (raw_parameters, raw_hints) = match &real_data {
-            Some(data) => {
-                (raw_block_parameters(&data.layers[0]), data.layers[0].attention_max_hints.clone())
-            }
-            None => {
-                let mut parameters = Vec::new();
-                parameters.extend(vec![0x3f80; shape.hidden_size]);
-                parameters.extend(vec![0x0000; shape.hidden_size]);
-                parameters.extend(vec![0x3f80; shape.hidden_size * 3 * shape.hidden_size]);
-                parameters.extend(vec![0x3f80; shape.hidden_size * shape.hidden_size]);
-                parameters.extend(vec![0x3f80; shape.hidden_size]);
-                parameters.extend(vec![0x0000; shape.hidden_size]);
-                parameters.extend(vec![0x3f80; shape.hidden_size * shape.linear_size]);
-                parameters.extend(vec![0x3f80; shape.linear_size * shape.hidden_size]);
-                (parameters, vec![0x0000; shape.sequence_length * shape.num_heads])
-            }
-        };
-        let commitments = compute_host_block_commitments(
-            arguments,
-            upstream,
-            &raw_input,
-            &raw_parameters,
-            &raw_hints,
-            &output,
-        );
-        assert_eq!(
-            public_digest, commitments.transcript,
-            "circuit Block transcript differs from the independent host commitment"
-        );
         let private_output_file = write_private_block_output(&arguments.output_dir, block, &output);
-        println!("Block commitment chain verified: block={block}");
-        (commitments, private_output_file)
+        println!("Block execution output materialized without an explicit output commitment");
+        private_output_file
     });
 
     if let Some(record) = proof_record {
         let artifact_stem =
             arguments.block.map(block_stem).unwrap_or_else(|| "zkgpt_like".to_owned());
         let proof = prove_and_verify(program, record, &arguments.output_dir, &artifact_stem).await;
-        if let Some((commitments, private_output_file)) = block_artifacts {
-            write_block_manifest(arguments, commitments, &private_output_file, &proof);
+        if let Some(private_output_file) = block_artifacts {
+            write_block_manifest(arguments, &private_output_file, &proof);
         }
     }
     println!("completed: elapsed={:.3}s", total_started.elapsed().as_secs_f64());
