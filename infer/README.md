@@ -198,7 +198,7 @@ digests needed to verify the multi-proof statement. This stage composes the
 proofs cryptographically but does not yet verify the child STARKs recursively
 inside one circuit.
 
-Prove the following bias-free attention projection as four bounded output-column
+Prove the following bias-free attention projection as three bounded output-column
 tiles, reusing one setup:
 
 ```bash
@@ -212,14 +212,14 @@ RAYON_NUM_THREADS=8 target/release/examples/zkgpt_c_proj_leaf \
   --output-dir /tmp/sp1-zkgpt-layer0-c-proj
 ```
 
-Each tile computes `[30, 768] x [768, 192] -> [30, 192]`, using the real BF16
+Each tile computes `[30, 768] x [768, 256] -> [30, 256]`, using the real BF16
 column slice of `attention_projection_weight.bf16.bin`. The circuit recomputes
 the private input commitment and constrains it to the verified Attention join
-output. Four ordered outputs are concatenated into a private `[30, 768]` file;
+output. Three ordered outputs are concatenated into a private `[30, 768]` file;
 their group manifest is host-generated for the following lightweight fan-in
 proof.
 
-Bind the four private tile outputs and their proof transcripts into one proved
+Bind the three private tile outputs and their proof transcripts into one proved
 `[30, 768]` c_proj output:
 
 ```bash
@@ -232,7 +232,7 @@ target/release/examples/zkgpt_c_proj_join \
   --output-dir /tmp/sp1-zkgpt-layer0-c-proj-join
 ```
 
-The host verifies all four tile proofs with their shared verifying key. The join
+The host verifies all three tile proofs with their shared verifying key. The join
 circuit recomputes every tile-output commitment and tile transcript, enforces a
 common Attention input and upstream transcript, preserves output-column order,
 and proves exactly the c_proj group transcript already recorded by the tile
@@ -260,7 +260,7 @@ is independent across tokens and this complete stage fits in `2^16` rows, so it
 uses one proof and needs no fan-in join. Its private `[30, 768]` output is the
 shared input to the following MLP-expansion tiles.
 
-Prove the bias-free MLP expansion and `gelu_new` activation as 12 output-column
+Prove the bias-free MLP expansion and `gelu_new` activation as nine output-column
 tiles with one shared setup:
 
 ```bash
@@ -273,14 +273,14 @@ RAYON_NUM_THREADS=8 target/release/examples/zkgpt_mlp_expansion_leaf \
   --output-dir /tmp/sp1-zkgpt-layer0-mlp-expansion
 ```
 
-Each tile computes `[30, 768] x [768, 192] -> [30, 192]` and applies the BF16
-`gelu_new` lookup to all 5,760 results. The 12 circuits share the verified LN2
+Each tile computes `[30, 768] x [768, 256] -> [30, 256]` and applies the BF16
+`gelu_new` lookup to all 7,680 results. The nine circuits share the verified LN2
 input commitment and use the corresponding private column slices of the real
 `mlp_expansion_weight.bf16.bin`. Their ordered private outputs are concatenated
 into `[30, 2304]`; the generated group manifest remains host-computed until the
 following MLP-expansion fan-in proof binds all child transcripts.
 
-Bind the 12 expansion+GELU outputs into one proved `[30, 2304]` tensor:
+Bind the nine expansion+GELU outputs into one proved `[30, 2304]` tensor:
 
 ```bash
 cargo build -p sp1-recursion-compiler --release \
@@ -292,7 +292,7 @@ target/release/examples/zkgpt_mlp_expansion_join \
   --output-dir /tmp/sp1-zkgpt-layer0-mlp-expansion-join
 ```
 
-The host verifies all 12 expansion proofs with their shared verifying key. The
+The host verifies all nine expansion proofs with their shared verifying key. The
 join circuit checks the private tile-output commitments and transcripts,
 enforces a common LN2 input and ordered, complete output-column coverage, and
 proves the same group transcript as the tile batch. Its verified `[30, 2304]`
@@ -382,7 +382,7 @@ commitment, binds every private head output, and proves the chained attention
 group transcript. The resulting proof and private attention tensor can be fed
 to `zkgpt_c_proj_leaf` with the same layer index.
 
-For example, prove layer one's four attention-projection tiles with the chained
+For example, prove layer one's three attention-projection tiles with the chained
 attention artifacts above:
 
 ```bash
@@ -398,7 +398,7 @@ matching attention join proof, constrains the private attention tensor to that
 join's output commitment, and loads the real projection weights from the
 requested checkpoint layer.
 
-Bind those four layer-one tiles into a single proved c_proj output:
+Bind those three layer-one tiles into a single proved c_proj output:
 
 ```bash
 target/release/examples/zkgpt_c_proj_join \
@@ -408,7 +408,7 @@ target/release/examples/zkgpt_c_proj_join \
 ```
 
 This is the same bounded fan-in circuit used for layer zero. It verifies the
-four tile proofs on the host, enforces ordered and complete output-column
+three tile proofs on the host, enforces ordered and complete output-column
 coverage in the join circuit, and preserves the layer-one attention upstream
 transcript for the following `ln_2` proof.
 
@@ -427,7 +427,7 @@ its private output tensor and applies the real BF16 `ln_2_weight` and
 `ln_2_bias` values from checkpoint layer one. The proved `[30, 768]` output is
 the common input for layer one's MLP-expansion shards.
 
-Prove layer one's 12 MLP expansion and GELU tiles with one shared setup:
+Prove layer one's nine MLP expansion and GELU tiles with one shared setup:
 
 ```bash
 RAYON_NUM_THREADS=8 target/release/examples/zkgpt_mlp_expansion_leaf \
@@ -438,10 +438,10 @@ RAYON_NUM_THREADS=8 target/release/examples/zkgpt_mlp_expansion_leaf \
 
 Each tile verifies the common layer-one LN2 proof on the host, constrains its
 private `[30, 768]` input to the LN2 output commitment, and applies the matching
-real BF16 expansion-weight columns followed by `gelu_new`. The 12 ordered
+real BF16 expansion-weight columns followed by `gelu_new`. The nine ordered
 outputs form the private `[30, 2304]` tensor consumed by the expansion join.
 
-Bind the 12 layer-one expansion outputs into one proved `[30, 2304]` tensor:
+Bind the nine layer-one expansion outputs into one proved `[30, 2304]` tensor:
 
 ```bash
 target/release/examples/zkgpt_mlp_expansion_join \
@@ -510,3 +510,71 @@ target/release/examples/zkgpt_attention_join \
 
 The resulting proof preserves the Block 1 upstream transcript and binds the
 ordered private head outputs into layer two's `[30, 768]` attention tensor.
+
+### Complete reusable 12-block proof runner
+
+`zkgpt_full_inference.py` reuses the same nine bounded stage implementations for
+every layer; it does not copy the Block circuit 12 times. Each completed
+`mlp_projection_block_join` supplies the private `[30, 768]` block output and
+proved transcript consumed by the next layer's chained attention leaves.
+
+The shape-aware planner packs complete natural units without cutting a BF16 dot
+product. With the default `2^19` row and Core-style trace-area limits, one block
+contains 41 proof instances: 12 attention-head leaves, three c_proj
+output-column leaves, one LN2 token-group proof, nine MLP-expansion
+output-column leaves, 12 MLP-projection leaves, and four join proofs. The
+12-block run therefore produces 492 proof instances. Stages and
+layers run sequentially so a completed subprocess releases its memory before
+the next stage begins.
+
+Inspect the complete 108-command schedule without executing it:
+
+```bash
+python3 infer/zkgpt_full_inference.py \
+  --dry-run \
+  --output-root /data/sp1-zkgpt-full-12x30
+```
+
+Build the nine reusable binaries and generate the complete 12-block proof:
+
+```bash
+python3 infer/zkgpt_full_inference.py \
+  --prove --build --resume --threads 8 \
+  --output-root /data/sp1-zkgpt-full-12x30
+```
+
+`--resume` is safe on a new directory. On a later invocation it validates and
+skips the complete prefix, then restarts at the first missing stage. Resume
+without recompiling the Rust examples:
+
+```bash
+python3 infer/zkgpt_full_inference.py \
+  --prove --resume --threads 8 \
+  --output-root /data/sp1-zkgpt-full-12x30
+```
+
+Generate only one complete block by adding `--end-layer 0`. A later run can
+continue the same directory with `--resume --start-layer 1`. `--end-stage` can
+also stop at a named stage for bounded experiments.
+
+Validate an existing complete run without generating proofs:
+
+```bash
+python3 infer/zkgpt_full_inference.py \
+  --check-only \
+  --output-root /data/sp1-zkgpt-full-12x30
+```
+
+Artifacts use `layer-00` through `layer-11`, with the same nine stage
+subdirectories in each layer. The runner rejects gaps, missing or empty proof
+files, incorrect tensor sizes, unordered child shards, group/join mismatches,
+and broken intra-layer or cross-layer commitment links. Per-stage console logs
+are stored under `logs/`; invocation status, elapsed wall time, proof counts,
+artifact bytes, and the latest complete block commitment are recorded in
+`zkgpt_full_inference.run.json` after every stage.
+
+This completes the agreed zkGPT-like 12-block boundary: BF16, sequence length
+30, hidden size 768, no residual connections or linear biases, and no `ln_f` or
+LM head. Child STARK verification remains host-side as in the individual join
+examples; the runner builds and validates the complete chained proof workflow,
+not a single recursively aggregated proof.

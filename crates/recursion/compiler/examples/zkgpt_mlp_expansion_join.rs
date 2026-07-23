@@ -28,12 +28,14 @@ use sp1_recursion_executor::{
     Executor, RecursionProgram, RecursionPublicValues, DIGEST_SIZE, HASH_RATE, PERMUTATION_WIDTH,
     RECURSIVE_PROOF_NUM_PV_ELTS,
 };
-use sp1_recursion_machine::RecursionAir;
+use sp1_recursion_machine::{
+    sharding::{plan_linear_output_columns, ShardLimits},
+    RecursionAir,
+};
 
 const DEFAULT_SEQUENCE_LENGTH: usize = 30;
 const DEFAULT_HIDDEN_SIZE: usize = 768;
 const DEFAULT_EXPANSION_SIZE: usize = 2304;
-const DEFAULT_NUM_TILES: usize = 12;
 const DEFAULT_LAYER: usize = 0;
 
 // These constants must remain identical to `zkgpt_mlp_expansion_leaf`.
@@ -75,11 +77,18 @@ struct Shape {
 
 impl Shape {
     fn full() -> Self {
+        let plan = plan_linear_output_columns(
+            DEFAULT_SEQUENCE_LENGTH,
+            DEFAULT_HIDDEN_SIZE,
+            DEFAULT_EXPANSION_SIZE,
+            1,
+            ShardLimits::full(),
+        );
         Self {
             sequence_length: DEFAULT_SEQUENCE_LENGTH,
             hidden_size: DEFAULT_HIDDEN_SIZE,
             expansion_size: DEFAULT_EXPANSION_SIZE,
-            num_tiles: DEFAULT_NUM_TILES,
+            num_tiles: plan.shard_count,
         }
     }
 
@@ -112,7 +121,6 @@ impl Shape {
         if self.sequence_length == DEFAULT_SEQUENCE_LENGTH
             && self.hidden_size == DEFAULT_HIDDEN_SIZE
             && self.expansion_size == DEFAULT_EXPANSION_SIZE
-            && self.num_tiles == DEFAULT_NUM_TILES
         {
             FULL_TILE_MAX_LOG_ROWS
         } else {
@@ -718,6 +726,9 @@ fn write_join_manifest(
             "  \"hidden_size\": {},\n",
             "  \"expansion_size\": {},\n",
             "  \"num_tiles\": {},\n",
+            "  \"sharding_strategy\": \"shape_aware_output_columns\",\n",
+            "  \"natural_unit\": \"output_column\",\n",
+            "  \"units_per_leaf\": {},\n",
             "  \"upstream_transcript\": \"{}\",\n",
             "  \"input_commitment\": \"{}\",\n",
             "  \"parameters_commitment\": \"{}\",\n",
@@ -743,6 +754,7 @@ fn write_join_manifest(
         arguments.shape.hidden_size,
         arguments.shape.expansion_size,
         arguments.shape.num_tiles,
+        arguments.shape.tile_width(),
         digest_hex(&commitments.upstream),
         digest_hex(&commitments.input),
         digest_hex(&commitments.parameters),

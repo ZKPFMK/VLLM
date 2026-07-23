@@ -31,13 +31,13 @@ use sp1_recursion_executor::{
 };
 use sp1_recursion_machine::{
     chips::bf16::{NUM_BF16_ADD_SUB_EVENTS_PER_ROW, NUM_BF16_MUL_EVENTS_PER_ROW},
+    sharding::{plan_linear_output_columns, ShardLimits, DEFAULT_MAX_TRACE_AREA},
     RecursionAir,
 };
 
 const DEFAULT_SEQUENCE_LENGTH: usize = 30;
 const DEFAULT_HIDDEN_SIZE: usize = 768;
 const DEFAULT_EXPANSION_SIZE: usize = 2304;
-const DEFAULT_NUM_TILES: usize = 12;
 const DEFAULT_LAYER: usize = 0;
 const DEFAULT_TILE: usize = 0;
 
@@ -81,11 +81,18 @@ struct Shape {
 
 impl Shape {
     fn full() -> Self {
+        let plan = plan_linear_output_columns(
+            DEFAULT_SEQUENCE_LENGTH,
+            DEFAULT_HIDDEN_SIZE,
+            DEFAULT_EXPANSION_SIZE,
+            1,
+            ShardLimits::full(),
+        );
         Self {
             sequence_length: DEFAULT_SEQUENCE_LENGTH,
             hidden_size: DEFAULT_HIDDEN_SIZE,
             expansion_size: DEFAULT_EXPANSION_SIZE,
-            num_tiles: DEFAULT_NUM_TILES,
+            num_tiles: plan.shard_count,
         }
     }
 
@@ -118,7 +125,6 @@ impl Shape {
         if self.sequence_length == DEFAULT_SEQUENCE_LENGTH
             && self.hidden_size == DEFAULT_HIDDEN_SIZE
             && self.expansion_size == DEFAULT_EXPANSION_SIZE
-            && self.num_tiles == DEFAULT_NUM_TILES
         {
             FULL_MAX_LOG_ROWS
         } else {
@@ -317,15 +323,11 @@ fn parse_arguments() -> Arguments {
     assert!(!(all_tiles && tile_was_set), "--all-tiles cannot be combined with --tile");
     assert!(tile < shape.num_tiles, "tile index {tile} is out of range");
     if !synthetic {
+        let full = Shape::full();
         assert_eq!(
             (shape.sequence_length, shape.hidden_size, shape.expansion_size, shape.num_tiles,),
-            (
-                DEFAULT_SEQUENCE_LENGTH,
-                DEFAULT_HIDDEN_SIZE,
-                DEFAULT_EXPANSION_SIZE,
-                DEFAULT_NUM_TILES,
-            ),
-            "real MLP expansion data uses the fixed 30 x 768 x 2304 x 12 shape"
+            (DEFAULT_SEQUENCE_LENGTH, DEFAULT_HIDDEN_SIZE, DEFAULT_EXPANSION_SIZE, full.num_tiles,),
+            "real MLP expansion data uses the shape-aware full 30 x 768 x 2304 plan"
         );
     }
     let output_dir =
@@ -672,6 +674,13 @@ fn padded_rows(events: usize, lanes: usize) -> usize {
 
 fn print_estimate(shape: Shape, events: EventCounts) {
     let max_rows = 1usize << shape.max_log_rows();
+    let plan = plan_linear_output_columns(
+        shape.sequence_length,
+        shape.hidden_size,
+        shape.expansion_size,
+        1,
+        ShardLimits { max_log_rows: shape.max_log_rows(), ..ShardLimits::full() },
+    );
     let event_bytes = events.mul * std::mem::size_of::<Bf16MulEvent<SP1Field>>()
         + events.add_sub * std::mem::size_of::<Bf16AddSubEvent<SP1Field>>()
         + events.unary * std::mem::size_of::<Bf16UnaryEvent<SP1Field>>();
@@ -700,6 +709,14 @@ fn print_estimate(shape: Shape, events: EventCounts) {
         "executor-record lower bound per tile: bytes={event_bytes} gib={:.2}",
         event_bytes as f64 / 1024_f64.powi(3)
     );
+    println!(
+        "shape-aware plan: natural_unit=output_column units_per_leaf={} leaves={} estimated_rows={} estimated_trace_area={} limit={}",
+        plan.units_per_shard,
+        plan.shard_count,
+        plan.estimate.max_rows(),
+        plan.estimate.estimated_trace_area,
+        plan.limits.max_trace_area,
+    );
 }
 
 fn write_tile_manifest(arguments: &Arguments, tile: usize, commitments: TileCommitments) {
@@ -707,8 +724,10 @@ fn write_tile_manifest(arguments: &Arguments, tile: usize, commitments: TileComm
         panic!("failed to create {}: {error}", arguments.output_dir.display())
     });
     let manifest = format!(
-        "version={PROTOCOL_VERSION}\nstage=mlp_expansion_gelu_tile\nlayer={}\ntile={tile}\nupstream={}\ninput={}\nparameters={}\noutput={}\ntranscript={}\n",
+        "version={PROTOCOL_VERSION}\nstage=mlp_expansion_gelu_tile\nsharding=shape_aware_output_columns\nlayer={}\ntile={tile}\noutput_start={}\noutput_width={}\nupstream={}\ninput={}\nparameters={}\noutput={}\ntranscript={}\n",
         arguments.layer,
+        tile * arguments.shape.tile_width(),
+        arguments.shape.tile_width(),
         digest_hex(&commitments.upstream),
         digest_hex(&commitments.input),
         digest_hex(&commitments.parameters),
@@ -856,6 +875,11 @@ async fn prove_tiles(
         let proof_shape = prover
             .shape_from_record(&execution.record)
             .expect("MLP expansion tile machine has no proof shape");
+        let trace_area = proof_shape.preprocessed_area + proof_shape.main_area;
+        assert!(
+            trace_area <= DEFAULT_MAX_TRACE_AREA,
+            "MLP expansion leaf trace area {trace_area} exceeds shape-aware limit {DEFAULT_MAX_TRACE_AREA}"
+        );
         println!("proof shape: tile={tile} {proof_shape:?}");
 
         let TileExecution { tile, output, commitments, record, reference_seconds, execute_seconds } =
@@ -997,6 +1021,11 @@ fn write_group_artifacts(
     writeln!(manifest, "  \"hidden_size\": {},", arguments.shape.hidden_size).unwrap();
     writeln!(manifest, "  \"expansion_size\": {},", arguments.shape.expansion_size).unwrap();
     writeln!(manifest, "  \"num_tiles\": {},", arguments.shape.num_tiles).unwrap();
+    writeln!(manifest, "  \"sharding_strategy\": \"shape_aware_output_columns\",").unwrap();
+    writeln!(manifest, "  \"natural_unit\": \"output_column\",").unwrap();
+    writeln!(manifest, "  \"units_per_leaf\": {},", arguments.shape.tile_width()).unwrap();
+    writeln!(manifest, "  \"max_log_rows\": {},", arguments.shape.max_log_rows()).unwrap();
+    writeln!(manifest, "  \"max_trace_area\": {DEFAULT_MAX_TRACE_AREA},").unwrap();
     writeln!(manifest, "  \"upstream_transcript\": \"{}\",", digest_hex(&upstream.transcript))
         .unwrap();
     writeln!(manifest, "  \"input_commitment\": \"{}\",", digest_hex(&commitments.input)).unwrap();

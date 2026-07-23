@@ -39,6 +39,9 @@ use sp1_recursion_executor::{
 };
 use sp1_recursion_machine::{
     chips::bf16::{NUM_BF16_ADD_SUB_EVENTS_PER_ROW, NUM_BF16_MUL_EVENTS_PER_ROW},
+    sharding::{
+        plan_uniform_natural_shards, Bf16EventsPerUnit, ShardLimits, DEFAULT_MAX_TRACE_AREA,
+    },
     RecursionAir,
 };
 
@@ -1113,6 +1116,16 @@ fn padded_rows(events: usize, lanes: usize) -> usize {
 
 fn print_estimate(shape: Shape, events: EventCounts) {
     let max_rows = 1usize << shape.max_log_rows();
+    let plan = plan_uniform_natural_shards(
+        shape.num_heads,
+        Bf16EventsPerUnit {
+            mul: events.mul,
+            add_sub: events.add_sub,
+            unary: events.unary,
+            div: events.div,
+        },
+        ShardLimits { max_log_rows: shape.max_log_rows(), ..ShardLimits::full() },
+    );
     let event_record_bytes = events.mul * std::mem::size_of::<Bf16MulEvent<SP1Field>>()
         + events.add_sub * std::mem::size_of::<Bf16AddSubEvent<SP1Field>>()
         + events.unary * std::mem::size_of::<Bf16UnaryEvent<SP1Field>>()
@@ -1143,6 +1156,27 @@ fn print_estimate(shape: Shape, events: EventCounts) {
         "executor-record lower bound: bytes={event_record_bytes} gib={:.2}",
         event_record_bytes as f64 / 1024_f64.powi(3)
     );
+    println!(
+        "shape-aware capacity: natural_unit=attention_head heads_per_leaf={} leaves={} estimated_rows={} estimated_trace_area={} limit={}",
+        plan.units_per_shard,
+        plan.shard_count,
+        plan.estimate.max_rows(),
+        plan.estimate.estimated_trace_area,
+        plan.limits.max_trace_area,
+    );
+    println!(
+        "selected attention plan: heads_per_leaf=1 leaves={} (one complete head is the leaf protocol unit)",
+        shape.num_heads,
+    );
+    if shape.sequence_length == DEFAULT_SEQUENCE_LENGTH
+        && shape.hidden_size == DEFAULT_HIDDEN_SIZE
+        && shape.num_heads == DEFAULT_NUM_HEADS
+    {
+        assert_eq!(
+            plan.units_per_shard, 1,
+            "the production attention shape unexpectedly fits multiple complete heads per leaf"
+        );
+    }
 }
 
 fn digest_hex(digest: &Digest) -> String {
@@ -1387,6 +1421,11 @@ async fn prove_heads(
         }
         let proof_shape =
             prover.shape_from_record(&execution.record).expect("leaf machine has no proof shape");
+        let trace_area = proof_shape.preprocessed_area + proof_shape.main_area;
+        assert!(
+            trace_area <= DEFAULT_MAX_TRACE_AREA,
+            "attention leaf trace area {trace_area} exceeds shape-aware limit {DEFAULT_MAX_TRACE_AREA}"
+        );
         println!("proof shape: head={head} {proof_shape:?}");
 
         let HeadExecution {
@@ -1567,6 +1606,11 @@ fn write_attention_group_artifacts(
     writeln!(manifest, "  \"sequence_length\": {},", arguments.shape.sequence_length).unwrap();
     writeln!(manifest, "  \"hidden_size\": {},", arguments.shape.hidden_size).unwrap();
     writeln!(manifest, "  \"num_heads\": {},", arguments.shape.num_heads).unwrap();
+    writeln!(manifest, "  \"sharding_strategy\": \"shape_aware_attention_heads\",").unwrap();
+    writeln!(manifest, "  \"natural_unit\": \"attention_head\",").unwrap();
+    writeln!(manifest, "  \"units_per_leaf\": 1,").unwrap();
+    writeln!(manifest, "  \"max_log_rows\": {},", arguments.shape.max_log_rows()).unwrap();
+    writeln!(manifest, "  \"max_trace_area\": {DEFAULT_MAX_TRACE_AREA},").unwrap();
     writeln!(
         manifest,
         "  \"upstream_transcript\": {},",

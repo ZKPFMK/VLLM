@@ -115,19 +115,19 @@ impl<
         Machine::new(chips, PROOF_MAX_NUM_PVS, shape)
     }
 
-    /// The compression machine extended with the opt-in `VeriLLM` BF16 lookup and arithmetic chips.
+    /// A minimal recursion machine for the `VeriLLM` BF16 inference circuits.
     ///
-    /// Keeping these chips out of [`Self::compress_machine`] avoids imposing a fixed 2^16-row
-    /// lookup trace on recursion programs that do not use floating-point operations.
+    /// The inference circuits use base-field equality checks, Poseidon2 commitments, and the BF16
+    /// lookup/arithmetic chips. They do not emit extension-field ALU, prefix-sum-check, or select
+    /// instructions; omitting those chips avoids proving their padded empty traces. Keeping the
+    /// BF16 chips out of [`Self::compress_machine`] also avoids imposing their fixed lookup trace
+    /// on recursion programs that do not use floating-point operations.
     pub fn verillm_machine() -> Machine<F, Self> {
         let chips = [
             RecursionAir::MemoryConst(MemoryConstChip::default()),
             RecursionAir::MemoryVar(MemoryVarChip::<F, VAR_EVENTS_PER_ROW>::default()),
             RecursionAir::BaseAlu(BaseAluChip),
-            RecursionAir::ExtAlu(ExtAluChip),
             RecursionAir::Poseidon2Wide(Poseidon2WideChip::<DEGREE>),
-            RecursionAir::PrefixSumChecks(PrefixSumChecksChip),
-            RecursionAir::Select(SelectChip),
             RecursionAir::Bf16Lookup(Bf16LookupChip),
             RecursionAir::Bf16Mul(Bf16MulChip),
             RecursionAir::Bf16Unary(Bf16UnaryChip),
@@ -230,6 +230,21 @@ pub mod tests {
     };
 
     use crate::test::test_recursion_linear_program;
+
+    #[test]
+    fn verillm_machine_omits_unused_general_recursion_chips() {
+        use sp1_hypercube::air::MachineAir;
+        use sp1_primitives::SP1Field;
+
+        type A = super::RecursionAir<SP1Field, 3, 2>;
+        let machine = A::verillm_machine();
+        let chip_names = machine.chips().iter().map(|chip| chip.air.name()).collect::<Vec<_>>();
+
+        assert!(chip_names.contains(&"BaseAlu"));
+        assert!(!chip_names.contains(&"ExtAlu"));
+        assert!(!chip_names.contains(&"PrefixSumChecks"));
+        assert!(!chip_names.contains(&"Select"));
+    }
 
     #[tokio::test]
     pub async fn fibonacci() {

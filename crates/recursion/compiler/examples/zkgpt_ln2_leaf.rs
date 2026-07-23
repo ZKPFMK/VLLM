@@ -31,6 +31,9 @@ use sp1_recursion_executor::{
 };
 use sp1_recursion_machine::{
     chips::bf16::{NUM_BF16_ADD_SUB_EVENTS_PER_ROW, NUM_BF16_MUL_EVENTS_PER_ROW},
+    sharding::{
+        plan_uniform_natural_shards, Bf16EventsPerUnit, ShardLimits, DEFAULT_MAX_TRACE_AREA,
+    },
     RecursionAir,
 };
 
@@ -599,6 +602,16 @@ fn padded_rows(events: usize, lanes: usize) -> usize {
 
 fn print_estimate(shape: Shape, events: EventCounts) {
     let max_rows = 1usize << shape.max_log_rows();
+    let plan = plan_uniform_natural_shards(
+        shape.sequence_length,
+        Bf16EventsPerUnit {
+            mul: 2 * shape.hidden_size,
+            add_sub: 4 * shape.hidden_size - 1,
+            unary: shape.hidden_size + 1,
+            div: 2,
+        },
+        ShardLimits { max_log_rows: shape.max_log_rows(), ..ShardLimits::full() },
+    );
     let event_bytes = events.mul * std::mem::size_of::<Bf16MulEvent<SP1Field>>()
         + events.add_sub * std::mem::size_of::<Bf16AddSubEvent<SP1Field>>()
         + events.unary * std::mem::size_of::<Bf16UnaryEvent<SP1Field>>()
@@ -627,6 +640,15 @@ fn print_estimate(shape: Shape, events: EventCounts) {
         "executor-record lower bound: bytes={event_bytes} mib={:.2}",
         event_bytes as f64 / 1024_f64.powi(2)
     );
+    println!(
+        "shape-aware plan: natural_unit=layernorm_token tokens_per_leaf={} leaves={} estimated_rows={} estimated_trace_area={} limit={}",
+        plan.units_per_shard,
+        plan.shard_count,
+        plan.estimate.max_rows(),
+        plan.estimate.estimated_trace_area,
+        plan.limits.max_trace_area,
+    );
+    assert_eq!(plan.shard_count, 1, "the full LN2 token set should fit in one leaf proof");
 }
 
 fn print_trace_rows(record: &ExecutionRecord<SP1Field>, max_log_rows: usize) {
@@ -685,6 +707,11 @@ fn write_artifacts(
             "  \"layer\": {},\n",
             "  \"sequence_length\": {},\n",
             "  \"hidden_size\": {},\n",
+            "  \"sharding_strategy\": \"shape_aware_layernorm_tokens\",\n",
+            "  \"natural_unit\": \"layernorm_token\",\n",
+            "  \"units_per_leaf\": {},\n",
+            "  \"max_log_rows\": {},\n",
+            "  \"max_trace_area\": {},\n",
             "  \"epsilon_bf16_raw\": {},\n",
             "  \"upstream_transcript\": \"{}\",\n",
             "  \"input_commitment\": \"{}\",\n",
@@ -711,6 +738,9 @@ fn write_artifacts(
         arguments.layer,
         arguments.shape.sequence_length,
         arguments.shape.hidden_size,
+        arguments.shape.sequence_length,
+        arguments.shape.max_log_rows(),
+        DEFAULT_MAX_TRACE_AREA,
         GPT2_LAYER_NORM_EPSILON,
         digest_hex(&commitments.upstream),
         digest_hex(&commitments.input),
@@ -760,6 +790,11 @@ async fn prove_ln2(
     );
     let prover = simple_prover(verifier);
     let proof_shape = prover.shape_from_record(&record).expect("LN2 machine has no proof shape");
+    let trace_area = proof_shape.preprocessed_area + proof_shape.main_area;
+    assert!(
+        trace_area <= DEFAULT_MAX_TRACE_AREA,
+        "LN2 leaf trace area {trace_area} exceeds shape-aware limit {DEFAULT_MAX_TRACE_AREA}"
+    );
     println!("proof shape: {proof_shape:?}");
 
     let setup_started = Instant::now();
