@@ -7016,6 +7016,7 @@ dependencies = [
  "cfg-if",
  "hashbrown 0.14.5",
  "itertools 0.14.0",
+ "libm",
  "range-set-blaze",
  "serde",
  "slop-algebra",

@@ -44,6 +44,10 @@ use sp1_recursion_executor::{
 use sp1_recursion_machine::chips::{
     alu_base::BaseAluChip,
     alu_ext::ExtAluChip,
+    bf16::{
+        Bf16AddSubChip, Bf16DivChip, Bf16MulChip, Bf16UnaryChip, NUM_BF16_ADD_SUB_EVENTS_PER_ROW,
+        NUM_BF16_MUL_EVENTS_PER_ROW,
+    },
     mem::{MemoryConstChip, MemoryVarChip},
     poseidon2_helper::{
         convert::ConvertChip, linear::Poseidon2LinearLayerChip, sbox::Poseidon2SBoxChip,
@@ -779,6 +783,10 @@ pub fn max_count(a: RecursionAirEventCount, b: RecursionAirEventCount) -> Recurs
         ),
         poseidon2_sbox_events: max(a.poseidon2_sbox_events, b.poseidon2_sbox_events),
         select_events: max(a.select_events, b.select_events),
+        bf16_mul_events: max(a.bf16_mul_events, b.bf16_mul_events),
+        bf16_unary_events: max(a.bf16_unary_events, b.bf16_unary_events),
+        bf16_div_events: max(a.bf16_div_events, b.bf16_div_events),
+        bf16_add_sub_events: max(a.bf16_add_sub_events, b.bf16_add_sub_events),
         prefix_sum_checks_events: max(a.prefix_sum_checks_events, b.prefix_sum_checks_events),
         commit_pv_hash_events: max(a.commit_pv_hash_events, b.commit_pv_hash_events),
     }
@@ -834,6 +842,16 @@ pub fn build_recursion_count_from_shape(
             .height(&CompressAir::<SP1Field>::Poseidon2SBox(Poseidon2SBoxChip))
             .unwrap_or(0),
         select_events: shape.height(&CompressAir::<SP1Field>::Select(SelectChip)).unwrap(),
+        bf16_mul_events: shape.height(&CompressAir::<SP1Field>::Bf16Mul(Bf16MulChip)).unwrap_or(0)
+            * NUM_BF16_MUL_EVENTS_PER_ROW,
+        bf16_unary_events: shape
+            .height(&CompressAir::<SP1Field>::Bf16Unary(Bf16UnaryChip))
+            .unwrap_or(0),
+        bf16_div_events: shape.height(&CompressAir::<SP1Field>::Bf16Div(Bf16DivChip)).unwrap_or(0),
+        bf16_add_sub_events: shape
+            .height(&CompressAir::<SP1Field>::Bf16AddSub(Bf16AddSubChip))
+            .unwrap_or(0)
+            * NUM_BF16_ADD_SUB_EVENTS_PER_ROW,
         prefix_sum_checks_events: shape
             .height(&CompressAir::<SP1Field>::PrefixSumChecks(PrefixSumChecksChip))
             .unwrap_or(0),
