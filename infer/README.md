@@ -153,6 +153,57 @@ for substantially more than 429 GiB of RAM (practically a high-memory server;
 operation is blocked unless `--allow-large-build` is explicitly supplied; do
 not run the full command on an ordinary workstation.
 
+### One proof per Block and one final recursion proof
+
+The server-oriented path avoids the 12-Block monolithic trace. Each invocation
+of `zkgpt_like --block N` proves exactly one complete GPT-2 Block and commits its
+input, private parameters, hints, output, and the previous Block transcript.
+The following Block verifies the previous proof on the host, consumes its
+committed private output, and proves the next link.
+
+After all 12 Block proofs exist, `zkgpt_block_recursion` performs actual
+in-circuit child-STARK verification. Every join verifies two child proofs and
+their verifying-key hashes, checks the Block range and the input/output and
+transcript boundaries, and emits one recursion proof. The runner constructs the
+binary reduction:
+
+```text
+12 Block proofs -> 6 -> 3 -> 2 -> 1 final recursion proof
+```
+
+This produces 12 Block proofs plus 11 recursion proofs during the full run, but
+the final artifact is one proof covering Blocks `0..12`. At an odd level the
+unpaired node is carried forward; no redundant identity proof is generated.
+
+Build and run this path on the Linux proving server:
+
+```bash
+python3 infer/zkgpt_block_recursion.py \
+  --prove --build --resume \
+  --threads "$(nproc)" \
+  --data-dir /home/dj/VLLM-models/gpt2-bf16/recursion/zkgpt-like-12x30-real-bf16 \
+  --output-root /home/dj/proofs/zkgpt-12-block-recursion
+```
+
+`--resume` validates and skips completed Block and recursion manifests. The
+runner writes `zkgpt_block_recursion.run.json` and prints the final recursion
+manifest path. After completion, verify the serialized final proof, its public
+transcript, and its verifying-key commitment again with:
+
+```bash
+python3 infer/zkgpt_block_recursion.py \
+  --check-only \
+  --output-root /home/dj/proofs/zkgpt-12-block-recursion
+```
+
+To inspect the complete command plan without proving:
+
+```bash
+python3 infer/zkgpt_block_recursion.py \
+  --dry-run \
+  --output-root /home/dj/proofs/zkgpt-12-block-recursion
+```
+
 ### Bounded attention-head leaf shards
 
 The `zkgpt_leaf` example proves the first bounded stage without materializing the

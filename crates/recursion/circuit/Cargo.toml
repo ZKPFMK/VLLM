@@ -55,6 +55,7 @@ rand = { workspace = true }
 futures = { workspace = true }
 test-artifacts = { path = "../../test-artifacts" }
 bincode = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [features]

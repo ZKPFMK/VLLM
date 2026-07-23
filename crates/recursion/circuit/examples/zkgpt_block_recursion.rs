@@ -1,0 +1,994 @@
+#![allow(clippy::print_stdout)]
+
+use std::{
+    borrow::{Borrow, BorrowMut},
+    fs::{self, File},
+    marker::PhantomData,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
+
+use serde::{Deserialize, Serialize};
+use slop_algebra::{AbstractField, PrimeField32};
+use slop_basefold::{BasefoldVerifier, FriConfig};
+use slop_symmetric::Permutation;
+use sp1_hypercube::{
+    air::MachineAir, inner_perm, prover::simple_prover, HashableKey, MachineProof,
+    MachineVerifyingKey, SP1PcsProofInner, ShardProof, ShardVerifier, NUM_SP1_COMMITMENTS,
+};
+use sp1_primitives::{
+    fri_params::{unique_decoding_queries, SP1_PROOF_OF_WORK_BITS},
+    SP1DiffusionMatrix, SP1ExtensionField, SP1Field, SP1GlobalContext,
+};
+use sp1_recursion_circuit::{
+    basefold::{
+        stacked::RecursiveStackedPcsVerifier, tcs::RecursiveMerkleTreeTcs,
+        RecursiveBasefoldVerifier,
+    },
+    challenger::CanObserveVariable,
+    jagged::{RecursiveJaggedEvalSumcheckConfig, RecursiveJaggedPcsVerifier},
+    shard::{MachineVerifyingKeyVariable, RecursiveShardVerifier, ShardProofVariable},
+    witness::Witnessable,
+    SP1FieldConfigVariable,
+};
+use sp1_recursion_compiler::{
+    circuit::{AsmBuilder, AsmCompiler, AsmConfig, CircuitV2Builder},
+    prelude::{Builder, Felt},
+};
+use sp1_recursion_executor::{
+    Block, Executor, RecursionProgram, RecursionPublicValues, DIGEST_SIZE, HASH_RATE,
+    PERMUTATION_WIDTH, RECURSIVE_PROOF_NUM_PV_ELTS,
+};
+use sp1_recursion_machine::RecursionAir;
+
+const DEFAULT_SEQUENCE_LENGTH: usize = 30;
+const DEFAULT_HIDDEN_SIZE: usize = 768;
+const DEFAULT_NUM_HEADS: usize = 12;
+const DEFAULT_LINEAR_SIZE: usize = 2304;
+const GPT2_LAYER_NORM_EPSILON: u16 = 0x3727;
+const GPT2_ATTENTION_SCALE: u16 = 0x3e00;
+
+const PROOF_LOG_BLOWUP: usize = 1;
+const PROOF_LOG_STACKING_HEIGHT: u32 = 22;
+const PROOF_MAX_LOG_ROW_COUNT: usize = 28;
+
+const BLOCK_PROTOCOL_VERSION: u32 = 1;
+const BLOCK_STAGE_GENESIS: u32 = 0x1600;
+const BLOCK_STAGE_CHAINED: u32 = 0x1601;
+const DOMAIN_BLOCK_TRANSCRIPT: u32 = 0x1614;
+
+const RECURSION_PROTOCOL_VERSION: u32 = 1;
+const RECURSION_STAGE: u32 = 0x1620;
+const DOMAIN_RECURSION_TRANSCRIPT: u32 = 0x1621;
+const NODE_KIND_BLOCK: u32 = 0x1622;
+const NODE_KIND_RECURSION: u32 = 0x1623;
+
+type Digest = [SP1Field; DIGEST_SIZE];
+type Air = RecursionAir<SP1Field, 3, 2>;
+type StoredProof = MachineProof<SP1GlobalContext, SP1PcsProofInner>;
+type StoredShardProof = ShardProof<SP1GlobalContext, SP1PcsProofInner>;
+type StoredVerifyingKey = MachineVerifyingKey<SP1GlobalContext>;
+type RecursiveVerifier = RecursiveShardVerifier<SP1GlobalContext, Air, AsmConfig>;
+type VerifyingKeyVariable = MachineVerifyingKeyVariable<AsmConfig, SP1GlobalContext>;
+type ProofVariable = ShardProofVariable<AsmConfig, SP1GlobalContext>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mode {
+    Check,
+    Build,
+    Execute,
+    Prove,
+}
+
+#[derive(Debug)]
+struct Arguments {
+    mode: Mode,
+    left_manifest: Option<PathBuf>,
+    right_manifest: Option<PathBuf>,
+    verify_manifest: Option<PathBuf>,
+    output_dir: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NodeKind {
+    Block,
+    Recursion,
+}
+
+impl NodeKind {
+    const fn tag(self) -> u32 {
+        match self {
+            Self::Block => NODE_KIND_BLOCK,
+            Self::Recursion => NODE_KIND_RECURSION,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Shape {
+    sequence_length: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    linear_size: usize,
+}
+
+impl Default for Shape {
+    fn default() -> Self {
+        Self {
+            sequence_length: DEFAULT_SEQUENCE_LENGTH,
+            hidden_size: DEFAULT_HIDDEN_SIZE,
+            num_heads: DEFAULT_NUM_HEADS,
+            linear_size: DEFAULT_LINEAR_SIZE,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NodeDescriptor {
+    kind: NodeKind,
+    start_block: usize,
+    end_block: usize,
+    input: Digest,
+    output: Digest,
+    first_upstream: Option<Digest>,
+    last_block_transcript: Digest,
+    transcript: Digest,
+    verifying_key: Digest,
+}
+
+struct ChildArtifact {
+    descriptor: NodeDescriptor,
+    shape: Shape,
+    manifest_path: PathBuf,
+    verifying_key: StoredVerifyingKey,
+    proof: StoredShardProof,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockManifest {
+    version: u32,
+    stage: String,
+    block: usize,
+    sequence_length: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    linear_size: usize,
+    shards: usize,
+    upstream_transcript: Option<String>,
+    input_commitment: String,
+    parameters_commitment: String,
+    hints_commitment: String,
+    output_commitment: String,
+    transcript_commitment: String,
+    proof_file: String,
+    verifying_key_file: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ManifestNodeDescriptor {
+    kind: NodeKind,
+    start_block: usize,
+    end_block: usize,
+    input_commitment: String,
+    output_commitment: String,
+    first_upstream_transcript: Option<String>,
+    last_block_transcript: String,
+    transcript_commitment: String,
+    verifying_key_commitment: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecursionManifest {
+    version: u32,
+    stage: String,
+    sequence_length: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    linear_size: usize,
+    shards: usize,
+    start_block: usize,
+    end_block: usize,
+    input_commitment: String,
+    output_commitment: String,
+    first_upstream_transcript: Option<String>,
+    last_block_transcript: String,
+    transcript_commitment: String,
+    verifying_key_commitment: String,
+    left: ManifestNodeDescriptor,
+    right: ManifestNodeDescriptor,
+    proof_file: String,
+    verifying_key_file: String,
+}
+
+fn parse_arguments() -> Arguments {
+    let mut mode = Mode::Check;
+    let mut left_manifest = None;
+    let mut right_manifest = None;
+    let mut verify_manifest = None;
+    let mut output_dir = std::env::var_os("SP1_ZKGPT_RECURSION_OUTPUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("sp1-zkgpt-block-recursion"));
+    let mut arguments = std::env::args_os().skip(1);
+    while let Some(argument) = arguments.next() {
+        match argument.to_str() {
+            Some("--check") => mode = Mode::Check,
+            Some("--build") => mode = Mode::Build,
+            Some("--execute") => mode = Mode::Execute,
+            Some("--prove") => mode = Mode::Prove,
+            Some("--left-manifest") => {
+                left_manifest = Some(PathBuf::from(
+                    arguments.next().expect("--left-manifest requires a value"),
+                ));
+            }
+            Some("--right-manifest") => {
+                right_manifest = Some(PathBuf::from(
+                    arguments.next().expect("--right-manifest requires a value"),
+                ));
+            }
+            Some("--verify-manifest") => {
+                verify_manifest = Some(PathBuf::from(
+                    arguments.next().expect("--verify-manifest requires a value"),
+                ));
+            }
+            Some("--output-dir") => {
+                output_dir =
+                    PathBuf::from(arguments.next().expect("--output-dir requires a value"));
+            }
+            Some(value) => panic!("unknown option: {value}"),
+            None => panic!("command-line options must be valid UTF-8"),
+        }
+    }
+    if verify_manifest.is_some() {
+        assert!(
+            left_manifest.is_none() && right_manifest.is_none(),
+            "--verify-manifest cannot be combined with child manifests"
+        );
+        assert_eq!(mode, Mode::Check, "--verify-manifest cannot generate a new proof");
+    } else {
+        assert!(
+            left_manifest.is_some() && right_manifest.is_some(),
+            "--left-manifest and --right-manifest are required"
+        );
+    }
+    Arguments { mode, left_manifest, right_manifest, verify_manifest, output_dir }
+}
+
+fn proof_fri_config() -> FriConfig<SP1Field> {
+    FriConfig::new(
+        PROOF_LOG_BLOWUP,
+        unique_decoding_queries(PROOF_LOG_BLOWUP),
+        SP1_PROOF_OF_WORK_BITS,
+    )
+}
+
+fn parse_digest(value: &str, label: &str) -> Digest {
+    let limbs = value
+        .split(':')
+        .map(|limb| {
+            let limb = limb.strip_prefix("0x").unwrap_or(limb);
+            u32::from_str_radix(limb, 16)
+                .unwrap_or_else(|error| panic!("invalid {label} limb {limb}: {error}"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(limbs.len(), DIGEST_SIZE, "{label} must contain {DIGEST_SIZE} limbs");
+    limbs.into_iter().map(SP1Field::from_canonical_u32).collect::<Vec<_>>().try_into().unwrap()
+}
+
+fn digest_hex(digest: &Digest) -> String {
+    digest
+        .iter()
+        .map(|value| format!("{:08X}", value.as_canonical_u32()))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn host_commit_fields(domain: u32, values: &[SP1Field]) -> Digest {
+    let mut state = [SP1Field::zero(); PERMUTATION_WIDTH];
+    state[0] = SP1Field::from_canonical_u32(domain);
+    state[1] = SP1Field::from_canonical_usize(values.len());
+    inner_perm().permute_mut(&mut state);
+    for chunk in values.chunks(HASH_RATE) {
+        state[..HASH_RATE].fill(SP1Field::zero());
+        state[..chunk.len()].copy_from_slice(chunk);
+        inner_perm().permute_mut(&mut state);
+    }
+    state[..DIGEST_SIZE].try_into().unwrap()
+}
+
+fn circuit_commit_fields(
+    builder: &mut Builder<AsmConfig>,
+    domain: u32,
+    values: &[Felt<SP1Field>],
+) -> [Felt<SP1Field>; DIGEST_SIZE] {
+    let zero: Felt<SP1Field> = builder.constant(SP1Field::zero());
+    let mut state = [zero; PERMUTATION_WIDTH];
+    state[0] = builder.constant(SP1Field::from_canonical_u32(domain));
+    state[1] = builder.constant(SP1Field::from_canonical_usize(values.len()));
+    state = builder.poseidon2_permute_v2(state);
+    for chunk in values.chunks(HASH_RATE) {
+        state[..HASH_RATE].fill(zero);
+        state[..chunk.len()].copy_from_slice(chunk);
+        state = builder.poseidon2_permute_v2(state);
+    }
+    state[..DIGEST_SIZE].try_into().unwrap()
+}
+
+fn block_transcript(manifest: &BlockManifest) -> Digest {
+    assert_eq!(manifest.version, BLOCK_PROTOCOL_VERSION, "unsupported Block protocol");
+    assert_eq!(manifest.stage, "zkgpt_block", "invalid Block stage");
+    assert_eq!(manifest.shards, 1, "a Block proof must contain one shard");
+    let upstream = manifest
+        .upstream_transcript
+        .as_deref()
+        .map(|value| parse_digest(value, "upstream transcript"));
+    if manifest.block == 0 {
+        assert!(upstream.is_none(), "Block 0 must not have an upstream transcript");
+    } else {
+        assert!(upstream.is_some(), "Block {} must have an upstream transcript", manifest.block);
+    }
+    let mut fields = [
+        BLOCK_PROTOCOL_VERSION,
+        if manifest.block == 0 { BLOCK_STAGE_GENESIS } else { BLOCK_STAGE_CHAINED },
+        manifest.block as u32,
+        manifest.sequence_length as u32,
+        manifest.hidden_size as u32,
+        manifest.num_heads as u32,
+        manifest.linear_size as u32,
+        GPT2_LAYER_NORM_EPSILON as u32,
+        GPT2_ATTENTION_SCALE as u32,
+    ]
+    .map(SP1Field::from_canonical_u32)
+    .to_vec();
+    if let Some(upstream) = upstream {
+        fields.extend(upstream);
+    }
+    fields.extend(parse_digest(&manifest.input_commitment, "Block input"));
+    fields.extend(parse_digest(&manifest.parameters_commitment, "Block parameters"));
+    fields.extend(parse_digest(&manifest.hints_commitment, "Block hints"));
+    fields.extend(parse_digest(&manifest.output_commitment, "Block output"));
+    host_commit_fields(DOMAIN_BLOCK_TRANSCRIPT, &fields)
+}
+
+fn descriptor_fields(descriptor: &NodeDescriptor) -> Vec<SP1Field> {
+    let mut fields = vec![
+        SP1Field::from_canonical_u32(descriptor.kind.tag()),
+        SP1Field::from_canonical_usize(descriptor.start_block),
+        SP1Field::from_canonical_usize(descriptor.end_block),
+        SP1Field::from_bool(descriptor.first_upstream.is_some()),
+    ];
+    fields.extend(descriptor.input);
+    fields.extend(descriptor.output);
+    fields.extend(descriptor.first_upstream.unwrap_or([SP1Field::zero(); DIGEST_SIZE]));
+    fields.extend(descriptor.last_block_transcript);
+    fields.extend(descriptor.transcript);
+    fields.extend(descriptor.verifying_key);
+    fields
+}
+
+fn aggregate_transcript(shape: Shape, left: &NodeDescriptor, right: &NodeDescriptor) -> Digest {
+    let mut fields = [
+        RECURSION_PROTOCOL_VERSION,
+        RECURSION_STAGE,
+        shape.sequence_length as u32,
+        shape.hidden_size as u32,
+        shape.num_heads as u32,
+        shape.linear_size as u32,
+        left.start_block as u32,
+        right.end_block as u32,
+    ]
+    .map(SP1Field::from_canonical_u32)
+    .to_vec();
+    fields.extend(descriptor_fields(left));
+    fields.extend(descriptor_fields(right));
+    host_commit_fields(DOMAIN_RECURSION_TRANSCRIPT, &fields)
+}
+
+fn descriptor_from_manifest(value: &ManifestNodeDescriptor) -> NodeDescriptor {
+    NodeDescriptor {
+        kind: value.kind,
+        start_block: value.start_block,
+        end_block: value.end_block,
+        input: parse_digest(&value.input_commitment, "node input"),
+        output: parse_digest(&value.output_commitment, "node output"),
+        first_upstream: value
+            .first_upstream_transcript
+            .as_deref()
+            .map(|digest| parse_digest(digest, "node first upstream")),
+        last_block_transcript: parse_digest(
+            &value.last_block_transcript,
+            "node last Block transcript",
+        ),
+        transcript: parse_digest(&value.transcript_commitment, "node transcript"),
+        verifying_key: parse_digest(&value.verifying_key_commitment, "node verifying key"),
+    }
+}
+
+fn manifest_descriptor(value: NodeDescriptor) -> ManifestNodeDescriptor {
+    ManifestNodeDescriptor {
+        kind: value.kind,
+        start_block: value.start_block,
+        end_block: value.end_block,
+        input_commitment: digest_hex(&value.input),
+        output_commitment: digest_hex(&value.output),
+        first_upstream_transcript: value.first_upstream.map(|digest| digest_hex(&digest)),
+        last_block_transcript: digest_hex(&value.last_block_transcript),
+        transcript_commitment: digest_hex(&value.transcript),
+        verifying_key_commitment: digest_hex(&value.verifying_key),
+    }
+}
+
+fn validate_adjacent(left: &NodeDescriptor, right: &NodeDescriptor) {
+    assert_eq!(left.end_block, right.start_block, "child Block ranges are not adjacent");
+    assert_eq!(left.output, right.input, "left output does not equal right input");
+    assert_eq!(
+        right.first_upstream,
+        Some(left.last_block_transcript),
+        "right Block chain does not continue from the left child"
+    );
+}
+
+fn safe_artifact_path(manifest_path: &Path, file: &str, label: &str) -> PathBuf {
+    let relative = Path::new(file);
+    assert!(
+        !relative.is_absolute()
+            && relative.file_name().is_some_and(|name| name == relative.as_os_str()),
+        "{label} must be a plain relative file name"
+    );
+    manifest_path.parent().expect("manifest must have a parent").join(relative)
+}
+
+fn read_proof_artifacts(
+    manifest_path: &Path,
+    proof_file: &str,
+    verifying_key_file: &str,
+) -> (StoredProof, StoredVerifyingKey) {
+    let proof_path = safe_artifact_path(manifest_path, proof_file, "proof_file");
+    let vk_path = safe_artifact_path(manifest_path, verifying_key_file, "verifying_key_file");
+    let proof: StoredProof = bincode::deserialize_from(
+        File::open(&proof_path)
+            .unwrap_or_else(|error| panic!("failed to open {}: {error}", proof_path.display())),
+    )
+    .unwrap_or_else(|error| panic!("failed to decode {}: {error}", proof_path.display()));
+    let vk: StoredVerifyingKey = bincode::deserialize_from(
+        File::open(&vk_path)
+            .unwrap_or_else(|error| panic!("failed to open {}: {error}", vk_path.display())),
+    )
+    .unwrap_or_else(|error| panic!("failed to decode {}: {error}", vk_path.display()));
+    (proof, vk)
+}
+
+fn host_verify(kind: NodeKind, vk: &StoredVerifyingKey, proof: &StoredProof) {
+    let machine = match kind {
+        NodeKind::Block => Air::verillm_machine(),
+        NodeKind::Recursion => Air::compress_machine(),
+    };
+    let verifier = ShardVerifier::from_basefold_parameters(
+        proof_fri_config(),
+        PROOF_LOG_STACKING_HEIGHT,
+        PROOF_MAX_LOG_ROW_COUNT,
+        machine,
+    );
+    simple_prover(verifier)
+        .verify(vk, proof)
+        .unwrap_or_else(|error| panic!("{kind:?} child proof failed host verification: {error:?}"));
+}
+
+fn load_child(manifest_path: &Path) -> ChildArtifact {
+    let bytes = fs::read(manifest_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display()));
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("invalid JSON {}: {error}", manifest_path.display()));
+    let stage = value
+        .get("stage")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("{} is missing stage", manifest_path.display()))
+        .to_owned();
+
+    let (descriptor_without_vk, shape, proof, vk, expected_vk) = match stage.as_str() {
+        "zkgpt_block" => {
+            let manifest: BlockManifest = serde_json::from_value(value)
+                .unwrap_or_else(|error| panic!("invalid Block manifest: {error}"));
+            let transcript = block_transcript(&manifest);
+            assert_eq!(
+                transcript,
+                parse_digest(&manifest.transcript_commitment, "Block transcript"),
+                "Block manifest transcript is inconsistent"
+            );
+            let shape = Shape {
+                sequence_length: manifest.sequence_length,
+                hidden_size: manifest.hidden_size,
+                num_heads: manifest.num_heads,
+                linear_size: manifest.linear_size,
+            };
+            let (proof, vk) = read_proof_artifacts(
+                manifest_path,
+                &manifest.proof_file,
+                &manifest.verifying_key_file,
+            );
+            let descriptor = NodeDescriptor {
+                kind: NodeKind::Block,
+                start_block: manifest.block,
+                end_block: manifest.block + 1,
+                input: parse_digest(&manifest.input_commitment, "Block input"),
+                output: parse_digest(&manifest.output_commitment, "Block output"),
+                first_upstream: manifest
+                    .upstream_transcript
+                    .as_deref()
+                    .map(|digest| parse_digest(digest, "Block upstream")),
+                last_block_transcript: transcript,
+                transcript,
+                verifying_key: [SP1Field::zero(); DIGEST_SIZE],
+            };
+            (descriptor, shape, proof, vk, None)
+        }
+        "zkgpt_block_recursion" => {
+            let manifest: RecursionManifest = serde_json::from_value(value)
+                .unwrap_or_else(|error| panic!("invalid recursion manifest: {error}"));
+            assert_eq!(
+                manifest.version, RECURSION_PROTOCOL_VERSION,
+                "unsupported recursion protocol"
+            );
+            assert_eq!(manifest.shards, 1, "a recursion proof must contain one shard");
+            let shape = Shape {
+                sequence_length: manifest.sequence_length,
+                hidden_size: manifest.hidden_size,
+                num_heads: manifest.num_heads,
+                linear_size: manifest.linear_size,
+            };
+            let left = descriptor_from_manifest(&manifest.left);
+            let right = descriptor_from_manifest(&manifest.right);
+            validate_adjacent(&left, &right);
+            assert_eq!(manifest.start_block, left.start_block);
+            assert_eq!(manifest.end_block, right.end_block);
+            let transcript = aggregate_transcript(shape, &left, &right);
+            assert_eq!(
+                transcript,
+                parse_digest(&manifest.transcript_commitment, "recursion transcript"),
+                "recursion manifest transcript is inconsistent"
+            );
+            let descriptor = NodeDescriptor {
+                kind: NodeKind::Recursion,
+                start_block: manifest.start_block,
+                end_block: manifest.end_block,
+                input: parse_digest(&manifest.input_commitment, "recursion input"),
+                output: parse_digest(&manifest.output_commitment, "recursion output"),
+                first_upstream: manifest
+                    .first_upstream_transcript
+                    .as_deref()
+                    .map(|digest| parse_digest(digest, "recursion first upstream")),
+                last_block_transcript: parse_digest(
+                    &manifest.last_block_transcript,
+                    "recursion last Block transcript",
+                ),
+                transcript,
+                verifying_key: [SP1Field::zero(); DIGEST_SIZE],
+            };
+            assert_eq!(descriptor.input, left.input);
+            assert_eq!(descriptor.output, right.output);
+            assert_eq!(descriptor.first_upstream, left.first_upstream);
+            assert_eq!(descriptor.last_block_transcript, right.last_block_transcript);
+            let (proof, vk) = read_proof_artifacts(
+                manifest_path,
+                &manifest.proof_file,
+                &manifest.verifying_key_file,
+            );
+            (
+                descriptor,
+                shape,
+                proof,
+                vk,
+                Some(parse_digest(&manifest.verifying_key_commitment, "recursion verifying key")),
+            )
+        }
+        other => panic!("unsupported child stage {other:?} in {}", manifest_path.display()),
+    };
+
+    assert_eq!(proof.shard_proofs.len(), 1, "child proof must contain exactly one shard");
+    host_verify(descriptor_without_vk.kind, &vk, &proof);
+    let verifying_key = vk.hash_koalabear();
+    if let Some(expected) = expected_vk {
+        assert_eq!(verifying_key, expected, "recursion verifying key differs from its manifest");
+    }
+    let public_values: &RecursionPublicValues<SP1Field> =
+        proof.shard_proofs[0].public_values.as_slice().borrow();
+    assert_eq!(
+        public_values.digest, descriptor_without_vk.transcript,
+        "child proof public digest differs from its manifest"
+    );
+    let mut descriptor = descriptor_without_vk;
+    descriptor.verifying_key = verifying_key;
+    println!(
+        "verified child: kind={:?} range={}..{} transcript={} vk={}",
+        descriptor.kind,
+        descriptor.start_block,
+        descriptor.end_block,
+        digest_hex(&descriptor.transcript),
+        digest_hex(&descriptor.verifying_key)
+    );
+    ChildArtifact {
+        descriptor,
+        shape,
+        manifest_path: manifest_path.to_owned(),
+        verifying_key: vk,
+        proof: proof.shard_proofs.into_iter().next().unwrap(),
+    }
+}
+
+fn recursive_verifier(kind: NodeKind) -> RecursiveVerifier {
+    let basefold =
+        BasefoldVerifier::<SP1GlobalContext>::new(proof_fri_config(), NUM_SP1_COMMITMENTS);
+    let recursive_basefold = RecursiveBasefoldVerifier::<AsmConfig, SP1GlobalContext> {
+        fri_config: basefold.fri_config,
+        tcs: RecursiveMerkleTreeTcs(PhantomData),
+    };
+    let stacked = RecursiveStackedPcsVerifier::new(recursive_basefold, PROOF_LOG_STACKING_HEIGHT);
+    let pcs_verifier = RecursiveJaggedPcsVerifier {
+        stacked_pcs_verifier: stacked,
+        max_log_row_count: PROOF_MAX_LOG_ROW_COUNT,
+        jagged_evaluator: RecursiveJaggedEvalSumcheckConfig(PhantomData),
+    };
+    let machine = match kind {
+        NodeKind::Block => Air::verillm_machine(),
+        NodeKind::Recursion => Air::compress_machine(),
+    };
+    RecursiveShardVerifier { machine, pcs_verifier, _phantom: PhantomData }
+}
+
+fn verify_child_in_circuit(
+    builder: &mut Builder<AsmConfig>,
+    artifact: &ChildArtifact,
+    vk: &VerifyingKeyVariable,
+    proof: &ProofVariable,
+) -> ([Felt<SP1Field>; DIGEST_SIZE], [Felt<SP1Field>; DIGEST_SIZE]) {
+    let mut challenger = SP1GlobalContext::challenger_variable(builder);
+    challenger.observe(builder, vk.preprocessed_commit);
+    challenger.observe_slice(builder, vk.pc_start);
+    challenger.observe_slice(builder, vk.initial_global_cumulative_sum.0.x.0);
+    challenger.observe_slice(builder, vk.initial_global_cumulative_sum.0.y.0);
+    challenger.observe(builder, vk.untrusted_config.enable_untrusted_programs);
+    let zero: Felt<SP1Field> = builder.constant(SP1Field::zero());
+    for _ in 0..6 {
+        challenger.observe(builder, zero);
+    }
+    recursive_verifier(artifact.descriptor.kind).verify_shard(builder, vk, proof, &mut challenger);
+
+    let vk_digest = vk.hash(builder);
+    for (&actual, expected) in vk_digest.iter().zip(artifact.descriptor.verifying_key) {
+        builder.assert_felt_eq(actual, expected);
+    }
+    let public_values: &RecursionPublicValues<Felt<SP1Field>> =
+        proof.public_values.as_slice().borrow();
+    for (&actual, expected) in public_values.digest.iter().zip(artifact.descriptor.transcript) {
+        builder.assert_felt_eq(actual, expected);
+    }
+    (public_values.digest, vk_digest)
+}
+
+fn circuit_descriptor_fields(
+    builder: &mut Builder<AsmConfig>,
+    descriptor: &NodeDescriptor,
+    transcript: [Felt<SP1Field>; DIGEST_SIZE],
+    verifying_key: [Felt<SP1Field>; DIGEST_SIZE],
+) -> Vec<Felt<SP1Field>> {
+    let mut fields = [
+        descriptor.kind.tag(),
+        descriptor.start_block as u32,
+        descriptor.end_block as u32,
+        u32::from(descriptor.first_upstream.is_some()),
+    ]
+    .map(|value| builder.constant(SP1Field::from_canonical_u32(value)))
+    .to_vec();
+    for digest in [
+        descriptor.input,
+        descriptor.output,
+        descriptor.first_upstream.unwrap_or([SP1Field::zero(); DIGEST_SIZE]),
+        descriptor.last_block_transcript,
+    ] {
+        fields.extend(digest.map(|value| -> Felt<SP1Field> { builder.constant(value) }));
+    }
+    fields.extend(transcript);
+    fields.extend(verifying_key);
+    fields
+}
+
+fn build_program(
+    left: &ChildArtifact,
+    right: &ChildArtifact,
+) -> (Arc<RecursionProgram<SP1Field>>, Vec<Block<SP1Field>>, Digest) {
+    assert_eq!(left.shape, right.shape, "children use different GPT-2 shapes");
+    validate_adjacent(&left.descriptor, &right.descriptor);
+    let expected = aggregate_transcript(left.shape, &left.descriptor, &right.descriptor);
+
+    let mut builder: Builder<AsmConfig> = AsmBuilder::default();
+    let left_vk = left.verifying_key.read(&mut builder);
+    let left_proof = left.proof.read(&mut builder);
+    let right_vk = right.verifying_key.read(&mut builder);
+    let right_proof = right.proof.read(&mut builder);
+
+    let (left_transcript, left_vk_digest) =
+        verify_child_in_circuit(&mut builder, left, &left_vk, &left_proof);
+    let (right_transcript, right_vk_digest) =
+        verify_child_in_circuit(&mut builder, right, &right_vk, &right_proof);
+
+    for (left_output, right_input) in left.descriptor.output.into_iter().zip(right.descriptor.input)
+    {
+        let left_output: Felt<SP1Field> = builder.constant(left_output);
+        builder.assert_felt_eq(left_output, right_input);
+    }
+    for (left_transcript, right_upstream) in left
+        .descriptor
+        .last_block_transcript
+        .into_iter()
+        .zip(right.descriptor.first_upstream.expect("right child must have an upstream"))
+    {
+        let left_transcript: Felt<SP1Field> = builder.constant(left_transcript);
+        builder.assert_felt_eq(left_transcript, right_upstream);
+    }
+
+    let mut fields = [
+        RECURSION_PROTOCOL_VERSION,
+        RECURSION_STAGE,
+        left.shape.sequence_length as u32,
+        left.shape.hidden_size as u32,
+        left.shape.num_heads as u32,
+        left.shape.linear_size as u32,
+        left.descriptor.start_block as u32,
+        right.descriptor.end_block as u32,
+    ]
+    .map(|value| builder.constant(SP1Field::from_canonical_u32(value)))
+    .to_vec();
+    fields.extend(circuit_descriptor_fields(
+        &mut builder,
+        &left.descriptor,
+        left_transcript,
+        left_vk_digest,
+    ));
+    fields.extend(circuit_descriptor_fields(
+        &mut builder,
+        &right.descriptor,
+        right_transcript,
+        right_vk_digest,
+    ));
+    let transcript = circuit_commit_fields(&mut builder, DOMAIN_RECURSION_TRANSCRIPT, &fields);
+    for (&actual, expected) in transcript.iter().zip(expected) {
+        builder.assert_felt_eq(actual, expected);
+    }
+
+    let zero = builder.constant(SP1Field::zero());
+    let mut public_value_elements = [zero; RECURSIVE_PROOF_NUM_PV_ELTS];
+    let public_values: &mut RecursionPublicValues<Felt<SP1Field>> =
+        public_value_elements.as_mut_slice().borrow_mut();
+    public_values.digest = transcript;
+    builder.commit_public_values_v2(*public_values);
+
+    let root = builder.into_root_block();
+    println!("built recursive join: ir_ops={}", root.ops.len());
+    let mut compiler = AsmCompiler::default();
+    let program = Arc::new(compiler.compile_inner(root).validate().unwrap());
+
+    let mut witness = Vec::new();
+    Witnessable::<AsmConfig>::write(&left.verifying_key, &mut witness);
+    Witnessable::<AsmConfig>::write(&left.proof, &mut witness);
+    Witnessable::<AsmConfig>::write(&right.verifying_key, &mut witness);
+    Witnessable::<AsmConfig>::write(&right.proof, &mut witness);
+    (program, witness, expected)
+}
+
+fn recursion_stem(start_block: usize, end_block: usize) -> String {
+    format!("zkgpt_recursion_b{start_block:02}_b{end_block:02}")
+}
+
+fn write_manifest(
+    arguments: &Arguments,
+    left: &ChildArtifact,
+    right: &ChildArtifact,
+    transcript: Digest,
+    proof_path: &Path,
+    vk_path: &Path,
+    vk: &StoredVerifyingKey,
+) {
+    let start_block = left.descriptor.start_block;
+    let end_block = right.descriptor.end_block;
+    let manifest_path = arguments
+        .output_dir
+        .join(format!("{}.manifest.json", recursion_stem(start_block, end_block)));
+    let manifest = serde_json::json!({
+        "version": RECURSION_PROTOCOL_VERSION,
+        "stage": "zkgpt_block_recursion",
+        "sequence_length": left.shape.sequence_length,
+        "hidden_size": left.shape.hidden_size,
+        "num_heads": left.shape.num_heads,
+        "linear_size": left.shape.linear_size,
+        "shards": 1,
+        "start_block": start_block,
+        "end_block": end_block,
+        "input_commitment": digest_hex(&left.descriptor.input),
+        "output_commitment": digest_hex(&right.descriptor.output),
+        "first_upstream_transcript": left.descriptor.first_upstream.map(|digest| digest_hex(&digest)),
+        "last_block_transcript": digest_hex(&right.descriptor.last_block_transcript),
+        "transcript_commitment": digest_hex(&transcript),
+        "verifying_key_commitment": digest_hex(&vk.hash_koalabear()),
+        "left_manifest": left.manifest_path.display().to_string(),
+        "right_manifest": right.manifest_path.display().to_string(),
+        "left": manifest_descriptor(left.descriptor),
+        "right": manifest_descriptor(right.descriptor),
+        "proof_file": proof_path.file_name().unwrap().to_string_lossy(),
+        "proof_bytes": fs::metadata(proof_path).unwrap().len(),
+        "verifying_key_file": vk_path.file_name().unwrap().to_string_lossy(),
+        "verifying_key_bytes": fs::metadata(vk_path).unwrap().len(),
+    });
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap())
+        .unwrap_or_else(|error| panic!("failed to write {}: {error}", manifest_path.display()));
+    println!("recursion manifest: {}", manifest_path.display());
+}
+
+async fn run(arguments: Arguments) {
+    let started = Instant::now();
+    if let Some(manifest) = &arguments.verify_manifest {
+        let artifact = load_child(manifest);
+        assert_eq!(
+            artifact.descriptor.kind,
+            NodeKind::Recursion,
+            "--verify-manifest requires a recursion proof"
+        );
+        println!(
+            "verified final recursion proof: range={}..{} transcript={} vk={}",
+            artifact.descriptor.start_block,
+            artifact.descriptor.end_block,
+            digest_hex(&artifact.descriptor.transcript),
+            digest_hex(&artifact.descriptor.verifying_key)
+        );
+        return;
+    }
+    let left = load_child(
+        arguments
+            .left_manifest
+            .as_deref()
+            .expect("left manifest was validated during argument parsing"),
+    );
+    let right = load_child(
+        arguments
+            .right_manifest
+            .as_deref()
+            .expect("right manifest was validated during argument parsing"),
+    );
+    assert_eq!(left.shape, right.shape, "children use different GPT-2 shapes");
+    validate_adjacent(&left.descriptor, &right.descriptor);
+    println!(
+        "recursive join: left={}..{} right={}..{} output={}..{}",
+        left.descriptor.start_block,
+        left.descriptor.end_block,
+        right.descriptor.start_block,
+        right.descriptor.end_block,
+        left.descriptor.start_block,
+        right.descriptor.end_block
+    );
+    if arguments.mode == Mode::Check {
+        println!("children and commitment chain verified");
+        return;
+    }
+
+    let build_started = Instant::now();
+    let (program, witness, expected_transcript) = build_program(&left, &right);
+    println!("compiled recursive join: elapsed={:.3}s", build_started.elapsed().as_secs_f64());
+    if arguments.mode == Mode::Build {
+        return;
+    }
+
+    let execute_started = Instant::now();
+    let mut executor = Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(
+        program.clone(),
+        inner_perm(),
+    );
+    executor.witness_stream = witness.into();
+    executor.run().expect("valid recursive join witness must execute");
+    assert_eq!(
+        executor.record.public_values.digest, expected_transcript,
+        "recursive circuit transcript differs from host transcript"
+    );
+    println!(
+        "executed recursive join: elapsed={:.3}s transcript={}",
+        execute_started.elapsed().as_secs_f64(),
+        digest_hex(&expected_transcript)
+    );
+    if arguments.mode == Mode::Execute {
+        return;
+    }
+
+    let record = std::mem::take(&mut executor.record);
+    drop(executor);
+    let machine = Air::compress_machine();
+    let max_rows = 1usize << PROOF_MAX_LOG_ROW_COUNT;
+    for chip in machine.chips() {
+        if chip.included(&record) {
+            let rows = chip.num_rows(&record).unwrap_or_default();
+            println!("trace: {:<24} rows={rows}", chip.name());
+            assert!(rows <= max_rows, "{} exceeds the proof row limit", chip.name());
+        }
+    }
+    let verifier = ShardVerifier::from_basefold_parameters(
+        proof_fri_config(),
+        PROOF_LOG_STACKING_HEIGHT,
+        PROOF_MAX_LOG_ROW_COUNT,
+        machine,
+    );
+    let prover = simple_prover(verifier);
+    let shape = prover.shape_from_record(&record).expect("recursion proof has no shape");
+    println!("recursion proof shape: {shape:?}");
+
+    let setup_started = Instant::now();
+    let (pk, vk) = prover.setup(program).await;
+    println!("recursion setup: elapsed={:.3}s", setup_started.elapsed().as_secs_f64());
+    let pk = unsafe { pk.into_inner() };
+    let prove_started = Instant::now();
+    let shard_proof = prover.prove_shard(pk, record).await;
+    let proof = MachineProof::from(vec![shard_proof]);
+    println!("recursion proof generated: elapsed={:.3}s", prove_started.elapsed().as_secs_f64());
+    prover.verify(&vk, &proof).expect("generated recursion proof must verify");
+
+    fs::create_dir_all(&arguments.output_dir).unwrap_or_else(|error| {
+        panic!("failed to create {}: {error}", arguments.output_dir.display())
+    });
+    let stem = recursion_stem(left.descriptor.start_block, right.descriptor.end_block);
+    let proof_path = arguments.output_dir.join(format!("{stem}.proof.bin"));
+    let vk_path = arguments.output_dir.join(format!("{stem}.vk.bin"));
+    bincode::serialize_into(File::create(&proof_path).unwrap(), &proof).unwrap();
+    bincode::serialize_into(File::create(&vk_path).unwrap(), &vk).unwrap();
+    write_manifest(&arguments, &left, &right, expected_transcript, &proof_path, &vk_path, &vk);
+    println!(
+        "recursive join completed: elapsed={:.3}s proof={} bytes",
+        started.elapsed().as_secs_f64(),
+        fs::metadata(proof_path).unwrap().len()
+    );
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    run(parse_arguments()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn digest(seed: u32) -> Digest {
+        std::array::from_fn(|index| SP1Field::from_canonical_u32(seed + index as u32))
+    }
+
+    fn node(kind: NodeKind, start: usize, end: usize, seed: u32) -> NodeDescriptor {
+        NodeDescriptor {
+            kind,
+            start_block: start,
+            end_block: end,
+            input: digest(seed),
+            output: digest(seed + 10),
+            first_upstream: (start != 0).then(|| digest(seed - 10)),
+            last_block_transcript: digest(seed + 20),
+            transcript: digest(seed + 30),
+            verifying_key: digest(seed + 40),
+        }
+    }
+
+    #[test]
+    fn aggregate_transcript_binds_child_kind_and_range() {
+        let shape = Shape::default();
+        let left = node(NodeKind::Block, 0, 1, 100);
+        let mut right = node(NodeKind::Block, 1, 2, 200);
+        right.input = left.output;
+        right.first_upstream = Some(left.last_block_transcript);
+        let expected = aggregate_transcript(shape, &left, &right);
+        right.kind = NodeKind::Recursion;
+        assert_ne!(expected, aggregate_transcript(shape, &left, &right));
+    }
+
+    #[test]
+    #[should_panic(expected = "right Block chain")]
+    fn adjacent_ranges_reject_a_broken_transcript_chain() {
+        let left = node(NodeKind::Block, 0, 1, 100);
+        let mut right = node(NodeKind::Block, 1, 2, 200);
+        right.input = left.output;
+        validate_adjacent(&left, &right);
+    }
+}

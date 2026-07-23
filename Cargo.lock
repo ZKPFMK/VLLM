@@ -8107,6 +8107,7 @@ dependencies = [
  "rand 0.8.6",
  "rayon",
  "serde",
+ "serde_json",
  "slop-air",
  "slop-algebra 6.3.1",
  "slop-alloc",
