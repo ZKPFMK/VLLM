@@ -45,6 +45,43 @@ impl<F> RecursionProgram<F> {
     pub fn into_inner(self) -> RootProgram<F> {
         self.0
     }
+
+    /// Return the global event slices represented by this program.
+    #[must_use]
+    pub fn event_ranges(&self) -> RecursionEventRanges {
+        self.event_ranges.unwrap_or_else(|| RecursionEventRanges::full(self.event_counts))
+    }
+}
+
+impl<F: Clone> RecursionProgram<F> {
+    /// Clone this global program as one event-trace shard.
+    ///
+    /// The instruction graph and global address space stay unchanged. Chips use `ranges` to
+    /// select matching preprocessed access rows, while the shard record contains the same slices
+    /// of the main event vectors.
+    #[must_use]
+    pub fn with_event_ranges(&self, ranges: RecursionEventRanges) -> Self {
+        let full = self.event_ranges();
+        let contained = |range: EventRange, outer: EventRange| {
+            outer.start <= range.start && range.end <= outer.end
+        };
+        assert!(contained(ranges.mem_const, full.mem_const));
+        assert!(contained(ranges.mem_var, full.mem_var));
+        assert!(contained(ranges.base_alu, full.base_alu));
+        assert!(contained(ranges.poseidon2_wide, full.poseidon2_wide));
+        assert!(contained(ranges.bf16_mul, full.bf16_mul));
+        assert!(contained(ranges.bf16_unary, full.bf16_unary));
+        assert!(contained(ranges.bf16_div, full.bf16_div));
+        assert!(contained(ranges.bf16_add_sub, full.bf16_add_sub));
+        assert!(contained(ranges.commit_pv_hash, full.commit_pv_hash));
+
+        let mut root = self.0.clone();
+        root.event_counts = ranges.event_counts();
+        root.event_ranges = Some(ranges);
+        // SAFETY: only event summary metadata changed; the instruction graph remains the already
+        // validated global program.
+        unsafe { Self::new_unchecked(root) }
+    }
 }
 
 impl<F> Default for RecursionProgram<F> {
@@ -197,8 +234,14 @@ mod validation {
         let (analyzed, counts) =
             RawProgram { seq_blocks: vec![SeqBlock::Basic(BasicBlock { instrs })] }.analyze();
 
-        RootProgram { inner: analyzed, total_memory: 0, shape: None, event_counts: counts }
-            .validate()
+        RootProgram {
+            inner: analyzed,
+            total_memory: 0,
+            shape: None,
+            event_counts: counts,
+            event_ranges: None,
+        }
+        .validate()
     }
 }
 
@@ -208,6 +251,8 @@ pub struct RootProgram<F> {
     pub total_memory: usize,
     pub shape: Option<RecursionShape<F>>,
     pub event_counts: RecursionAirEventCount,
+    /// Optional slices of the global event vectors used by one trace shard.
+    pub event_ranges: Option<RecursionEventRanges>,
 }
 
 // `Default` without bounds on the type parameter.
@@ -218,6 +263,7 @@ impl<F> Default for RootProgram<F> {
             total_memory: Default::default(),
             shape: None,
             event_counts: Default::default(),
+            event_ranges: None,
         }
     }
 }

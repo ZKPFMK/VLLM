@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Generate 12 one-Block GPT-2 proofs and reduce them to one recursion proof.
+"""Generate 12 trace-sharded GPT-2 Block proofs and reduce them to one proof.
 
-The Block proofs are sequential because Block N consumes the host-carried
-private output of Block N-1. Once all 12 leaves exist, recursion proofs are generated
-as a binary tree.  With 12 leaves the tree contains 11 joins:
+Each Block is first executed once, split by event/trace area, and compressed into
+one recursion proof. Blocks remain sequential because Block N consumes the
+host-carried private output of Block N-1. Once all 12 Block proofs exist, they are
+reduced as a binary tree. With 12 leaves the tree contains 11 joins:
 
     12 -> 6 -> 3 -> 2 -> 1
 
@@ -30,7 +31,9 @@ SEQUENCE_LENGTH = 30
 HIDDEN_SIZE = 768
 NUM_HEADS = 12
 LINEAR_SIZE = 2304
-BLOCK_STAGE = "zkgpt_block"
+BLOCK_STAGE = "zkgpt_block_shard_recursion"
+BLOCK_PROTOCOL_VERSION = 1
+EVENT_SHARD_STAGE = "zkgpt_event_shards"
 RECURSION_STAGE = "zkgpt_block_recursion"
 RUN_MANIFEST = "zkgpt_block_recursion.run.json"
 
@@ -90,7 +93,14 @@ def block_dir(output_root: Path, block: int) -> Path:
 
 
 def block_manifest(output_root: Path, block: int) -> Path:
-    return block_dir(output_root, block) / f"zkgpt_block_l{block:02d}.manifest.json"
+    return (
+        block_dir(output_root, block)
+        / f"zkgpt_block_{block:02d}_shard_recursion.manifest.json"
+    )
+
+
+def event_shard_manifest(output_root: Path, block: int) -> Path:
+    return block_dir(output_root, block) / "zkgpt_event_shards.manifest.json"
 
 
 def recursion_dir(output_root: Path, level: int, start: int, end: int) -> Path:
@@ -135,6 +145,49 @@ def require_shape(data: dict[str, Any], path: Path) -> None:
             )
 
 
+def validate_event_shard_manifest(path: Path, expected_block: int) -> dict[str, Any]:
+    data = read_json(path)
+    if data.get("stage") != EVENT_SHARD_STAGE or data.get("block") != expected_block:
+        raise ValidationError(
+            f"{path}: not the expected Block {expected_block} event-shard manifest"
+        )
+    for key, value in {
+        "sequence_length": SEQUENCE_LENGTH,
+        "hidden_size": HIDDEN_SIZE,
+        "num_heads": NUM_HEADS,
+        "linear_size": LINEAR_SIZE,
+    }.items():
+        if data.get(key) != value:
+            raise ValidationError(
+                f"{path}: expected {key}={value}, found {data.get(key)!r}"
+            )
+    if data.get("lookup_protocol") != "shared_challenge_batch":
+        raise ValidationError(f"{path}: unsupported lookup protocol")
+    if data.get("lookup_batch_closed") is not True:
+        raise ValidationError(f"{path}: lookup batch is not closed")
+    if (
+        data.get("transcript_binding")
+        != "ordered_verifying_keys_main_trace_commitments_real_heights"
+    ):
+        raise ValidationError(f"{path}: unsupported trace transcript binding")
+    require_digest(data, "block_transcript_commitment", path)
+    require_file(path.parent, data.get("private_output_file"), "private output", path)
+    artifacts = data.get("artifacts")
+    if not isinstance(artifacts, list) or data.get("shards") != len(artifacts) or not artifacts:
+        raise ValidationError(f"{path}: invalid event-shard artifact count")
+    for index, artifact in enumerate(artifacts):
+        if not isinstance(artifact, dict) or artifact.get("index") != index:
+            raise ValidationError(f"{path}: event shard {index} is missing or unordered")
+        require_file(path.parent, artifact.get("proof_file"), f"shard {index} proof", path)
+        require_file(
+            path.parent,
+            artifact.get("verifying_key_file"),
+            f"shard {index} verifying key",
+            path,
+        )
+    return data
+
+
 def require_digest(data: dict[str, Any], key: str, path: Path) -> str:
     value = data.get(key)
     if not isinstance(value, str):
@@ -157,25 +210,22 @@ def load_block_node(path: Path, expected_block: int) -> Node:
     require_file(directory, data.get("proof_file"), "proof", path)
     require_file(directory, data.get("verifying_key_file"), "verifying key", path)
     require_file(directory, data.get("private_output_file"), "private output", path)
-    if data.get("version") != 2:
-        raise ValidationError(f"{path}: expected Block protocol version 2")
-    if data.get("explicit_value_commitments") is not False:
-        raise ValidationError(f"{path}: explicit value commitments must be disabled")
-    expected_storage = {
-        "public_input_storage": "memory_const",
-        "private_parameters_storage": "hint",
-        "private_auxiliary_hints_storage": "hint",
-        "private_values_binding": "execution_trace_commitment",
-    }
-    for key, expected in expected_storage.items():
-        if data.get(key) != expected:
-            raise ValidationError(f"{path}: expected {key}={expected!r}")
+    if data.get("version") != BLOCK_PROTOCOL_VERSION:
+        raise ValidationError(
+            f"{path}: expected Block shard-recursion protocol version "
+            f"{BLOCK_PROTOCOL_VERSION}"
+        )
+    source_event_shards = data.get("source_event_shards")
+    if not isinstance(source_event_shards, int) or source_event_shards <= 0:
+        raise ValidationError(f"{path}: invalid source_event_shards")
+    require_digest(data, "trace_transcript_commitment", path)
+    require_digest(data, "verifying_key_commitment", path)
     return Node(
         manifest=path,
-        kind="block",
+        kind="recursion",
         start_block=expected_block,
         end_block=expected_block + 1,
-        transcript_commitment=None,
+        transcript_commitment=require_digest(data, "transcript_commitment", path),
     )
 
 
@@ -226,7 +276,7 @@ def block_command(
 ) -> list[str]:
     command = [
         str(bin_dir / "zkgpt_like"),
-        "--prove",
+        "--prove-shards",
         "--allow-large-build",
         "--block",
         str(block),
@@ -240,6 +290,19 @@ def block_command(
             ["--previous-block-dir", str(block_dir(output_root, block - 1))]
         )
     return command
+
+
+def block_recursion_command(
+    output_root: Path, bin_dir: Path, block: int
+) -> list[str]:
+    return [
+        str(bin_dir / "zkgpt_block_recursion"),
+        "--prove",
+        "--event-shard-manifest",
+        str(event_shard_manifest(output_root, block)),
+        "--output-dir",
+        str(block_dir(output_root, block)),
+    ]
 
 
 def join_command(join: Join, bin_dir: Path) -> list[str]:
@@ -419,7 +482,11 @@ def write_run_manifest(
         "blocks": NUM_BLOCKS,
         "block_proofs": NUM_BLOCKS,
         "recursion_proofs": NUM_BLOCKS - 1,
-        "total_proofs": 2 * NUM_BLOCKS - 1,
+        "event_leaf_proofs": sum(
+            read_json(block_manifest(output_root, block))["source_event_shards"]
+            for block in range(NUM_BLOCKS)
+        ),
+        "total_persisted_block_and_join_proofs": 2 * NUM_BLOCKS - 1,
         "data_dir": str(data_dir),
         "final_manifest": str(final.manifest),
         "final_transcript_commitment": require_digest(
@@ -555,9 +622,10 @@ def run(args: argparse.Namespace) -> int:
             events.append({"kind": "block", "block": block, "status": "skipped"})
         elif args.dry_run:
             print(shlex.join(block_command(output_root, data_dir, bin_dir, block)))
+            print(shlex.join(block_recursion_command(output_root, bin_dir, block)))
             node = Node(
                 manifest=path,
-                kind="block",
+                kind="recursion",
                 start_block=block,
                 end_block=block + 1,
                 transcript_commitment=None,
@@ -565,10 +633,30 @@ def run(args: argparse.Namespace) -> int:
         else:
             output = block_dir(output_root, block)
             output.mkdir(parents=True, exist_ok=True)
+            shard_path = event_shard_manifest(output_root, block)
+            if args.resume and shard_path.is_file():
+                validate_event_shard_manifest(shard_path, block)
+                print(f"[runner] skip valid event leaves for Block {block}")
+            else:
+                leaf_elapsed = run_command(
+                    block_command(output_root, data_dir, bin_dir, block),
+                    root,
+                    output_root / "logs" / f"block-{block:02d}-event-leaves.log",
+                    args.threads,
+                )
+                events.append(
+                    {
+                        "kind": "event_leaves",
+                        "block": block,
+                        "status": "produced",
+                        "wall_seconds": round(leaf_elapsed, 6),
+                    }
+                )
+                validate_event_shard_manifest(shard_path, block)
             elapsed = run_command(
-                block_command(output_root, data_dir, bin_dir, block),
+                block_recursion_command(output_root, bin_dir, block),
                 root,
-                output_root / "logs" / f"block-{block:02d}.log",
+                output_root / "logs" / f"block-{block:02d}-recursion.log",
                 args.threads,
             )
             node = load_block_node(path, block)
@@ -598,7 +686,7 @@ def run(args: argparse.Namespace) -> int:
         )
         print(
             "[runner] recursion plan: 12 -> 6 -> 3 -> 2 -> 1 "
-            "(11 recursion proofs, 23 proofs total)"
+            "(per-Block event leaves -> 1 Block proof, then 11 joins)"
         )
         return 0
 
@@ -615,6 +703,16 @@ def run(args: argparse.Namespace) -> int:
     )
     if final.start_block != 0 or final.end_block != NUM_BLOCKS:
         raise ValidationError("final recursion proof does not cover all 12 Blocks")
+    subprocess.run(
+        [
+            str(bin_dir / "zkgpt_block_recursion"),
+            "--check",
+            "--verify-manifest",
+            str(final.manifest),
+        ],
+        cwd=root,
+        check=True,
+    )
     write_run_manifest(output_root, data_dir, final, events, started)
     return 0
 

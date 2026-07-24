@@ -8,8 +8,8 @@ use std::{collections::BTreeMap, collections::BTreeSet, sync::Arc};
 use crate::{
     air::MachineAir,
     prover::{shard::AirProver, CoreProofShape, PcsProof, ProvingKey},
-    MachineVerifier, MachineVerifierConfigError, MachineVerifyingKey, ShardContext, ShardProof,
-    ShardVerifier,
+    LogUpGkrChallenges, MachineVerifier, MachineVerifierConfigError, MachineVerifyingKey,
+    ShardContext, ShardProof, ShardVerifier,
 };
 
 use super::{PreprocessedData, ProverSemaphore};
@@ -104,6 +104,23 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: AirProver<GC, SC>> SimpleProver<GC, SC
         self.verifier.verify(vk, proof)
     }
 
+    /// Verify one member of a committed lookup batch and return its local residual.
+    pub fn verify_shard_with_logup_challenges(
+        &self,
+        vk: &MachineVerifyingKey<GC>,
+        proof: &ShardProof<GC, PcsProof<GC, SC>>,
+        challenges: &LogUpGkrChallenges<GC::EF>,
+    ) -> Result<GC::EF, MachineVerifierConfigError<GC, SC::Config>>
+    where
+        GC::F: PrimeField32,
+    {
+        let mut challenger = self.challenger();
+        vk.observe_into(&mut challenger);
+        self.verifier
+            .verify_shard_with_logup_challenges(vk, proof, challenges, &mut challenger)
+            .map_err(crate::MachineVerifierError::InvalidShardProof)
+    }
+
     /// Get the verifier.
     #[must_use]
     #[inline]
@@ -167,6 +184,32 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: AirProver<GC, SC>> SimpleProver<GC, SC
     ) -> ShardProof<GC, PcsProof<GC, SC>> {
         let (proof, _) = self.prover.prove_shard_with_pk(pk, record, single_permit()).await;
 
+        proof
+    }
+
+    /// Commit a shard's main traces for the first phase of a batched lookup proof.
+    #[must_use]
+    pub async fn commit_shard_main_traces(
+        &self,
+        record: Record<GC, SC>,
+    ) -> (GC::Digest, Vec<(String, usize)>) {
+        let (commitment, real_heights, _) =
+            self.prover.commit_shard_main_traces(record, single_permit()).await;
+        (commitment, real_heights)
+    }
+
+    /// Prove a shard with lookup challenges shared by a committed batch.
+    #[must_use]
+    pub async fn prove_shard_with_logup_challenges(
+        &self,
+        pk: Arc<ProvingKey<GC, SC, C>>,
+        record: Record<GC, SC>,
+        challenges: LogUpGkrChallenges<GC::EF>,
+    ) -> ShardProof<GC, PcsProof<GC, SC>> {
+        let (proof, _) = self
+            .prover
+            .prove_shard_with_pk_and_logup_challenges(pk, record, challenges, single_permit())
+            .await;
         proof
     }
 

@@ -124,18 +124,32 @@ impl<F: PrimeField32> MachineAir<F> for Bf16MulChip {
             *cols = Bf16MulAccessCols { is_real: F::one(), addrs: *addrs, mult: *mult };
         };
 
+        let active = program.event_ranges().bf16_mul;
         for analyzed in program.inner.iter() {
             match analyzed.inner() {
                 Instruction::Bf16Mul(instruction) => {
-                    let start = analyzed.offset() * BF16_MUL_ACCESS_COLS;
+                    let offset = analyzed.offset();
+                    if offset < active.start || offset >= active.end {
+                        continue;
+                    }
+                    let start = (offset - active.start) * BF16_MUL_ACCESS_COLS;
                     populate(&mut values[start..start + BF16_MUL_ACCESS_COLS], instruction);
                 }
                 Instruction::Bf16LinearBatch(batch) => {
-                    let start = analyzed.offset() * BF16_MUL_ACCESS_COLS;
-                    let end = start + batch.mul_count() * BF16_MUL_ACCESS_COLS;
+                    let batch_start = analyzed.offset();
+                    let batch_end = batch_start + batch.mul_count();
+                    let intersection_start = batch_start.max(active.start);
+                    let intersection_end = batch_end.min(active.end);
+                    if intersection_start >= intersection_end {
+                        continue;
+                    }
+                    let first_batch_index = intersection_start - batch_start;
+                    let start = (intersection_start - active.start) * BF16_MUL_ACCESS_COLS;
+                    let end =
+                        start + (intersection_end - intersection_start) * BF16_MUL_ACCESS_COLS;
                     values[start..end].par_chunks_mut(BF16_MUL_ACCESS_COLS).enumerate().for_each(
                         |(index, row)| {
-                            let instruction = batch.mul_instruction(index);
+                            let instruction = batch.mul_instruction(first_batch_index + index);
                             let Bf16MulInstr { addrs, mult } = instruction;
                             let cols: &mut Bf16MulAccessCols<F> = row.borrow_mut();
                             *cols = Bf16MulAccessCols { is_real: F::one(), addrs, mult };

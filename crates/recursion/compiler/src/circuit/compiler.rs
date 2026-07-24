@@ -1142,7 +1142,13 @@ where
 
         let (analyzed, counts) = program.analyze();
 
-        RootProgram { inner: analyzed, total_memory, shape: None, event_counts: counts }
+        RootProgram {
+            inner: analyzed,
+            total_memory,
+            shape: None,
+            event_counts: counts,
+            event_ranges: None,
+        }
     }
 }
 

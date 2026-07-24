@@ -58,11 +58,7 @@ impl<F: PrimeField32> MachineAir<F> for Bf16UnaryChip {
     }
 
     fn preprocessed_num_rows(&self, program: &Self::Program) -> Option<usize> {
-        let count = program
-            .inner
-            .iter()
-            .filter(|instruction| matches!(instruction.inner(), Instruction::Bf16Unary(_)))
-            .count();
+        let count = program.event_counts.bf16_unary_events;
         self.preprocessed_num_rows_with_instrs_len(program, count)
     }
 
@@ -86,11 +82,16 @@ impl<F: PrimeField32> MachineAir<F> for Bf16UnaryChip {
             "generate_preprocessed_trace only supports SP1Field"
         );
 
+        let active = program.event_ranges().bf16_unary;
         let instructions = program
             .inner
             .iter()
-            .filter_map(|instruction| match instruction.inner() {
-                Instruction::Bf16Unary(instruction) => Some(instruction),
+            .filter_map(|analyzed| match analyzed.inner() {
+                Instruction::Bf16Unary(instruction)
+                    if active.start <= analyzed.offset() && analyzed.offset() < active.end =>
+                {
+                    Some(instruction)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();

@@ -5,7 +5,7 @@ use crate::GKR_GRINDING_BITS;
 use crate::{air::MachineAir, Chip, ShardContext};
 use itertools::Itertools;
 use slop_air::BaseAir;
-use slop_algebra::AbstractField;
+use slop_algebra::{AbstractField, Field};
 use slop_challenger::GrindingChallenger;
 use slop_challenger::{CanObserve, FieldChallenger, IopCtx, VariableLengthChallenger};
 use slop_multilinear::{
@@ -19,7 +19,7 @@ use std::{
 };
 use thiserror::Error;
 
-use super::{ChipEvaluation, LogUpEvaluations, LogUpGkrOutput, LogupGkrProof};
+use super::{ChipEvaluation, LogUpEvaluations, LogUpGkrChallenges, LogUpGkrOutput, LogupGkrProof};
 
 /// An error type for `LogUp` GKR.
 #[derive(Debug, Error)]
@@ -70,6 +70,24 @@ pub enum LogupGkrVerificationError<EF> {
 pub struct LogUpGkrVerifier<GC, SC>(PhantomData<(GC, SC)>);
 
 impl<GC: IopCtx, SC: ShardContext<GC>> LogUpGkrVerifier<GC, SC> {
+    /// Return the beta seed dimension required by these chips and their public values.
+    #[must_use]
+    pub fn beta_seed_dimension(shard_chips: &BTreeSet<Chip<GC::F, SC::Air>>) -> usize {
+        let max_interaction_arity = shard_chips
+            .iter()
+            .flat_map(|c| c.sends().iter().chain(c.receives().iter()))
+            .map(|i| i.values.len() + 1)
+            .max()
+            .unwrap();
+        let max_interaction_kinds_values = Record::<_, SC>::interactions_in_public_values()
+            .iter()
+            .map(|kind| kind.num_values() + 1)
+            .max()
+            .unwrap_or(1);
+        max(max_interaction_arity, max_interaction_kinds_values).next_power_of_two().ilog2()
+            as usize
+    }
+
     /// Verify the public values satisfy the required constraints, and return the cumulative sum.
     pub fn verify_public_values(
         challenge: GC::EF,
@@ -107,23 +125,58 @@ impl<GC: IopCtx, SC: ShardContext<GC>> LogUpGkrVerifier<GC, SC> {
         public_values: &[GC::F],
         challenger: &mut GC::Challenger,
     ) -> Result<(), LogupGkrVerificationError<GC::EF>> {
+        Self::verify_logup_gkr_inner(
+            shard_chips,
+            degrees,
+            max_log_row_count,
+            proof,
+            public_values,
+            None,
+            challenger,
+        )
+        .map(|_| ())
+    }
+
+    /// Verify one member of a batched lookup argument and return its local residual.
+    ///
+    /// The caller must verify every shard with the same `challenges` and assert that the returned
+    /// residuals sum to zero.  The challenges must be derived from all shard commitments.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_logup_gkr_with_challenges(
+        shard_chips: &BTreeSet<Chip<GC::F, SC::Air>>,
+        degrees: &BTreeMap<String, Point<GC::F>>,
+        max_log_row_count: usize,
+        proof: &LogupGkrProof<<GC::Challenger as GrindingChallenger>::Witness, GC::EF>,
+        public_values: &[GC::F],
+        challenges: &LogUpGkrChallenges<GC::EF>,
+        challenger: &mut GC::Challenger,
+    ) -> Result<GC::EF, LogupGkrVerificationError<GC::EF>> {
+        Self::verify_logup_gkr_inner(
+            shard_chips,
+            degrees,
+            max_log_row_count,
+            proof,
+            public_values,
+            Some(challenges),
+            challenger,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
+    fn verify_logup_gkr_inner(
+        shard_chips: &BTreeSet<Chip<GC::F, SC::Air>>,
+        degrees: &BTreeMap<String, Point<GC::F>>,
+        max_log_row_count: usize,
+        proof: &LogupGkrProof<<GC::Challenger as GrindingChallenger>::Witness, GC::EF>,
+        public_values: &[GC::F],
+        shared_challenges: Option<&LogUpGkrChallenges<GC::EF>>,
+        challenger: &mut GC::Challenger,
+    ) -> Result<GC::EF, LogupGkrVerificationError<GC::EF>> {
         let LogupGkrProof { circuit_output, round_proofs, logup_evaluations, witness } = proof;
 
         let LogUpGkrOutput { numerator, denominator } = circuit_output;
-        let max_interaction_arity = shard_chips
-            .iter()
-            .flat_map(|c| c.sends().iter().chain(c.receives().iter()))
-            .map(|i| i.values.len() + 1)
-            .max()
-            .unwrap();
-
-        let max_interaction_kinds_values = Record::<_, SC>::interactions_in_public_values()
-            .iter()
-            .map(|kind| kind.num_values() + 1)
-            .max()
-            .unwrap_or(1);
-        let beta_seed_dim =
-            max(max_interaction_arity, max_interaction_kinds_values).next_power_of_two().ilog2();
+        let beta_seed_dim = Self::beta_seed_dimension(shard_chips);
 
         // Check proof of work (grinding to find a number that hashes to have
         // `GKR_GRINDING_BITS` zeroes at the beginning).
@@ -131,11 +184,25 @@ impl<GC: IopCtx, SC: ShardContext<GC>> LogUpGkrVerifier<GC, SC> {
             return Err(LogupGkrVerificationError::Pow);
         }
 
-        let alpha = challenger.sample_ext_element::<GC::EF>();
-        let beta_seed = (0..beta_seed_dim)
-            .map(|_| challenger.sample_ext_element::<GC::EF>())
-            .collect::<Point<_>>();
-        let pv_challenge = challenger.sample_ext_element::<GC::EF>();
+        let (alpha, beta_seed, pv_challenge) = if let Some(challenges) = shared_challenges {
+            if challenges.beta_seed.dimension() != beta_seed_dim {
+                return Err(LogupGkrVerificationError::InvalidShape);
+            }
+            challenger.observe_ext_element(challenges.alpha);
+            for beta in challenges.beta_seed.iter() {
+                challenger.observe_ext_element(*beta);
+            }
+            challenger.observe_ext_element(challenges.public_values_challenge);
+            (challenges.alpha, challenges.beta_seed.clone(), challenges.public_values_challenge)
+        } else {
+            (
+                challenger.sample_ext_element::<GC::EF>(),
+                (0..beta_seed_dim)
+                    .map(|_| challenger.sample_ext_element::<GC::EF>())
+                    .collect::<Point<_>>(),
+                challenger.sample_ext_element::<GC::EF>(),
+            )
+        };
         let cumulative_sum = -LogUpGkrVerifier::<GC, SC>::verify_public_values(
             pv_challenge,
             &alpha,
@@ -172,7 +239,8 @@ impl<GC: IopCtx, SC: ShardContext<GC>> LogUpGkrVerifier<GC, SC> {
             .zip_eq(denominator.guts().as_slice().iter())
             .map(|(n, d)| *n / *d)
             .sum::<GC::EF>();
-        if output_cumulative_sum != cumulative_sum {
+        let local_residual = output_cumulative_sum - cumulative_sum;
+        if shared_challenges.is_none() && !local_residual.is_zero() {
             return Err(LogupGkrVerificationError::CumulativeSumMismatch(
                 output_cumulative_sum,
                 cumulative_sum,
@@ -350,6 +418,6 @@ impl<GC: IopCtx, SC: ShardContext<GC>> LogUpGkrVerifier<GC, SC> {
                 expected_denominator_eval,
             ));
         }
-        Ok(())
+        Ok(local_residual)
     }
 }

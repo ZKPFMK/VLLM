@@ -123,7 +123,9 @@ impl<F> UnsafeRecord<F> {
             ext_alu_events: create_uninit_vec(event_counts.ext_alu_events),
             mem_const_count: event_counts.mem_const_events,
             mem_var_events: create_uninit_vec(event_counts.mem_var_events),
-            public_values: MaybeUninit::uninit(),
+            // Programs which do not expose explicit public values still produce a valid record.
+            // A CommitPublicValues instruction overwrites this value during execution.
+            public_values: MaybeUninit::new(UnsafeCell::new(RecursionPublicValues::default())),
             ext_felt_conversion_events: create_uninit_vec(event_counts.ext_felt_conversion_events),
             poseidon2_events: create_uninit_vec(event_counts.poseidon2_wide_events),
             poseidon2_linear_layer_events: create_uninit_vec(
@@ -228,11 +230,192 @@ impl<F: PrimeField32> MachineRecord for ExecutionRecord<F> {
     }
 }
 
+impl<F: Copy> ExecutionRecord<F> {
+    /// Split one globally executed record into trace shards without changing event order.
+    ///
+    /// Each supplied program must be a [`RecursionProgram::with_event_ranges`] view of this
+    /// record's global program. The ranges must be contiguous and cover every supported event
+    /// vector exactly once.
+    #[must_use]
+    pub fn into_event_shards(self, programs: Vec<Arc<RecursionProgram<F>>>) -> Vec<Self> {
+        fn take_exact<T>(events: &mut impl Iterator<Item = T>, len: usize) -> Vec<T> {
+            let result = events.take(len).collect::<Vec<_>>();
+            assert_eq!(result.len(), len, "event shard range exceeds the global record");
+            result
+        }
+
+        let Self {
+            program: _,
+            index: _,
+            base_alu_events,
+            ext_alu_events,
+            mem_const_count,
+            mem_var_events,
+            public_values,
+            ext_felt_conversion_events,
+            poseidon2_events,
+            poseidon2_linear_layer_events,
+            poseidon2_sbox_events,
+            select_events,
+            bf16_mul_events,
+            bf16_unary_events,
+            bf16_div_events,
+            bf16_add_sub_events,
+            prefix_sum_checks_events,
+            commit_pv_hash_events,
+        } = self;
+        assert!(ext_alu_events.is_empty());
+        assert!(ext_felt_conversion_events.is_empty());
+        assert!(poseidon2_linear_layer_events.is_empty());
+        assert!(poseidon2_sbox_events.is_empty());
+        assert!(select_events.is_empty());
+        assert!(prefix_sum_checks_events.is_empty());
+
+        let mut base_alu = base_alu_events.into_iter();
+        let mut mem_var = mem_var_events.into_iter();
+        let mut poseidon2 = poseidon2_events.into_iter();
+        let mut bf16_mul = bf16_mul_events.into_iter();
+        let mut bf16_unary = bf16_unary_events.into_iter();
+        let mut bf16_div = bf16_div_events.into_iter();
+        let mut bf16_add_sub = bf16_add_sub_events.into_iter();
+        let mut commit_pv_hash = commit_pv_hash_events.into_iter();
+        let mut expected = RecursionEventRanges::default();
+        let mut consumed_mem_const = 0usize;
+
+        let records = programs
+            .into_iter()
+            .enumerate()
+            .map(|(index, program)| {
+                let ranges = program
+                    .event_ranges
+                    .expect("an event shard program must contain explicit event ranges");
+                assert_eq!(ranges.mem_const.start, expected.mem_const.end);
+                assert_eq!(ranges.mem_var.start, expected.mem_var.end);
+                assert_eq!(ranges.base_alu.start, expected.base_alu.end);
+                assert_eq!(ranges.poseidon2_wide.start, expected.poseidon2_wide.end);
+                assert_eq!(ranges.bf16_mul.start, expected.bf16_mul.end);
+                assert_eq!(ranges.bf16_unary.start, expected.bf16_unary.end);
+                assert_eq!(ranges.bf16_div.start, expected.bf16_div.end);
+                assert_eq!(ranges.bf16_add_sub.start, expected.bf16_add_sub.end);
+                assert_eq!(ranges.commit_pv_hash.start, expected.commit_pv_hash.end);
+                expected = ranges;
+                consumed_mem_const += ranges.mem_const.len();
+
+                Self {
+                    program,
+                    index: u32::try_from(index).expect("too many recursion event shards"),
+                    base_alu_events: take_exact(&mut base_alu, ranges.base_alu.len()),
+                    ext_alu_events: Vec::new(),
+                    mem_const_count: ranges.mem_const.len(),
+                    mem_var_events: take_exact(&mut mem_var, ranges.mem_var.len()),
+                    public_values,
+                    ext_felt_conversion_events: Vec::new(),
+                    poseidon2_events: take_exact(&mut poseidon2, ranges.poseidon2_wide.len()),
+                    poseidon2_linear_layer_events: Vec::new(),
+                    poseidon2_sbox_events: Vec::new(),
+                    select_events: Vec::new(),
+                    bf16_mul_events: take_exact(&mut bf16_mul, ranges.bf16_mul.len()),
+                    bf16_unary_events: take_exact(&mut bf16_unary, ranges.bf16_unary.len()),
+                    bf16_div_events: take_exact(&mut bf16_div, ranges.bf16_div.len()),
+                    bf16_add_sub_events: take_exact(&mut bf16_add_sub, ranges.bf16_add_sub.len()),
+                    prefix_sum_checks_events: Vec::new(),
+                    commit_pv_hash_events: take_exact(
+                        &mut commit_pv_hash,
+                        ranges.commit_pv_hash.len(),
+                    ),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(consumed_mem_const, mem_const_count);
+        assert!(base_alu.next().is_none());
+        assert!(mem_var.next().is_none());
+        assert!(poseidon2.next().is_none());
+        assert!(bf16_mul.next().is_none());
+        assert!(bf16_unary.next().is_none());
+        assert!(bf16_div.next().is_none());
+        assert!(bf16_add_sub.next().is_none());
+        assert!(commit_pv_hash.next().is_none());
+        records
+    }
+}
+
 impl<F: Field> ExecutionRecord<F> {
     pub fn compute_event_counts<'a>(
         instrs: impl Iterator<Item = &'a Instruction<F>> + 'a,
     ) -> RecursionAirEventCount {
         instrs.fold(RecursionAirEventCount::default(), Add::add)
+    }
+}
+
+/// A half-open range in one global recursion event vector.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EventRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl EventRange {
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.end - self.start
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.start == self.end
+    }
+}
+
+/// Active slices of the global event vectors for a trace shard.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecursionEventRanges {
+    pub mem_const: EventRange,
+    pub mem_var: EventRange,
+    pub base_alu: EventRange,
+    pub poseidon2_wide: EventRange,
+    pub bf16_mul: EventRange,
+    pub bf16_unary: EventRange,
+    pub bf16_div: EventRange,
+    pub bf16_add_sub: EventRange,
+    pub commit_pv_hash: EventRange,
+}
+
+impl RecursionEventRanges {
+    #[must_use]
+    pub const fn event_counts(self) -> RecursionAirEventCount {
+        RecursionAirEventCount {
+            mem_const_events: self.mem_const.len(),
+            mem_var_events: self.mem_var.len(),
+            base_alu_events: self.base_alu.len(),
+            ext_alu_events: 0,
+            ext_felt_conversion_events: 0,
+            poseidon2_wide_events: self.poseidon2_wide.len(),
+            poseidon2_linear_layer_events: 0,
+            poseidon2_sbox_events: 0,
+            select_events: 0,
+            bf16_mul_events: self.bf16_mul.len(),
+            bf16_unary_events: self.bf16_unary.len(),
+            bf16_div_events: self.bf16_div.len(),
+            bf16_add_sub_events: self.bf16_add_sub.len(),
+            prefix_sum_checks_events: 0,
+            commit_pv_hash_events: self.commit_pv_hash.len(),
+        }
+    }
+
+    #[must_use]
+    pub const fn full(counts: RecursionAirEventCount) -> Self {
+        Self {
+            mem_const: EventRange { start: 0, end: counts.mem_const_events },
+            mem_var: EventRange { start: 0, end: counts.mem_var_events },
+            base_alu: EventRange { start: 0, end: counts.base_alu_events },
+            poseidon2_wide: EventRange { start: 0, end: counts.poseidon2_wide_events },
+            bf16_mul: EventRange { start: 0, end: counts.bf16_mul_events },
+            bf16_unary: EventRange { start: 0, end: counts.bf16_unary_events },
+            bf16_div: EventRange { start: 0, end: counts.bf16_div_events },
+            bf16_add_sub: EventRange { start: 0, end: counts.bf16_add_sub_events },
+            commit_pv_hash: EventRange { start: 0, end: counts.commit_pv_hash_events },
+        }
     }
 }
 

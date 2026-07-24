@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::{
     prover::{CoreProofShape, PcsProof, ZerocheckAir},
-    Machine, SP1Pcs, ShardVerifierConfigError,
+    LogUpGkrChallenges, Machine, SP1Pcs, ShardVerifierConfigError,
 };
 
 use super::{MachineVerifyingKey, ShardProof, ShardVerifier, ShardVerifierError};
@@ -183,6 +183,18 @@ where {
     ) -> Result<(), ShardVerifierConfigError<GC, SC::Config>>
 where {
         self.shard_verifier.verify_shard(vk, proof, challenger)
+    }
+
+    /// Verify a shard as part of a committed batch and return its local lookup residual.
+    pub fn verify_shard_with_logup_challenges(
+        &self,
+        vk: &MachineVerifyingKey<GC>,
+        proof: &ShardProof<GC, PcsProof<GC, SC>>,
+        challenges: &LogUpGkrChallenges<GC::EF>,
+        challenger: &mut GC::Challenger,
+    ) -> Result<GC::EF, ShardVerifierConfigError<GC, SC::Config>>
+where {
+        self.shard_verifier.verify_shard_with_logup_challenges(vk, proof, challenges, challenger)
     }
 }
 

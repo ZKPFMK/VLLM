@@ -58,24 +58,8 @@ impl<F: PrimeField32> MachineAir<F> for MemoryConstChip<F> {
     }
 
     fn preprocessed_num_rows(&self, program: &Self::Program) -> Option<usize> {
-        let instrs_len = program
-            .inner
-            .iter()
-            .filter_map(|instruction| match instruction.inner() {
-                Instruction::Mem(MemInstr { addrs, vals, mult, kind }) => {
-                    let mult = mult.to_owned();
-                    let mult = match kind {
-                        MemAccessKind::Read => -mult,
-                        MemAccessKind::Write => mult,
-                    };
-
-                    Some((vals.inner, MemoryAccessCols { addr: addrs.inner, mult }))
-                }
-                _ => None,
-            })
-            .chunks(NUM_CONST_MEM_ENTRIES_PER_ROW)
-            .into_iter()
-            .count();
+        let instrs_len =
+            program.event_counts.mem_const_events.div_ceil(NUM_CONST_MEM_ENTRIES_PER_ROW);
         self.preprocessed_num_rows_with_instrs_len(program, instrs_len)
     }
 
@@ -93,11 +77,16 @@ impl<F: PrimeField32> MachineAir<F> for MemoryConstChip<F> {
         program: &Self::Program,
         buffer: &mut [MaybeUninit<F>],
     ) {
+        let active = program.event_ranges().mem_const;
         let chunks = program
             .inner
             .iter()
             .filter_map(|instruction| match instruction.inner() {
                 Instruction::Mem(MemInstr { addrs, vals, mult, kind }) => {
+                    let offset = instruction.offset();
+                    if offset < active.start || offset >= active.end {
+                        return None;
+                    }
                     let mult = mult.to_owned();
                     let mult = match kind {
                         MemAccessKind::Read => -mult,

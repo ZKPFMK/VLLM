@@ -75,14 +75,7 @@ impl<F: PrimeField32> MachineAir<F> for BaseAluChip {
     }
 
     fn preprocessed_num_rows(&self, program: &Self::Program) -> Option<usize> {
-        let instrs_len = program
-            .inner
-            .iter()
-            .filter_map(|instruction| match instruction.inner() {
-                Instruction::BaseAlu(x) => Some(x),
-                _ => None,
-            })
-            .count();
+        let instrs_len = program.event_counts.base_alu_events;
         self.preprocessed_num_rows_with_instrs_len(program, instrs_len)
     }
 
@@ -107,11 +100,17 @@ impl<F: PrimeField32> MachineAir<F> for BaseAluChip {
             "generate_preprocessed_trace only supports SP1Field field"
         );
 
+        let active = program.event_ranges().base_alu;
         let instrs = program
             .inner
             .iter()
             .filter_map(|instruction| match instruction.inner() {
-                Instruction::BaseAlu(x) => Some(x),
+                Instruction::BaseAlu(x)
+                    if active.start <= instruction.offset()
+                        && instruction.offset() < active.end =>
+                {
+                    Some(x)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();

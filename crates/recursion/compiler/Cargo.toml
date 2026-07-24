@@ -30,6 +30,7 @@ cfg-if = { workspace = true }
 [dev-dependencies]
 bincode = { workspace = true }
 slop-basefold = { workspace = true }
+slop-challenger = { workspace = true }
 sp1-recursion-executor = { workspace = true, features = ["program_validation"] }
 sp1-recursion-machine = { workspace = true }
 rand = { workspace = true }

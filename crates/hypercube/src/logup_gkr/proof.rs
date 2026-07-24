@@ -1,9 +1,47 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use slop_algebra::{ExtensionField, Field};
 use slop_alloc::{Backend, CpuBackend};
+use slop_challenger::FieldChallenger;
 use slop_multilinear::{Mle, MleEval, Point};
 use slop_sumcheck::PartialSumcheckProof;
+
+/// Lookup challenges shared by every trace shard in one batched execution.
+///
+/// A batch prover must derive these challenges only after committing to every shard trace.  This
+/// lets individual shard proofs carry a non-zero local LogUp residual while a batch verifier checks
+/// that the residuals cancel globally.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct LogUpGkrChallenges<EF> {
+    /// The random offset used in every lookup denominator.
+    pub alpha: EF,
+    /// Randomness used to compress an interaction tuple.
+    pub beta_seed: Point<EF>,
+    /// Randomness used by interactions declared in public values.
+    pub public_values_challenge: EF,
+}
+
+impl<EF> LogUpGkrChallenges<EF> {
+    /// Sample a common challenge set from an already initialized batch transcript.
+    ///
+    /// The transcript must contain every preprocessed and main commitment, the ordered shard
+    /// shapes, and a domain separator before this method is called.
+    pub fn sample<F, Challenger>(challenger: &mut Challenger, beta_seed_dimension: usize) -> Self
+    where
+        F: Field,
+        EF: ExtensionField<F>,
+        Challenger: FieldChallenger<F>,
+    {
+        Self {
+            alpha: challenger.sample_ext_element::<EF>(),
+            beta_seed: (0..beta_seed_dimension)
+                .map(|_| challenger.sample_ext_element::<EF>())
+                .collect(),
+            public_values_challenge: challenger.sample_ext_element::<EF>(),
+        }
+    }
+}
 
 /// The output of the log-up GKR circuit.
 #[derive(Debug, Serialize, Deserialize, Clone)]

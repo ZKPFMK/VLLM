@@ -26,9 +26,9 @@ use thiserror::Error;
 use crate::{
     air::MachineAir,
     prover::{CoreProofShape, PcsProof, ZerocheckAir},
-    Chip, ChipOpenedValues, LogUpEvaluations, LogUpGkrVerifier, LogupGkrVerificationError, Machine,
-    ShardContext, ShardContextImpl, VerifierConstraintFolder, MAX_CONSTRAINT_DEGREE,
-    PROOF_MAX_NUM_PVS, SP1SC,
+    Chip, ChipOpenedValues, LogUpEvaluations, LogUpGkrChallenges, LogUpGkrVerifier,
+    LogupGkrVerificationError, Machine, ShardContext, ShardContextImpl, VerifierConstraintFolder,
+    MAX_CONSTRAINT_DEGREE, PROOF_MAX_NUM_PVS, SP1SC,
 };
 
 use super::{MachineVerifyingKey, ShardOpenedValues, ShardProof};
@@ -441,6 +441,33 @@ where {
         challenger: &mut GC::Challenger,
     ) -> Result<(), ShardVerifierConfigError<GC, SC::Config>>
 where {
+        self.verify_shard_inner(vk, proof, None, challenger).map(|_| ())
+    }
+
+    /// Verify one shard in a committed lookup batch and return its local lookup residual.
+    ///
+    /// The batch verifier must invoke this for every shard with identical `challenges` and assert
+    /// that the returned residuals sum to zero.
+    pub fn verify_shard_with_logup_challenges(
+        &self,
+        vk: &MachineVerifyingKey<GC>,
+        proof: &ShardProof<GC, PcsProof<GC, SC>>,
+        challenges: &LogUpGkrChallenges<GC::EF>,
+        challenger: &mut GC::Challenger,
+    ) -> Result<GC::EF, ShardVerifierConfigError<GC, SC::Config>>
+where {
+        self.verify_shard_inner(vk, proof, Some(challenges), challenger)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn verify_shard_inner(
+        &self,
+        vk: &MachineVerifyingKey<GC>,
+        proof: &ShardProof<GC, PcsProof<GC, SC>>,
+        shared_challenges: Option<&LogUpGkrChallenges<GC::EF>>,
+        challenger: &mut GC::Challenger,
+    ) -> Result<GC::EF, ShardVerifierConfigError<GC, SC::Config>>
+where {
         let ShardProof {
             main_commitment,
             opened_values,
@@ -584,14 +611,27 @@ where {
         }
 
         // Verify the logup GKR proof.
-        LogUpGkrVerifier::<GC, SC>::verify_logup_gkr(
-            &shard_chips,
-            &degrees,
-            max_log_row_count,
-            logup_gkr_proof,
-            public_values,
-            challenger,
-        )
+        let local_residual = if let Some(challenges) = shared_challenges {
+            LogUpGkrVerifier::<GC, SC>::verify_logup_gkr_with_challenges(
+                &shard_chips,
+                &degrees,
+                max_log_row_count,
+                logup_gkr_proof,
+                public_values,
+                challenges,
+                challenger,
+            )
+        } else {
+            LogUpGkrVerifier::<GC, SC>::verify_logup_gkr(
+                &shard_chips,
+                &degrees,
+                max_log_row_count,
+                logup_gkr_proof,
+                public_values,
+                challenger,
+            )
+            .map(|_| GC::EF::zero())
+        }
         .map_err(ShardVerifierError::GkrVerificationFailed)?;
 
         // Verify the zerocheck proof.
@@ -738,7 +778,7 @@ where {
         {
             Err(ShardVerifierError::InvalidShape)
         } else {
-            Ok(())
+            Ok(local_residual)
         }
     }
 }

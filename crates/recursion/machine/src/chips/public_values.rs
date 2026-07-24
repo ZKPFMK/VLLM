@@ -102,15 +102,18 @@ impl<F: PrimeField32> MachineAir<F> for PublicValuesChip {
             )
         };
 
+        let active = program.event_ranges().commit_pv_hash;
         let commit_pv_hash_instrs = program
             .inner
             .iter()
-            .filter_map(|instruction| {
-                if let Instruction::CommitPublicValues(instr) = instruction.inner() {
+            .filter_map(|instruction| match instruction.inner() {
+                Instruction::CommitPublicValues(instr)
+                    if active.start <= instruction.offset()
+                        && instruction.offset() < active.end =>
+                {
                     Some(instr)
-                } else {
-                    None
                 }
+                _ => None,
             })
             .collect::<Vec<_>>();
 

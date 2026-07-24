@@ -17,7 +17,7 @@ use slop_sumcheck::PartialSumcheckProof;
 
 use sp1_hypercube::{
     air::MachineAir, septic_digest::SepticDigest, GenericVerifierPublicValuesConstraintFolder,
-    LogupGkrProof, Machine, ShardOpenedValues, UntrustedConfig,
+    LogUpGkrChallenges, LogupGkrProof, Machine, ShardOpenedValues, UntrustedConfig,
 };
 use sp1_primitives::{SP1ExtensionField, SP1Field};
 use sp1_recursion_compiler::{
@@ -114,6 +114,36 @@ where
     ) where
         A: for<'b> Air<RecursiveVerifierConstraintFolder<'b>>,
     {
+        self.verify_shard_inner(builder, vk, proof, None, challenger);
+    }
+
+    /// Verify a shard as part of one committed lookup batch and return its local residual.
+    pub fn verify_shard_with_logup_challenges(
+        &self,
+        builder: &mut Builder<C>,
+        vk: &MachineVerifyingKeyVariable<C, GC>,
+        proof: &ShardProofVariable<C, GC>,
+        challenges: &LogUpGkrChallenges<Ext<SP1Field, SP1ExtensionField>>,
+        challenger: &mut GC::FriChallengerVariable,
+    ) -> SymbolicExt<SP1Field, SP1ExtensionField>
+    where
+        A: for<'b> Air<RecursiveVerifierConstraintFolder<'b>>,
+    {
+        self.verify_shard_inner(builder, vk, proof, Some(challenges), challenger)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn verify_shard_inner(
+        &self,
+        builder: &mut Builder<C>,
+        vk: &MachineVerifyingKeyVariable<C, GC>,
+        proof: &ShardProofVariable<C, GC>,
+        shared_challenges: Option<&LogUpGkrChallenges<Ext<SP1Field, SP1ExtensionField>>>,
+        challenger: &mut GC::FriChallengerVariable,
+    ) -> SymbolicExt<SP1Field, SP1ExtensionField>
+    where
+        A: for<'b> Air<RecursiveVerifierConstraintFolder<'b>>,
+    {
         let ShardProofVariable {
             main_commitment,
             opened_values,
@@ -178,15 +208,29 @@ where
 
         // Verify the `LogUp` GKR proof.
         builder.cycle_tracker_v2_enter("verify-logup-gkr");
-        RecursiveLogUpGkrVerifier::<C, GC, A>::verify_logup_gkr(
-            builder,
-            &shard_chips,
-            &degrees,
-            max_log_row_count,
-            logup_gkr_proof,
-            public_values,
-            challenger,
-        );
+        let local_residual = if let Some(challenges) = shared_challenges {
+            RecursiveLogUpGkrVerifier::<C, GC, A>::verify_logup_gkr_with_challenges(
+                builder,
+                &shard_chips,
+                &degrees,
+                max_log_row_count,
+                logup_gkr_proof,
+                public_values,
+                challenges,
+                challenger,
+            )
+        } else {
+            RecursiveLogUpGkrVerifier::<C, GC, A>::verify_logup_gkr(
+                builder,
+                &shard_chips,
+                &degrees,
+                max_log_row_count,
+                logup_gkr_proof,
+                public_values,
+                challenger,
+            );
+            SymbolicExt::zero()
+        };
         builder.cycle_tracker_v2_exit();
 
         // Verify the zerocheck proof.
@@ -400,6 +444,7 @@ where
         builder.assert_felt_eq(acc, total_area_felt);
 
         builder.cycle_tracker_v2_exit();
+        local_residual
     }
 }
 

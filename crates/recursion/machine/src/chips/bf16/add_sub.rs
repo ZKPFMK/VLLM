@@ -146,10 +146,15 @@ impl<F: PrimeField32> MachineAir<F> for Bf16AddSubChip {
             };
         };
 
+        let active = program.event_ranges().bf16_add_sub;
         for analyzed in program.inner.iter() {
-            let (start, count) = match analyzed.inner() {
+            let (global_start, count) = match analyzed.inner() {
                 Instruction::Bf16AddSub(instruction) => {
-                    let start = analyzed.offset() * BF16_ADD_SUB_ACCESS_COLS;
+                    let offset = analyzed.offset();
+                    if offset < active.start || offset >= active.end {
+                        continue;
+                    }
+                    let start = (offset - active.start) * BF16_ADD_SUB_ACCESS_COLS;
                     populate(&mut values[start..start + BF16_ADD_SUB_ACCESS_COLS], instruction);
                     continue;
                 }
@@ -159,10 +164,18 @@ impl<F: PrimeField32> MachineAir<F> for Bf16AddSubChip {
                 Instruction::Bf16MeanBatch(batch) => (analyzed.offset(), batch.add_sub_count()),
                 _ => continue,
             };
-            let start = start * BF16_ADD_SUB_ACCESS_COLS;
-            let end = start + count * BF16_ADD_SUB_ACCESS_COLS;
+            let global_end = global_start + count;
+            let intersection_start = global_start.max(active.start);
+            let intersection_end = global_end.min(active.end);
+            if intersection_start >= intersection_end {
+                continue;
+            }
+            let first_instruction_index = intersection_start - global_start;
+            let start = (intersection_start - active.start) * BF16_ADD_SUB_ACCESS_COLS;
+            let end = start + (intersection_end - intersection_start) * BF16_ADD_SUB_ACCESS_COLS;
             values[start..end].par_chunks_mut(BF16_ADD_SUB_ACCESS_COLS).enumerate().for_each(
                 |(index, row)| {
+                    let index = first_instruction_index + index;
                     let instruction = match analyzed.inner() {
                         Instruction::Bf16LinearBatch(batch) => batch.add_sub_instruction(index),
                         Instruction::Bf16MeanBatch(batch) => batch.add_sub_instruction(index),

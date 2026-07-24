@@ -12,7 +12,9 @@ use crate::{
     LogupGkrCpuTraceGenerator, ShardContext, GKR_GRINDING_BITS,
 };
 
-use super::{LogUpEvaluations, LogUpGkrOutput, LogupGkrProof, LogupGkrRoundProof};
+use super::{
+    LogUpEvaluations, LogUpGkrChallenges, LogUpGkrOutput, LogupGkrProof, LogupGkrRoundProof,
+};
 
 /// TODO
 pub struct GkrProverImpl<GC: IopCtx, SC: ShardContext<GC>> {
@@ -75,6 +77,50 @@ impl<GC: IopCtx, SC: ShardContext<GC>> GkrProverImpl<GC, SC> {
         public_values: Vec<GC::F>,
         challenger: &mut GC::Challenger,
     ) -> LogupGkrProof<<GC::Challenger as GrindingChallenger>::Witness, GC::EF> {
+        self.prove_logup_gkr_inner(
+            chips,
+            preprocessed_traces,
+            traces,
+            public_values,
+            None,
+            challenger,
+        )
+    }
+
+    /// Prove one member of a batched lookup argument.
+    ///
+    /// `challenges` must have been sampled from a transcript containing the commitments of every
+    /// shard in the batch.  Unlike [`Self::prove_logup_gkr`], this method does not require the
+    /// current shard's lookup sum to close by itself.
+    pub(crate) fn prove_logup_gkr_with_challenges(
+        &self,
+        chips: &BTreeSet<Chip<GC::F, SC::Air>>,
+        preprocessed_traces: &Traces<GC::F, CpuBackend>,
+        traces: &Traces<GC::F, CpuBackend>,
+        public_values: Vec<GC::F>,
+        challenges: &LogUpGkrChallenges<GC::EF>,
+        challenger: &mut GC::Challenger,
+    ) -> LogupGkrProof<<GC::Challenger as GrindingChallenger>::Witness, GC::EF> {
+        self.prove_logup_gkr_inner(
+            chips,
+            preprocessed_traces,
+            traces,
+            public_values,
+            Some(challenges),
+            challenger,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prove_logup_gkr_inner(
+        &self,
+        chips: &BTreeSet<Chip<GC::F, SC::Air>>,
+        preprocessed_traces: &Traces<GC::F, CpuBackend>,
+        traces: &Traces<GC::F, CpuBackend>,
+        public_values: Vec<GC::F>,
+        shared_challenges: Option<&LogUpGkrChallenges<GC::EF>>,
+        challenger: &mut GC::Challenger,
+    ) -> LogupGkrProof<<GC::Challenger as GrindingChallenger>::Witness, GC::EF> {
         let max_interaction_arity = chips
             .iter()
             .flat_map(|c| c.sends().iter().chain(c.receives().iter()))
@@ -85,12 +131,28 @@ impl<GC: IopCtx, SC: ShardContext<GC>> GkrProverImpl<GC, SC> {
 
         let witness = challenger.grind(GKR_GRINDING_BITS);
 
-        // Sample the logup challenges.
-        let alpha = challenger.sample_ext_element::<GC::EF>();
-        let beta_seed = (0..beta_seed_dim)
-            .map(|_| challenger.sample_ext_element::<GC::EF>())
-            .collect::<Point<_>>();
-        let _pv_challenge = challenger.sample_ext_element::<GC::EF>();
+        // A normal shard samples its lookup challenges from its own transcript. A batched shard
+        // observes challenges sampled from the transcript of all batch commitments instead.
+        let (alpha, beta_seed) = if let Some(challenges) = shared_challenges {
+            assert_eq!(
+                challenges.beta_seed.dimension(),
+                beta_seed_dim as usize,
+                "invalid shared LogUp beta seed dimension"
+            );
+            challenger.observe_ext_element(challenges.alpha);
+            for beta in challenges.beta_seed.iter() {
+                challenger.observe_ext_element(*beta);
+            }
+            challenger.observe_ext_element(challenges.public_values_challenge);
+            (challenges.alpha, challenges.beta_seed.clone())
+        } else {
+            let alpha = challenger.sample_ext_element::<GC::EF>();
+            let beta_seed = (0..beta_seed_dim)
+                .map(|_| challenger.sample_ext_element::<GC::EF>())
+                .collect::<Point<_>>();
+            let _pv_challenge = challenger.sample_ext_element::<GC::EF>();
+            (alpha, beta_seed)
+        };
 
         let num_interactions =
             chips.iter().map(|chip| chip.sends().len() + chip.receives().len()).sum::<usize>();

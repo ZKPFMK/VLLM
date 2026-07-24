@@ -158,31 +158,46 @@ not run the full command on an ordinary workstation.
 
 ### One proof per Block and one final recursion proof
 
-The server-oriented path avoids the 12-Block monolithic trace. Each invocation
-of `zkgpt_like --block N` proves exactly one complete GPT-2 Block. The public
-hidden-state input is placed in `MemoryConst`; model parameters and attention
-hints enter through the private witness stream. There are no separate Poseidon
-commitments for input, output, parameters, or hints. The PCS trace commitment
-binds the private witness values used by that individual proof.
+The server-oriented path executes one complete GPT-2 Block, then partitions its
+global event record by chip event counts and padded trace area. It does not cut
+the model into LayerNorm/attention/MLP subcircuits. The default limits are
+`2^22` rows per chip and `3 * 2^27` total main-plus-preprocessed cells per leaf.
+The current full `30 x 768` Block plan contains about 25 event leaves.
+
+Every leaf first commits its main trace. The ordered verifying keys, main trace
+commitments, chip names, and real heights jointly derive one shared LogUp
+challenge. Each leaf proof may have a nonzero local lookup residual; the batch
+is accepted only when all residuals sum to zero under that same challenge. A
+recursion circuit verifies all leaves, checks the residual sum, recomputes the
+ordered trace-batch digest, and emits one Block wrapper proof.
+
+The public hidden-state input is placed in `MemoryConst`; model parameters and
+attention hints enter through the private witness stream. There are no separate
+Poseidon commitments for input, output, parameters, or hints. The leaf PCS main
+trace commitments bind the witness values, and the Block wrapper's public
+digest binds the Block number, model shape, ordered leaf verifying keys, main
+trace commitments, and real heights.
 
 The following Block verifies the previous proof on the host and consumes its
 host-carried private output. Because the output has no explicit public
 commitment, this experimental mode does not cryptographically enforce equality
 between one Block's output file and the next Block's input.
 
-After all 12 Block proofs exist, `zkgpt_block_recursion` performs actual
+After all 12 Block wrapper proofs exist, `zkgpt_block_recursion` performs actual
 in-circuit child-STARK verification. Every join verifies two child proofs and
 their verifying-key hashes, checks that their Block ranges are adjacent, and
 emits one recursion proof. It does not check an input/output commitment
-boundary. The runner constructs the binary reduction:
+boundary. The runner constructs:
 
 ```text
-12 Block proofs -> 6 -> 3 -> 2 -> 1 final recursion proof
+each Block: event leaves -> 1 Block wrapper proof
+all Blocks: 12 wrappers -> 6 -> 3 -> 2 -> 1 final recursion proof
 ```
 
-This produces 12 Block proofs plus 11 recursion proofs during the full run, but
-the final artifact is one proof covering Blocks `0..12`. At an odd level the
-unpaired node is carried forward; no redundant identity proof is generated.
+The persisted top-level artifacts are 12 Block wrapper proofs plus 11 join
+proofs; event-leaf proofs are also retained for audit and `--resume`. The final
+artifact is one proof covering Blocks `0..12`. At an odd level the unpaired node
+is carried forward; no redundant identity proof is generated.
 
 Build and run this path on the Linux proving server:
 
@@ -194,11 +209,33 @@ python3 infer/zkgpt_block_recursion.py \
   --output-root /home/dj/proofs/zkgpt-12-block-recursion
 ```
 
-`--resume` validates artifact metadata and adjacent Block ranges, then skips
-completed Block and recursion manifests. The
-runner writes `zkgpt_block_recursion.run.json` and prints the final recursion
-manifest path. After completion, verify the serialized final proof, its public
-recursion transcript, and its verifying-key commitment again with:
+To prove only Block 0 by hand, run the two stages explicitly:
+
+```bash
+cargo build --release \
+  -p sp1-recursion-compiler --example zkgpt_like \
+  -p sp1-recursion-circuit --example zkgpt_block_recursion
+
+RAYON_NUM_THREADS="$(nproc)" target/release/examples/zkgpt_like \
+  --prove-shards --allow-large-build --block 0 \
+  --data-dir /home/dj/VLLM-models/gpt2-bf16/recursion/zkgpt-like-12x30-real-bf16 \
+  --output-dir /home/dj/proofs/block-00
+
+RAYON_NUM_THREADS="$(nproc)" target/release/examples/zkgpt_block_recursion \
+  --prove \
+  --event-shard-manifest /home/dj/proofs/block-00/zkgpt_event_shards.manifest.json \
+  --output-dir /home/dj/proofs/block-00
+```
+
+The final Block-0 artifact is
+`zkgpt_block_00_shard_recursion.manifest.json`. Its proof can be used directly
+as a child of the 12-Block recursion tree.
+
+`--resume` validates the event-leaf files, trace-batch metadata, Block wrapper
+artifacts, and adjacent Block ranges before skipping completed work. The runner
+writes `zkgpt_block_recursion.run.json` and prints the final recursion manifest
+path. After completion, verify the serialized final proof, its public recursion
+transcript, and its verifying-key commitment again with:
 
 ```bash
 python3 infer/zkgpt_block_recursion.py \

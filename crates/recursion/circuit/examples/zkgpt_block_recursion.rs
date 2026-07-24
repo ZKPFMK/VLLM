@@ -2,6 +2,7 @@
 
 use std::{
     borrow::{Borrow, BorrowMut},
+    collections::BTreeSet,
     fs::{self, File},
     marker::PhantomData,
     path::{Path, PathBuf},
@@ -10,12 +11,15 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use slop_algebra::{AbstractField, PrimeField32};
+use slop_algebra::{AbstractField, Field, PrimeField32};
 use slop_basefold::{BasefoldVerifier, FriConfig};
+use slop_challenger::{CanObserve, IopCtx};
+use slop_multilinear::Point;
 use slop_symmetric::Permutation;
 use sp1_hypercube::{
-    air::MachineAir, inner_perm, prover::simple_prover, HashableKey, MachineProof,
-    MachineVerifyingKey, SP1PcsProofInner, ShardProof, ShardVerifier, NUM_SP1_COMMITMENTS,
+    air::MachineAir, inner_perm, prover::simple_prover, HashableKey, InnerSC, LogUpGkrChallenges,
+    LogUpGkrVerifier, MachineProof, MachineVerifyingKey, SP1PcsProofInner, ShardProof,
+    ShardVerifier, NUM_SP1_COMMITMENTS,
 };
 use sp1_primitives::{
     fri_params::{unique_decoding_queries, SP1_PROOF_OF_WORK_BITS},
@@ -26,7 +30,7 @@ use sp1_recursion_circuit::{
         stacked::RecursiveStackedPcsVerifier, tcs::RecursiveMerkleTreeTcs,
         RecursiveBasefoldVerifier,
     },
-    challenger::CanObserveVariable,
+    challenger::{CanObserveVariable, FieldChallengerVariable},
     jagged::{RecursiveJaggedEvalSumcheckConfig, RecursiveJaggedPcsVerifier},
     shard::{MachineVerifyingKeyVariable, RecursiveShardVerifier, ShardProofVariable},
     witness::Witnessable,
@@ -34,7 +38,7 @@ use sp1_recursion_circuit::{
 };
 use sp1_recursion_compiler::{
     circuit::{AsmBuilder, AsmCompiler, AsmConfig, CircuitV2Builder},
-    prelude::{Builder, Felt},
+    prelude::{Builder, Ext, Felt, SymbolicExt, SymbolicFelt},
 };
 use sp1_recursion_executor::{
     Block, Executor, RecursionProgram, RecursionPublicValues, DIGEST_SIZE, HASH_RATE,
@@ -57,6 +61,12 @@ const RECURSION_STAGE: u32 = 0x1620;
 const DOMAIN_RECURSION_TRANSCRIPT: u32 = 0x1621;
 const NODE_KIND_BLOCK: u32 = 0x1622;
 const NODE_KIND_RECURSION: u32 = 0x1623;
+const EVENT_SHARD_BATCH_DOMAIN: u32 = 0x5a4b_4556;
+const EVENT_SHARD_TRANSCRIPT_DOMAIN: u32 = 0x5a4b_4557;
+const EVENT_BLOCK_TRANSCRIPT_DOMAIN: u32 = 0x5a4b_4558;
+const EVENT_SHARD_PROTOCOL_VERSION: u32 = 2;
+const EVENT_BLOCK_RECURSION_PROTOCOL_VERSION: u32 = 1;
+const EVENT_BLOCK_RECURSION_STAGE: &str = "zkgpt_block_shard_recursion";
 
 type Digest = [SP1Field; DIGEST_SIZE];
 type Air = RecursionAir<SP1Field, 3, 2>;
@@ -66,6 +76,9 @@ type StoredVerifyingKey = MachineVerifyingKey<SP1GlobalContext>;
 type RecursiveVerifier = RecursiveShardVerifier<SP1GlobalContext, Air, AsmConfig>;
 type VerifyingKeyVariable = MachineVerifyingKeyVariable<AsmConfig, SP1GlobalContext>;
 type ProofVariable = ShardProofVariable<AsmConfig, SP1GlobalContext>;
+type StarkSC = InnerSC<Air>;
+type ChallengerVariable =
+    <SP1GlobalContext as SP1FieldConfigVariable<AsmConfig>>::FriChallengerVariable;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
@@ -81,6 +94,7 @@ struct Arguments {
     left_manifest: Option<PathBuf>,
     right_manifest: Option<PathBuf>,
     verify_manifest: Option<PathBuf>,
+    event_shard_manifest: Option<PathBuf>,
     output_dir: PathBuf,
 }
 
@@ -136,6 +150,24 @@ struct ChildArtifact {
     proof: StoredShardProof,
 }
 
+struct EventShardArtifact {
+    index: usize,
+    verifying_key: StoredVerifyingKey,
+    proof: StoredShardProof,
+    real_heights: Vec<(String, usize)>,
+}
+
+struct EventShardBatch {
+    manifest_path: PathBuf,
+    block: usize,
+    shape: Shape,
+    trace_transcript: Digest,
+    transcript: Digest,
+    private_output_file: String,
+    beta_seed_dimension: usize,
+    shards: Vec<EventShardArtifact>,
+}
+
 #[derive(Debug, Deserialize)]
 struct BlockManifest {
     version: u32,
@@ -183,11 +215,55 @@ struct RecursionManifest {
     verifying_key_file: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct EventShardManifest {
+    version: u32,
+    stage: String,
+    lookup_protocol: String,
+    lookup_batch_closed: bool,
+    transcript_binding: String,
+    block: Option<usize>,
+    sequence_length: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    linear_size: usize,
+    block_transcript_commitment: String,
+    private_output_file: Option<String>,
+    beta_seed_dimension: usize,
+    shards: usize,
+    artifacts: Vec<EventShardManifestArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EventShardManifestArtifact {
+    index: usize,
+    proof_file: String,
+    verifying_key_file: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EventBlockRecursionManifest {
+    version: u32,
+    stage: String,
+    block: usize,
+    sequence_length: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    linear_size: usize,
+    shards: usize,
+    trace_transcript_commitment: String,
+    transcript_commitment: String,
+    verifying_key_commitment: String,
+    proof_file: String,
+    verifying_key_file: String,
+}
+
 fn parse_arguments() -> Arguments {
     let mut mode = Mode::Check;
     let mut left_manifest = None;
     let mut right_manifest = None;
     let mut verify_manifest = None;
+    let mut event_shard_manifest = None;
     let mut output_dir = std::env::var_os("SP1_ZKGPT_RECURSION_OUTPUT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("sp1-zkgpt-block-recursion"));
@@ -213,6 +289,11 @@ fn parse_arguments() -> Arguments {
                     arguments.next().expect("--verify-manifest requires a value"),
                 ));
             }
+            Some("--event-shard-manifest") => {
+                event_shard_manifest = Some(PathBuf::from(
+                    arguments.next().expect("--event-shard-manifest requires a value"),
+                ));
+            }
             Some("--output-dir") => {
                 output_dir =
                     PathBuf::from(arguments.next().expect("--output-dir requires a value"));
@@ -223,17 +304,29 @@ fn parse_arguments() -> Arguments {
     }
     if verify_manifest.is_some() {
         assert!(
-            left_manifest.is_none() && right_manifest.is_none(),
+            left_manifest.is_none() && right_manifest.is_none() && event_shard_manifest.is_none(),
             "--verify-manifest cannot be combined with child manifests"
         );
         assert_eq!(mode, Mode::Check, "--verify-manifest cannot generate a new proof");
+    } else if event_shard_manifest.is_some() {
+        assert!(
+            left_manifest.is_none() && right_manifest.is_none(),
+            "--event-shard-manifest cannot be combined with child manifests"
+        );
     } else {
         assert!(
             left_manifest.is_some() && right_manifest.is_some(),
             "--left-manifest and --right-manifest are required"
         );
     }
-    Arguments { mode, left_manifest, right_manifest, verify_manifest, output_dir }
+    Arguments {
+        mode,
+        left_manifest,
+        right_manifest,
+        verify_manifest,
+        event_shard_manifest,
+        output_dir,
+    }
 }
 
 fn proof_fri_config() -> FriConfig<SP1Field> {
@@ -379,6 +472,173 @@ fn read_proof_artifacts(
     (proof, vk)
 }
 
+fn derive_event_batch_challenges(
+    shards: &[EventShardArtifact],
+    beta_seed_dimension: usize,
+) -> LogUpGkrChallenges<SP1ExtensionField> {
+    assert!(!shards.is_empty(), "event shard batch cannot be empty");
+    let mut challenger = SP1GlobalContext::default_challenger();
+    challenger.observe(SP1Field::from_canonical_u32(EVENT_SHARD_BATCH_DOMAIN));
+    challenger.observe(SP1Field::from_canonical_usize(shards.len()));
+    for shard in shards {
+        challenger.observe(SP1Field::from_canonical_usize(shard.index));
+        shard.verifying_key.observe_into(&mut challenger);
+        challenger.observe(shard.proof.main_commitment);
+        challenger.observe(SP1Field::from_canonical_usize(shard.real_heights.len()));
+        for (name, height) in &shard.real_heights {
+            challenger.observe(SP1Field::from_canonical_usize(name.len()));
+            for byte in name.bytes() {
+                challenger.observe(SP1Field::from_canonical_u8(byte));
+            }
+            challenger.observe(SP1Field::from_canonical_usize(*height));
+        }
+    }
+    LogUpGkrChallenges::sample::<SP1Field, _>(&mut challenger, beta_seed_dimension)
+}
+
+fn event_shard_transcript(shape: Shape, block: usize, shards: &[EventShardArtifact]) -> Digest {
+    let mut fields = [
+        EVENT_SHARD_PROTOCOL_VERSION,
+        shape.sequence_length as u32,
+        shape.hidden_size as u32,
+        shape.num_heads as u32,
+        shape.linear_size as u32,
+        block as u32,
+        shards.len() as u32,
+    ]
+    .map(SP1Field::from_canonical_u32)
+    .to_vec();
+    for shard in shards {
+        fields.push(SP1Field::from_canonical_usize(shard.index));
+        fields.extend(shard.verifying_key.hash_koalabear());
+        fields.extend(shard.proof.main_commitment);
+        fields.push(SP1Field::from_canonical_usize(shard.real_heights.len()));
+        for (name, height) in &shard.real_heights {
+            fields.push(SP1Field::from_canonical_usize(name.len()));
+            fields.extend(name.bytes().map(SP1Field::from_canonical_u8));
+            fields.push(SP1Field::from_canonical_usize(*height));
+        }
+    }
+    host_commit_fields(EVENT_SHARD_TRANSCRIPT_DOMAIN, &fields)
+}
+
+fn event_block_transcript(shape: Shape, block: usize, trace_transcript: Digest) -> Digest {
+    let mut fields = [
+        EVENT_BLOCK_RECURSION_PROTOCOL_VERSION,
+        block as u32,
+        shape.sequence_length as u32,
+        shape.hidden_size as u32,
+        shape.num_heads as u32,
+        shape.linear_size as u32,
+    ]
+    .map(SP1Field::from_canonical_u32)
+    .to_vec();
+    fields.extend(trace_transcript);
+    host_commit_fields(EVENT_BLOCK_TRANSCRIPT_DOMAIN, &fields)
+}
+
+fn load_event_shard_batch(manifest_path: &Path) -> EventShardBatch {
+    let manifest: EventShardManifest = serde_json::from_slice(
+        &fs::read(manifest_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display())),
+    )
+    .unwrap_or_else(|error| panic!("invalid event shard manifest: {error}"));
+    assert_eq!(manifest.version, EVENT_SHARD_PROTOCOL_VERSION);
+    assert_eq!(manifest.stage, "zkgpt_event_shards");
+    assert_eq!(manifest.lookup_protocol, "shared_challenge_batch");
+    assert!(manifest.lookup_batch_closed);
+    assert_eq!(
+        manifest.transcript_binding,
+        "ordered_verifying_keys_main_trace_commitments_real_heights"
+    );
+    assert_eq!(manifest.shards, manifest.artifacts.len());
+    let block = manifest.block.expect("block event shard manifest must contain a block index");
+    let private_output_file = manifest
+        .private_output_file
+        .clone()
+        .expect("block event shard manifest must contain its private output file");
+    let _ = safe_artifact_path(manifest_path, &private_output_file, "private_output_file");
+    let shape = Shape {
+        sequence_length: manifest.sequence_length,
+        hidden_size: manifest.hidden_size,
+        num_heads: manifest.num_heads,
+        linear_size: manifest.linear_size,
+    };
+    let manifest_transcript =
+        parse_digest(&manifest.block_transcript_commitment, "block transcript commitment");
+
+    let mut shards = Vec::with_capacity(manifest.artifacts.len());
+    for (expected_index, artifact) in manifest.artifacts.iter().enumerate() {
+        assert_eq!(artifact.index, expected_index, "event shards must be ordered");
+        let (proof, verifying_key) =
+            read_proof_artifacts(manifest_path, &artifact.proof_file, &artifact.verifying_key_file);
+        assert_eq!(proof.shard_proofs.len(), 1, "event shard file must contain one proof");
+        let proof = proof.shard_proofs.into_iter().next().unwrap();
+        let real_heights = proof
+            .opened_values
+            .chips
+            .iter()
+            .map(|(name, values)| {
+                (name.clone(), values.degree.bit_string_evaluation().as_canonical_u32() as usize)
+            })
+            .collect();
+        shards.push(EventShardArtifact {
+            index: expected_index,
+            verifying_key,
+            proof,
+            real_heights,
+        });
+    }
+    let trace_transcript = event_shard_transcript(shape, block, &shards);
+    assert_eq!(
+        trace_transcript, manifest_transcript,
+        "event shard trace transcript differs from the manifest"
+    );
+    let transcript = event_block_transcript(shape, block, trace_transcript);
+
+    let all_chips = Air::verillm_machine().chips().iter().cloned().collect::<BTreeSet<_>>();
+    let expected_beta_seed_dimension =
+        LogUpGkrVerifier::<SP1GlobalContext, StarkSC>::beta_seed_dimension(&all_chips);
+    assert_eq!(
+        manifest.beta_seed_dimension, expected_beta_seed_dimension,
+        "event shard beta seed dimension does not match the machine"
+    );
+    let challenges = derive_event_batch_challenges(&shards, manifest.beta_seed_dimension);
+    let verifier = ShardVerifier::from_basefold_parameters(
+        proof_fri_config(),
+        PROOF_LOG_STACKING_HEIGHT,
+        PROOF_MAX_LOG_ROW_COUNT,
+        Air::verillm_machine(),
+    );
+    let prover = simple_prover(verifier);
+    let mut residual = SP1ExtensionField::zero();
+    for shard in &shards {
+        residual += prover
+            .verify_shard_with_logup_challenges(&shard.verifying_key, &shard.proof, &challenges)
+            .unwrap_or_else(|error| {
+                panic!("event shard {} failed host verification: {error:?}", shard.index)
+            });
+    }
+    assert!(residual.is_zero(), "event shard lookup residuals do not close");
+    println!(
+        "verified event shard batch: block={} shards={} trace={} block_transcript={}",
+        block,
+        shards.len(),
+        digest_hex(&trace_transcript),
+        digest_hex(&transcript)
+    );
+    EventShardBatch {
+        manifest_path: manifest_path.to_owned(),
+        block,
+        shape,
+        trace_transcript,
+        transcript,
+        private_output_file,
+        beta_seed_dimension: manifest.beta_seed_dimension,
+        shards,
+    }
+}
+
 fn host_verify(kind: NodeKind, vk: &StoredVerifyingKey, proof: &StoredProof) {
     let machine = match kind {
         NodeKind::Block => Air::verillm_machine(),
@@ -490,6 +750,52 @@ fn load_child(manifest_path: &Path) -> ChildArtifact {
                 Some(parse_digest(&manifest.verifying_key_commitment, "recursion verifying key")),
             )
         }
+        EVENT_BLOCK_RECURSION_STAGE => {
+            let manifest: EventBlockRecursionManifest = serde_json::from_value(value)
+                .unwrap_or_else(|error| panic!("invalid event block recursion manifest: {error}"));
+            assert_eq!(
+                manifest.version, EVENT_BLOCK_RECURSION_PROTOCOL_VERSION,
+                "unsupported event block recursion protocol"
+            );
+            assert_eq!(manifest.stage, EVENT_BLOCK_RECURSION_STAGE);
+            assert_eq!(manifest.shards, 1, "event block recursion proof must contain one shard");
+            let shape = Shape {
+                sequence_length: manifest.sequence_length,
+                hidden_size: manifest.hidden_size,
+                num_heads: manifest.num_heads,
+                linear_size: manifest.linear_size,
+            };
+            let trace_transcript =
+                parse_digest(&manifest.trace_transcript_commitment, "event block trace transcript");
+            let transcript = event_block_transcript(shape, manifest.block, trace_transcript);
+            assert_eq!(
+                transcript,
+                parse_digest(&manifest.transcript_commitment, "event block transcript"),
+                "event block number or shape differs from its transcript"
+            );
+            let descriptor = NodeDescriptor {
+                kind: NodeKind::Recursion,
+                start_block: manifest.block,
+                end_block: manifest.block + 1,
+                transcript,
+                verifying_key: [SP1Field::zero(); DIGEST_SIZE],
+            };
+            let (proof, vk) = read_proof_artifacts(
+                manifest_path,
+                &manifest.proof_file,
+                &manifest.verifying_key_file,
+            );
+            (
+                descriptor,
+                shape,
+                proof,
+                vk,
+                Some(parse_digest(
+                    &manifest.verifying_key_commitment,
+                    "event block recursion verifying key",
+                )),
+            )
+        }
         other => panic!("unsupported child stage {other:?} in {}", manifest_path.display()),
     };
 
@@ -544,13 +850,11 @@ fn recursive_verifier(kind: NodeKind) -> RecursiveVerifier {
     RecursiveShardVerifier { machine, pcs_verifier, _phantom: PhantomData }
 }
 
-fn verify_child_in_circuit(
+fn observe_vk_variable(
     builder: &mut Builder<AsmConfig>,
-    artifact: &ChildArtifact,
+    challenger: &mut ChallengerVariable,
     vk: &VerifyingKeyVariable,
-    proof: &ProofVariable,
-) -> ([Felt<SP1Field>; DIGEST_SIZE], [Felt<SP1Field>; DIGEST_SIZE]) {
-    let mut challenger = SP1GlobalContext::challenger_variable(builder);
+) {
     challenger.observe(builder, vk.preprocessed_commit);
     challenger.observe_slice(builder, vk.pc_start);
     challenger.observe_slice(builder, vk.initial_global_cumulative_sum.0.x.0);
@@ -560,6 +864,132 @@ fn verify_child_in_circuit(
     for _ in 0..6 {
         challenger.observe(builder, zero);
     }
+}
+
+fn proof_height_felts(
+    builder: &mut Builder<AsmConfig>,
+    proof: &ProofVariable,
+) -> Vec<(String, Felt<SP1Field>)> {
+    let two = SymbolicFelt::from_canonical_u32(2);
+    proof
+        .opened_values
+        .chips
+        .iter()
+        .map(|(name, values)| {
+            let mut height = SymbolicFelt::zero();
+            values.degree.iter().for_each(|bit| {
+                height = *bit + two * height;
+            });
+            (name.clone(), builder.eval(height))
+        })
+        .collect()
+}
+
+fn derive_event_batch_challenges_in_circuit(
+    builder: &mut Builder<AsmConfig>,
+    vks: &[VerifyingKeyVariable],
+    proofs: &[ProofVariable],
+    beta_seed_dimension: usize,
+) -> LogUpGkrChallenges<Ext<SP1Field, SP1ExtensionField>> {
+    assert_eq!(vks.len(), proofs.len());
+    let mut challenger = SP1GlobalContext::challenger_variable(builder);
+    let domain: Felt<SP1Field> =
+        builder.constant(SP1Field::from_canonical_u32(EVENT_SHARD_BATCH_DOMAIN));
+    challenger.observe(builder, domain);
+    let shard_count: Felt<SP1Field> =
+        builder.constant(SP1Field::from_canonical_usize(proofs.len()));
+    challenger.observe(builder, shard_count);
+    for (index, (vk, proof)) in vks.iter().zip(proofs).enumerate() {
+        let index: Felt<SP1Field> = builder.constant(SP1Field::from_canonical_usize(index));
+        challenger.observe(builder, index);
+        observe_vk_variable(builder, &mut challenger, vk);
+        challenger.observe(builder, proof.main_commitment);
+        let heights = proof_height_felts(builder, proof);
+        let height_count: Felt<SP1Field> =
+            builder.constant(SP1Field::from_canonical_usize(heights.len()));
+        challenger.observe(builder, height_count);
+        for (name, height) in heights {
+            let name_len: Felt<SP1Field> =
+                builder.constant(SP1Field::from_canonical_usize(name.len()));
+            challenger.observe(builder, name_len);
+            for byte in name.bytes() {
+                let byte: Felt<SP1Field> = builder.constant(SP1Field::from_canonical_u8(byte));
+                challenger.observe(builder, byte);
+            }
+            challenger.observe(builder, height);
+        }
+    }
+    LogUpGkrChallenges {
+        alpha: challenger.sample_ext(builder),
+        beta_seed: Point::from_iter(
+            (0..beta_seed_dimension).map(|_| challenger.sample_ext(builder)),
+        ),
+        public_values_challenge: challenger.sample_ext(builder),
+    }
+}
+
+fn event_shard_transcript_in_circuit(
+    builder: &mut Builder<AsmConfig>,
+    batch: &EventShardBatch,
+    vks: &[VerifyingKeyVariable],
+    proofs: &[ProofVariable],
+) -> [Felt<SP1Field>; DIGEST_SIZE] {
+    assert_eq!(vks.len(), proofs.len());
+    let mut fields = [
+        EVENT_SHARD_PROTOCOL_VERSION,
+        batch.shape.sequence_length as u32,
+        batch.shape.hidden_size as u32,
+        batch.shape.num_heads as u32,
+        batch.shape.linear_size as u32,
+        batch.block as u32,
+        proofs.len() as u32,
+    ]
+    .map(|value| builder.constant(SP1Field::from_canonical_u32(value)))
+    .to_vec();
+    for (index, (vk, proof)) in vks.iter().zip(proofs).enumerate() {
+        fields.push(builder.constant(SP1Field::from_canonical_usize(index)));
+        fields.extend(vk.hash(builder));
+        fields.extend(proof.main_commitment);
+        let heights = proof_height_felts(builder, proof);
+        fields.push(builder.constant(SP1Field::from_canonical_usize(heights.len())));
+        for (name, height) in heights {
+            fields.push(builder.constant(SP1Field::from_canonical_usize(name.len())));
+            for byte in name.bytes() {
+                fields.push(builder.constant(SP1Field::from_canonical_u8(byte)));
+            }
+            fields.push(height);
+        }
+    }
+    circuit_commit_fields(builder, EVENT_SHARD_TRANSCRIPT_DOMAIN, &fields)
+}
+
+fn event_block_transcript_in_circuit(
+    builder: &mut Builder<AsmConfig>,
+    batch: &EventShardBatch,
+    trace_transcript: [Felt<SP1Field>; DIGEST_SIZE],
+) -> [Felt<SP1Field>; DIGEST_SIZE] {
+    let mut fields = [
+        EVENT_BLOCK_RECURSION_PROTOCOL_VERSION,
+        batch.block as u32,
+        batch.shape.sequence_length as u32,
+        batch.shape.hidden_size as u32,
+        batch.shape.num_heads as u32,
+        batch.shape.linear_size as u32,
+    ]
+    .map(|value| builder.constant(SP1Field::from_canonical_u32(value)))
+    .to_vec();
+    fields.extend(trace_transcript);
+    circuit_commit_fields(builder, EVENT_BLOCK_TRANSCRIPT_DOMAIN, &fields)
+}
+
+fn verify_child_in_circuit(
+    builder: &mut Builder<AsmConfig>,
+    artifact: &ChildArtifact,
+    vk: &VerifyingKeyVariable,
+    proof: &ProofVariable,
+) -> ([Felt<SP1Field>; DIGEST_SIZE], [Felt<SP1Field>; DIGEST_SIZE]) {
+    let mut challenger = SP1GlobalContext::challenger_variable(builder);
+    observe_vk_variable(builder, &mut challenger, vk);
     recursive_verifier(artifact.descriptor.kind).verify_shard(builder, vk, proof, &mut challenger);
 
     let vk_digest = vk.hash(builder);
@@ -657,6 +1087,71 @@ fn build_program(
     (program, witness, expected)
 }
 
+fn build_event_block_program(
+    batch: &EventShardBatch,
+) -> (Arc<RecursionProgram<SP1Field>>, Vec<Block<SP1Field>>) {
+    let mut builder: Builder<AsmConfig> = AsmBuilder::default();
+    let mut vks = Vec::with_capacity(batch.shards.len());
+    let mut proofs = Vec::with_capacity(batch.shards.len());
+    for shard in &batch.shards {
+        vks.push(shard.verifying_key.read(&mut builder));
+        proofs.push(shard.proof.read(&mut builder));
+    }
+
+    let challenges = derive_event_batch_challenges_in_circuit(
+        &mut builder,
+        &vks,
+        &proofs,
+        batch.beta_seed_dimension,
+    );
+    let verifier = recursive_verifier(NodeKind::Block);
+    let mut residual = SymbolicExt::zero();
+    for (vk, proof) in vks.iter().zip(&proofs) {
+        let mut challenger = SP1GlobalContext::challenger_variable(&mut builder);
+        observe_vk_variable(&mut builder, &mut challenger, vk);
+        residual = residual
+            + verifier.verify_shard_with_logup_challenges(
+                &mut builder,
+                vk,
+                proof,
+                &challenges,
+                &mut challenger,
+            );
+    }
+    builder.assert_ext_eq(residual, SymbolicExt::zero());
+
+    let trace_transcript = event_shard_transcript_in_circuit(&mut builder, batch, &vks, &proofs);
+    for (&actual, expected) in trace_transcript.iter().zip(batch.trace_transcript) {
+        builder.assert_felt_eq(actual, expected);
+    }
+    let transcript = event_block_transcript_in_circuit(&mut builder, batch, trace_transcript);
+    for (&actual, expected) in transcript.iter().zip(batch.transcript) {
+        builder.assert_felt_eq(actual, expected);
+    }
+
+    let zero = builder.constant(SP1Field::zero());
+    let mut output_elements = [zero; RECURSIVE_PROOF_NUM_PV_ELTS];
+    let output: &mut RecursionPublicValues<Felt<SP1Field>> =
+        output_elements.as_mut_slice().borrow_mut();
+    output.digest = transcript;
+    builder.commit_public_values_v2(*output);
+
+    let root = builder.into_root_block();
+    println!(
+        "built event block recursion: shards={} ir_ops={}",
+        batch.shards.len(),
+        root.ops.len()
+    );
+    let mut compiler = AsmCompiler::default();
+    let program = Arc::new(compiler.compile_inner(root).validate().unwrap());
+    let mut witness = Vec::new();
+    for shard in &batch.shards {
+        Witnessable::<AsmConfig>::write(&shard.verifying_key, &mut witness);
+        Witnessable::<AsmConfig>::write(&shard.proof, &mut witness);
+    }
+    (program, witness)
+}
+
 fn recursion_stem(start_block: usize, end_block: usize) -> String {
     format!("zkgpt_recursion_b{start_block:02}_b{end_block:02}")
 }
@@ -701,6 +1196,134 @@ fn write_manifest(
     println!("recursion manifest: {}", manifest_path.display());
 }
 
+fn write_event_block_manifest(
+    arguments: &Arguments,
+    batch: &EventShardBatch,
+    proof_path: &Path,
+    vk_path: &Path,
+    vk: &StoredVerifyingKey,
+) {
+    let stem = format!("zkgpt_block_{:02}_shard_recursion", batch.block);
+    let manifest_path = arguments.output_dir.join(format!("{stem}.manifest.json"));
+    let source_private_output =
+        safe_artifact_path(&batch.manifest_path, &batch.private_output_file, "private_output_file");
+    let persisted_private_output = arguments.output_dir.join(&batch.private_output_file);
+    if source_private_output != persisted_private_output {
+        fs::copy(&source_private_output, &persisted_private_output).unwrap_or_else(|error| {
+            panic!(
+                "failed to copy {} to {}: {error}",
+                source_private_output.display(),
+                persisted_private_output.display()
+            )
+        });
+    }
+    let manifest = serde_json::json!({
+        "version": EVENT_BLOCK_RECURSION_PROTOCOL_VERSION,
+        "stage": EVENT_BLOCK_RECURSION_STAGE,
+        "block": batch.block,
+        "sequence_length": batch.shape.sequence_length,
+        "hidden_size": batch.shape.hidden_size,
+        "num_heads": batch.shape.num_heads,
+        "linear_size": batch.shape.linear_size,
+        "shards": 1,
+        "source_event_shards": batch.shards.len(),
+        "source_manifest": batch.manifest_path.display().to_string(),
+        "private_output_file": batch.private_output_file,
+        "trace_transcript_commitment": digest_hex(&batch.trace_transcript),
+        "transcript_commitment": digest_hex(&batch.transcript),
+        "verifying_key_commitment": digest_hex(&vk.hash_koalabear()),
+        "proof_file": proof_path.file_name().unwrap().to_string_lossy(),
+        "proof_bytes": fs::metadata(proof_path).unwrap().len(),
+        "verifying_key_file": vk_path.file_name().unwrap().to_string_lossy(),
+        "verifying_key_bytes": fs::metadata(vk_path).unwrap().len(),
+    });
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap())
+        .unwrap_or_else(|error| panic!("failed to write {}: {error}", manifest_path.display()));
+    println!("event block recursion manifest: {}", manifest_path.display());
+}
+
+async fn run_event_shard_batch(arguments: &Arguments, manifest_path: &Path) {
+    let started = Instant::now();
+    let batch = load_event_shard_batch(manifest_path);
+    if arguments.mode == Mode::Check {
+        println!("event shard batch host verification completed");
+        return;
+    }
+
+    let build_started = Instant::now();
+    let (program, witness) = build_event_block_program(&batch);
+    println!(
+        "compiled event block recursion: elapsed={:.3}s",
+        build_started.elapsed().as_secs_f64()
+    );
+    if arguments.mode == Mode::Build {
+        return;
+    }
+
+    let execute_started = Instant::now();
+    let mut executor = Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(
+        program.clone(),
+        inner_perm(),
+    );
+    executor.witness_stream = witness.into();
+    executor.run().expect("valid event block recursion witness must execute");
+    assert_eq!(executor.record.public_values.digest, batch.transcript);
+    println!(
+        "executed event block recursion: elapsed={:.3}s transcript={}",
+        execute_started.elapsed().as_secs_f64(),
+        digest_hex(&batch.transcript)
+    );
+    if arguments.mode == Mode::Execute {
+        return;
+    }
+
+    let record = std::mem::take(&mut executor.record);
+    drop(executor);
+    let machine = Air::compress_machine();
+    let max_rows = 1usize << PROOF_MAX_LOG_ROW_COUNT;
+    for chip in machine.chips() {
+        if chip.included(&record) {
+            let rows = chip.num_rows(&record).unwrap_or_default();
+            println!("trace: {:<24} rows={rows}", chip.name());
+            assert!(rows <= max_rows, "{} exceeds the proof row limit", chip.name());
+        }
+    }
+    let verifier = ShardVerifier::from_basefold_parameters(
+        proof_fri_config(),
+        PROOF_LOG_STACKING_HEIGHT,
+        PROOF_MAX_LOG_ROW_COUNT,
+        machine,
+    );
+    let prover = simple_prover(verifier);
+    let shape = prover.shape_from_record(&record).expect("event block recursion has no shape");
+    println!("event block recursion proof shape: {shape:?}");
+
+    let setup_started = Instant::now();
+    let (pk, vk) = prover.setup(program).await;
+    println!("recursion setup: elapsed={:.3}s", setup_started.elapsed().as_secs_f64());
+    let pk = unsafe { pk.into_inner() };
+    let prove_started = Instant::now();
+    let shard_proof = prover.prove_shard(pk, record).await;
+    let proof = MachineProof::from(vec![shard_proof]);
+    println!("recursion proof generated: elapsed={:.3}s", prove_started.elapsed().as_secs_f64());
+    prover.verify(&vk, &proof).expect("event block recursion proof must verify");
+
+    fs::create_dir_all(&arguments.output_dir).unwrap_or_else(|error| {
+        panic!("failed to create {}: {error}", arguments.output_dir.display())
+    });
+    let stem = format!("zkgpt_block_{:02}_shard_recursion", batch.block);
+    let proof_path = arguments.output_dir.join(format!("{stem}.proof.bin"));
+    let vk_path = arguments.output_dir.join(format!("{stem}.vk.bin"));
+    bincode::serialize_into(File::create(&proof_path).unwrap(), &proof).unwrap();
+    bincode::serialize_into(File::create(&vk_path).unwrap(), &vk).unwrap();
+    write_event_block_manifest(arguments, &batch, &proof_path, &vk_path, &vk);
+    println!(
+        "event block recursion completed: elapsed={:.3}s proof={} bytes",
+        started.elapsed().as_secs_f64(),
+        fs::metadata(proof_path).unwrap().len()
+    );
+}
+
 async fn run(arguments: Arguments) {
     let started = Instant::now();
     if let Some(manifest) = &arguments.verify_manifest {
@@ -717,6 +1340,10 @@ async fn run(arguments: Arguments) {
             digest_hex(&artifact.descriptor.transcript),
             digest_hex(&artifact.descriptor.verifying_key)
         );
+        return;
+    }
+    if let Some(manifest) = &arguments.event_shard_manifest {
+        run_event_shard_batch(&arguments, manifest).await;
         return;
     }
     let left = load_child(
@@ -852,6 +1479,18 @@ mod tests {
         let expected = aggregate_transcript(shape, &left, &right);
         right.kind = NodeKind::Recursion;
         assert_ne!(expected, aggregate_transcript(shape, &left, &right));
+    }
+
+    #[test]
+    fn event_block_transcript_binds_block_and_shape() {
+        let shape = Shape::default();
+        let trace = digest(300);
+        let expected = event_block_transcript(shape, 0, trace);
+        assert_ne!(expected, event_block_transcript(shape, 1, trace));
+        assert_ne!(
+            expected,
+            event_block_transcript(Shape { sequence_length: 1, ..shape }, 0, trace)
+        );
     }
 
     #[test]

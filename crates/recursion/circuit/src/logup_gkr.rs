@@ -6,8 +6,8 @@ use std::{collections::BTreeSet, marker::PhantomData, ops::Deref};
 use slop_algebra::AbstractField;
 use slop_multilinear::{full_geq, Mle, MleEval, Point};
 use sp1_hypercube::{
-    air::MachineAir, Chip, ChipEvaluation, LogUpEvaluations, LogUpGkrOutput, LogupGkrProof,
-    LogupGkrRoundProof,
+    air::MachineAir, Chip, ChipEvaluation, LogUpEvaluations, LogUpGkrChallenges, LogUpGkrOutput,
+    LogupGkrProof, LogupGkrRoundProof,
 };
 use sp1_primitives::{SP1ExtensionField, SP1Field};
 use sp1_recursion_compiler::ir::Builder;
@@ -71,6 +71,56 @@ where
         public_values: &[Felt<SP1Field>],
         challenger: &mut SC::FriChallengerVariable,
     ) {
+        Self::verify_logup_gkr_inner(
+            builder,
+            shard_chips,
+            degrees,
+            max_log_row_count,
+            proof,
+            public_values,
+            None,
+            challenger,
+        );
+    }
+
+    /// Verify one shard using lookup challenges shared by a committed batch and return its local
+    /// lookup residual. The parent circuit must sum every residual in the batch and constrain the
+    /// result to zero.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_logup_gkr_with_challenges(
+        builder: &mut Builder<C>,
+        shard_chips: &BTreeSet<Chip<SP1Field, A>>,
+        degrees: &[Point<Felt<SP1Field>>],
+        max_log_row_count: usize,
+        proof: &LogupGkrProof<Felt<SP1Field>, Ext<SP1Field, SP1ExtensionField>>,
+        public_values: &[Felt<SP1Field>],
+        challenges: &LogUpGkrChallenges<Ext<SP1Field, SP1ExtensionField>>,
+        challenger: &mut SC::FriChallengerVariable,
+    ) -> SymbolicExt<SP1Field, SP1ExtensionField> {
+        Self::verify_logup_gkr_inner(
+            builder,
+            shard_chips,
+            degrees,
+            max_log_row_count,
+            proof,
+            public_values,
+            Some(challenges),
+            challenger,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
+    fn verify_logup_gkr_inner(
+        builder: &mut Builder<C>,
+        shard_chips: &BTreeSet<Chip<SP1Field, A>>,
+        degrees: &[Point<Felt<SP1Field>>],
+        max_log_row_count: usize,
+        proof: &LogupGkrProof<Felt<SP1Field>, Ext<SP1Field, SP1ExtensionField>>,
+        public_values: &[Felt<SP1Field>],
+        shared_challenges: Option<&LogUpGkrChallenges<Ext<SP1Field, SP1ExtensionField>>>,
+        challenger: &mut SC::FriChallengerVariable,
+    ) -> SymbolicExt<SP1Field, SP1ExtensionField> {
         let LogupGkrProof { circuit_output, round_proofs, logup_evaluations, witness } = proof;
         let LogUpGkrOutput { numerator, denominator } = circuit_output;
 
@@ -78,8 +128,6 @@ where
         // `GKR_GRINDING_BITS` zeroes at the beginning).
         challenger.check_witness(builder, GKR_GRINDING_BITS, *witness);
 
-        // Sample the permutation challenges.
-        let alpha = challenger.sample_ext(builder);
         let max_interaction_arity = shard_chips
             .iter()
             .flat_map(|c| c.sends().iter().chain(c.receives().iter()))
@@ -87,10 +135,25 @@ where
             .max()
             .unwrap();
         let beta_seed_dim = max_interaction_arity.next_power_of_two().ilog2();
-        let beta_seed =
-            Point::from_iter((0..beta_seed_dim).map(|_| challenger.sample_ext(builder)));
-        // Sample the public value challenge.
-        let pv_challenge = challenger.sample_ext(builder);
+        let (alpha, beta_seed, pv_challenge) = if let Some(challenges) = shared_challenges {
+            assert_eq!(
+                challenges.beta_seed.dimension(),
+                beta_seed_dim as usize,
+                "invalid shared recursive LogUp beta seed dimension"
+            );
+            challenger.observe_ext_element(builder, challenges.alpha);
+            for beta in challenges.beta_seed.iter() {
+                challenger.observe_ext_element(builder, *beta);
+            }
+            challenger.observe_ext_element(builder, challenges.public_values_challenge);
+            (challenges.alpha, challenges.beta_seed.clone(), challenges.public_values_challenge)
+        } else {
+            (
+                challenger.sample_ext(builder),
+                Point::from_iter((0..beta_seed_dim).map(|_| challenger.sample_ext(builder))),
+                challenger.sample_ext(builder),
+            )
+        };
 
         builder.cycle_tracker_v2_enter("verify-public-values");
         let cumulative_sum = -RecursiveLogUpGkrVerifier::<C, SC, A>::verify_public_values(
@@ -114,8 +177,10 @@ where
             .zip_eq(denominator.guts().as_slice().iter())
             .map(|(n, d)| *n / *d)
             .sum::<SymbolicExt<SP1Field, SP1ExtensionField>>();
-        // Assert that the cumulative sum matches the claimed one.
-        builder.assert_ext_eq(output_cumulative_sum, cumulative_sum);
+        let local_residual = output_cumulative_sum - cumulative_sum;
+        if shared_challenges.is_none() {
+            builder.assert_ext_eq(local_residual, SymbolicExt::zero());
+        }
 
         // Calculate the interaction number.
         let num_of_interactions =
@@ -278,6 +343,7 @@ where
 
         builder.assert_ext_eq(numerator_eval, expected_numerator_eval);
         builder.assert_ext_eq(denominator_eval, expected_denominator_eval);
+        local_residual
     }
 }
 

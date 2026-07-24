@@ -104,6 +104,7 @@ impl<F: PrimeField32> MachineAir<F> for Bf16DivChip {
             let cols: &mut Bf16DivPreprocessedCols<F> = row.borrow_mut();
             *cols = Bf16DivPreprocessedCols { is_real: F::one(), addrs, mult };
         };
+        let active = program.event_ranges().bf16_div;
         for analyzed in program.inner.iter() {
             let (offset, instruction) = match analyzed.inner() {
                 Instruction::Bf16Div(instruction) => (analyzed.offset(), *instruction),
@@ -112,7 +113,10 @@ impl<F: PrimeField32> MachineAir<F> for Bf16DivChip {
                 }
                 _ => continue,
             };
-            let start = offset * BF16_DIV_PREPROCESSED_COLS;
+            if offset < active.start || offset >= active.end {
+                continue;
+            }
+            let start = (offset - active.start) * BF16_DIV_PREPROCESSED_COLS;
             populate(&mut values[start..start + BF16_DIV_PREPROCESSED_COLS], instruction);
         }
     }

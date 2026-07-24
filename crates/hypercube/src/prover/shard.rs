@@ -31,8 +31,8 @@ use crate::{
     },
     septic_digest::SepticDigest,
     AirOpenedValues, Chip, ChipEvaluation, ChipOpenedValues, ChipStatistics,
-    ConstraintSumcheckFolder, GkrProverImpl, LogUpEvaluations, Machine, MachineVerifyingKey,
-    ShardContext, ShardOpenedValues, ShardProof, UntrustedConfig,
+    ConstraintSumcheckFolder, GkrProverImpl, LogUpEvaluations, LogUpGkrChallenges, Machine,
+    MachineVerifyingKey, ShardContext, ShardOpenedValues, ShardProof, UntrustedConfig,
 };
 
 use super::{TraceGenerator, Traces};
@@ -75,6 +75,25 @@ pub trait AirProver<GC: IopCtx, SC: ShardContext<GC>>: 'static + Send + Sync + S
         record: Record<GC, SC>,
         prover_permits: ProverSemaphore,
     ) -> impl Future<Output = (ShardProof<GC, PcsProof<GC, SC>>, ProverPermit)> + Send;
+
+    /// Prove one shard using lookup challenges shared by a committed batch.
+    fn prove_shard_with_pk_and_logup_challenges(
+        &self,
+        pk: Arc<ProvingKey<GC, SC, Self>>,
+        record: Record<GC, SC>,
+        challenges: LogUpGkrChallenges<GC::EF>,
+        prover_permits: ProverSemaphore,
+    ) -> impl Future<Output = (ShardProof<GC, PcsProof<GC, SC>>, ProverPermit)> + Send;
+
+    /// Generate and commit a shard's main traces without producing its proof.
+    ///
+    /// This is the first phase of a batched lookup proof. The caller derives common lookup
+    /// challenges only after collecting every returned commitment and real trace height.
+    fn commit_shard_main_traces(
+        &self,
+        record: Record<GC, SC>,
+        prover_permits: ProverSemaphore,
+    ) -> impl Future<Output = (GC::Digest, Vec<(String, usize)>, ProverPermit)> + Send;
     /// Get all the chips in the machine.
     fn all_chips(&self) -> &[Chip<GC::F, SC::Air>] {
         self.machine().chips()
@@ -358,6 +377,57 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>> A
         })
         .await
         .unwrap()
+    }
+
+    async fn prove_shard_with_pk_and_logup_challenges(
+        &self,
+        pk: Arc<ProvingKey<GC, SC, Self>>,
+        record: Record<GC, SC>,
+        challenges: LogUpGkrChallenges<GC::EF>,
+        prover_permits: ProverSemaphore,
+    ) -> (ShardProof<GC, PcsProof<GC, SC>>, ProverPermit) {
+        let mut challenger = GC::default_challenger();
+        pk.vk.observe_into(&mut challenger);
+        let main_trace_data = self
+            .inner
+            .trace_generator
+            .generate_main_traces(record, self.max_log_row_count(), prover_permits)
+            .instrument(tracing::debug_span!("generate batched main traces"))
+            .await;
+
+        let shard_data = ShardData { pk, main_trace_data };
+        let prover = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _span = tracing::debug_span!("prove batched shard with data").entered();
+            prover.prove_shard_with_data_and_logup_challenges(shard_data, challenger, &challenges)
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn commit_shard_main_traces(
+        &self,
+        record: Record<GC, SC>,
+        prover_permits: ProverSemaphore,
+    ) -> (GC::Digest, Vec<(String, usize)>, ProverPermit) {
+        let main_trace_data = self
+            .inner
+            .trace_generator
+            .generate_main_traces(record, self.max_log_row_count(), prover_permits)
+            .instrument(tracing::debug_span!("generate main traces for batch commitment"))
+            .await;
+        let MainTraceData { traces, shard_chips, permit, .. } = main_trace_data;
+        let real_heights = shard_chips
+            .iter()
+            .map(|chip| {
+                (
+                    chip.name().to_string(),
+                    traces.get(chip.name()).expect("missing shard trace").num_real_entries(),
+                )
+            })
+            .collect();
+        let (commitment, _) = self.commit_traces(&traces);
+        (commitment, real_heights, permit)
     }
 
     async fn preprocessed_table_heights(
@@ -650,7 +720,29 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
     pub fn prove_shard_with_data(
         &self,
         data: ShardData<GC, SC, C>,
+        challenger: GC::Challenger,
+    ) -> (ShardProof<GC, PcsProof<GC, SC>>, ProverPermit) {
+        self.prove_shard_with_data_inner(data, challenger, None)
+    }
+
+    /// Generate a shard proof whose local lookup residual is closed by the rest of a committed
+    /// batch rather than by this shard alone.
+    pub fn prove_shard_with_data_and_logup_challenges(
+        &self,
+        data: ShardData<GC, SC, C>,
+        challenger: GC::Challenger,
+        challenges: &LogUpGkrChallenges<GC::EF>,
+    ) -> (ShardProof<GC, PcsProof<GC, SC>>, ProverPermit) {
+        self.prove_shard_with_data_inner(data, challenger, Some(challenges))
+    }
+
+    #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_lines)]
+    fn prove_shard_with_data_inner(
+        &self,
+        data: ShardData<GC, SC, C>,
         mut challenger: GC::Challenger,
+        shared_challenges: Option<&LogUpGkrChallenges<GC::EF>>,
     ) -> (ShardProof<GC, PcsProof<GC, SC>>, ProverPermit) {
         let ShardData { pk, main_trace_data } = data;
         let MainTraceData { traces, public_values, shard_chips, permit } = main_trace_data;
@@ -695,13 +787,24 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
 
         let logup_gkr_proof = {
             let _span = tracing::debug_span!("logup gkr proof").entered();
-            self.inner.logup_gkr_prover.prove_logup_gkr(
-                &shard_chips,
-                &pk.preprocessed_data.preprocessed_traces,
-                &traces,
-                public_values.clone(),
-                &mut challenger,
-            )
+            if let Some(challenges) = shared_challenges {
+                self.inner.logup_gkr_prover.prove_logup_gkr_with_challenges(
+                    &shard_chips,
+                    &pk.preprocessed_data.preprocessed_traces,
+                    &traces,
+                    public_values.clone(),
+                    challenges,
+                    &mut challenger,
+                )
+            } else {
+                self.inner.logup_gkr_prover.prove_logup_gkr(
+                    &shard_chips,
+                    &pk.preprocessed_data.preprocessed_traces,
+                    &traces,
+                    public_values.clone(),
+                    &mut challenger,
+                )
+            }
         };
         // Get the challenge for batching constraints.
         let batching_challenge = challenger.sample_ext_element::<GC::EF>();

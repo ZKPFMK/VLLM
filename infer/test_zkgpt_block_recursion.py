@@ -41,7 +41,7 @@ class BlockRecursionRunnerTests(unittest.TestCase):
                 line for line in lines if "/zkgpt_block_recursion " in line
             ]
             self.assertEqual(len(leaf_commands), 12)
-            self.assertEqual(len(join_commands), 11)
+            self.assertEqual(len(join_commands), 23)
             self.assertIn("12 -> 6 -> 3 -> 2 -> 1", lines[-1])
 
     def test_later_block_consumes_the_previous_directory(self) -> None:
@@ -49,6 +49,7 @@ class BlockRecursionRunnerTests(unittest.TestCase):
             Path("/proofs"), Path("/model"), Path("/bin"), 7
         )
         self.assertEqual(command[0], "/bin/zkgpt_like")
+        self.assertIn("--prove-shards", command)
         self.assertIn("/proofs/blocks/block-06", command)
         self.assertIn("/proofs/blocks/block-07", command)
 

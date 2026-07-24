@@ -60,30 +60,7 @@ impl<F: PrimeField32, const VAR_EVENTS_PER_ROW: usize> MachineAir<F>
     }
 
     fn preprocessed_num_rows(&self, program: &Self::Program) -> Option<usize> {
-        let instrs_len = program
-            .inner
-            .iter()
-            // .par_bridge() // Using `rayon` here provides a big speedup. TODO put rayon back
-            .flat_map(|instruction| match instruction.inner() {
-                Instruction::Hint(HintInstr { output_addrs_mults })
-                | Instruction::HintBits(HintBitsInstr {
-                    output_addrs_mults,
-                    input_addr: _, // No receive interaction for the hint operation
-                }) => output_addrs_mults.iter().collect(),
-                Instruction::HintExt2Felts(HintExt2FeltsInstr {
-                    output_addrs_mults,
-                    input_addr: _, // No receive interaction for the hint operation
-                }) => output_addrs_mults.iter().collect(),
-                Instruction::HintAddCurve(instr) => {
-                    let HintAddCurveInstr {
-                    output_x_addrs_mults,
-                    output_y_addrs_mults, .. // No receive interaction for the hint operation
-                } = instr.as_ref();
-                    output_x_addrs_mults.iter().chain(output_y_addrs_mults.iter()).collect()
-                }
-                _ => vec![],
-            })
-            .count();
+        let instrs_len = program.event_counts.mem_var_events;
         self.preprocessed_num_rows_with_instrs_len(program, instrs_len)
     }
 
@@ -102,28 +79,40 @@ impl<F: PrimeField32, const VAR_EVENTS_PER_ROW: usize> MachineAir<F>
         buffer: &mut [MaybeUninit<F>],
     ) {
         // Allocating an intermediate `Vec` is faster.
+        let active = program.event_ranges().mem_var;
         let accesses = program
             .inner
             .iter()
             // .par_bridge() // Using `rayon` here provides a big speedup. TODO put rayon back
-            .flat_map(|instruction| match instruction.inner() {
-                Instruction::Hint(HintInstr { output_addrs_mults })
-                | Instruction::HintBits(HintBitsInstr {
-                    output_addrs_mults,
-                    input_addr: _, // No receive interaction for the hint operation
-                }) => output_addrs_mults.iter().collect(),
-                Instruction::HintExt2Felts(HintExt2FeltsInstr {
-                    output_addrs_mults,
-                    input_addr: _, // No receive interaction for the hint operation
-                }) => output_addrs_mults.iter().collect(),
-                Instruction::HintAddCurve(instr) => {
-                    let HintAddCurveInstr {
+            .flat_map(|instruction| {
+                let all = match instruction.inner() {
+                    Instruction::Hint(HintInstr { output_addrs_mults })
+                    | Instruction::HintBits(HintBitsInstr {
+                        output_addrs_mults,
+                        input_addr: _, // No receive interaction for the hint operation
+                    }) => output_addrs_mults.iter().collect(),
+                    Instruction::HintExt2Felts(HintExt2FeltsInstr {
+                        output_addrs_mults,
+                        input_addr: _, // No receive interaction for the hint operation
+                    }) => output_addrs_mults.iter().collect(),
+                    Instruction::HintAddCurve(instr) => {
+                        let HintAddCurveInstr {
                         output_x_addrs_mults,
                         output_y_addrs_mults, .. // No receive interaction for the hint operation
                     } = instr.as_ref();
-                    output_x_addrs_mults.iter().chain(output_y_addrs_mults.iter()).collect()
+                        output_x_addrs_mults.iter().chain(output_y_addrs_mults.iter()).collect()
+                    }
+                    _ => vec![],
+                };
+                let instruction_start = instruction.offset();
+                let instruction_end = instruction_start + all.len();
+                let start = instruction_start.max(active.start);
+                let end = instruction_end.min(active.end);
+                if start >= end {
+                    Vec::new()
+                } else {
+                    all[start - instruction_start..end - instruction_start].to_vec()
                 }
-                _ => vec![],
             })
             .collect::<Vec<_>>();
 

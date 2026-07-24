@@ -9,7 +9,9 @@ pub use add_sub::{
     NUM_BF16_ADD_SUB_EVENTS_PER_ROW,
 };
 pub use div::{Bf16DivChip, BF16_DIV_COLS, BF16_DIV_PREPROCESSED_COLS};
-pub use lookup::Bf16LookupChip;
+pub use lookup::{
+    Bf16LookupChip, BF16_LOOKUP_COLS, BF16_LOOKUP_PREPROCESSED_COLS, BF16_LOOKUP_ROWS,
+};
 pub use mul::{
     Bf16MulChip, BF16_MUL_COLS, BF16_MUL_PREPROCESSED_COLS, NUM_BF16_MUL_EVENTS_PER_ROW,
 };

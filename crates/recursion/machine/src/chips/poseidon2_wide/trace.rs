@@ -92,11 +92,7 @@ impl<F: PrimeField32, const DEGREE: usize> MachineAir<F> for Poseidon2WideChip<D
     }
 
     fn preprocessed_num_rows(&self, program: &Self::Program) -> Option<usize> {
-        let instrs_len = program
-            .inner
-            .iter()
-            .filter(|instruction| matches!(instruction.inner(), Instruction::Poseidon2(_)))
-            .count();
+        let instrs_len = program.event_counts.poseidon2_wide_events;
         self.preprocessed_num_rows_with_instrs_len(program, instrs_len)
     }
 
@@ -121,11 +117,17 @@ impl<F: PrimeField32, const DEGREE: usize> MachineAir<F> for Poseidon2WideChip<D
         );
 
         // Allocating an intermediate `Vec` is faster.
+        let active = program.event_ranges().poseidon2_wide;
         let instrs = program
             .inner
             .iter() // Faster than using `rayon` for some reason. Maybe vectorization?
             .filter_map(|instruction| match instruction.inner() {
-                Instruction::Poseidon2(instr) => Some(instr.as_ref()),
+                Instruction::Poseidon2(instr)
+                    if active.start <= instruction.offset()
+                        && instruction.offset() < active.end =>
+                {
+                    Some(instr.as_ref())
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
