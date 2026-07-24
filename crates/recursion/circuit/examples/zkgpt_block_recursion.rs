@@ -579,10 +579,19 @@ fn validate_event_shard_coverage(
     shards: &[EventShardArtifact],
 ) {
     assert!(!shards.is_empty(), "event shard batch cannot be empty");
-    let mut expected = RecursionEventRanges::default();
-    for (index, shard) in shards.iter().enumerate() {
+    let ranges = shards.iter().enumerate().map(|(index, shard)| {
         assert_eq!(shard.index, index, "event shards must be ordered");
-        let ranges = shard.ranges;
+        shard.ranges
+    });
+    validate_event_range_coverage(global_counts, ranges);
+}
+
+fn validate_event_range_coverage(
+    global_counts: RecursionAirEventCount,
+    ranges: impl IntoIterator<Item = RecursionEventRanges>,
+) {
+    let mut expected = RecursionEventRanges::default();
+    for ranges in ranges {
         assert_eq!(ranges.mem_const.start, expected.mem_const.end);
         assert_eq!(ranges.mem_var.start, expected.mem_var.end);
         assert_eq!(ranges.base_alu.start, expected.base_alu.end);
@@ -592,7 +601,15 @@ fn validate_event_shard_coverage(
         assert_eq!(ranges.bf16_div.start, expected.bf16_div.end);
         assert_eq!(ranges.bf16_add_sub.start, expected.bf16_add_sub.end);
         assert_eq!(ranges.commit_pv_hash.start, expected.commit_pv_hash.end);
-        expected = ranges;
+        expected.mem_const.end = ranges.mem_const.end;
+        expected.mem_var.end = ranges.mem_var.end;
+        expected.base_alu.end = ranges.base_alu.end;
+        expected.poseidon2_wide.end = ranges.poseidon2_wide.end;
+        expected.bf16_mul.end = ranges.bf16_mul.end;
+        expected.bf16_unary.end = ranges.bf16_unary.end;
+        expected.bf16_div.end = ranges.bf16_div.end;
+        expected.bf16_add_sub.end = ranges.bf16_add_sub.end;
+        expected.commit_pv_hash.end = ranges.commit_pv_hash.end;
     }
     assert_eq!(
         expected,
@@ -1592,6 +1609,28 @@ mod tests {
             expected,
             event_block_transcript(Shape { sequence_length: 1, ..shape }, 0, trace)
         );
+    }
+
+    #[test]
+    fn event_ranges_accept_multiple_contiguous_shards() {
+        let global_counts = RecursionAirEventCount {
+            mem_const_events: 5,
+            bf16_mul_events: 7,
+            ..RecursionAirEventCount::default()
+        };
+        let ranges = [
+            RecursionEventRanges {
+                mem_const: EventRange { start: 0, end: 2 },
+                bf16_mul: EventRange { start: 0, end: 3 },
+                ..RecursionEventRanges::default()
+            },
+            RecursionEventRanges {
+                mem_const: EventRange { start: 2, end: 5 },
+                bf16_mul: EventRange { start: 3, end: 7 },
+                ..RecursionEventRanges::default()
+            },
+        ];
+        validate_event_range_coverage(global_counts, ranges);
     }
 
     #[test]
