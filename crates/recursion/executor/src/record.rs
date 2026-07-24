@@ -460,7 +460,7 @@ impl<F> AddAssign<&Instruction<F>> for RecursionAirEventCount {
             }
             Instruction::Bf16MeanBatch(instruction) => {
                 self.bf16_add_sub_events += instruction.add_sub_count();
-                self.bf16_div_events += 1;
+                self.bf16_mul_events += 1;
             }
             Instruction::Hint(HintInstr { output_addrs_mults })
             | Instruction::HintBits(HintBitsInstr {

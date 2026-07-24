@@ -156,6 +156,17 @@ impl<F: PrimeField32> MachineAir<F> for Bf16MulChip {
                         },
                     );
                 }
+                Instruction::Bf16MeanBatch(batch) => {
+                    let offset = analyzed.secondary_offset();
+                    if offset < active.start || offset >= active.end {
+                        continue;
+                    }
+                    let start = (offset - active.start) * BF16_MUL_ACCESS_COLS;
+                    populate(
+                        &mut values[start..start + BF16_MUL_ACCESS_COLS],
+                        &batch.mul_instruction(),
+                    );
+                }
                 _ => {}
             }
         }
@@ -309,12 +320,12 @@ where
 mod tests {
     use std::sync::Arc;
 
-    use slop_algebra::extension::BinomialExtensionField;
+    use slop_algebra::{extension::BinomialExtensionField, AbstractField};
     use sp1_hypercube::inner_perm;
     use sp1_primitives::{SP1DiffusionMatrix, SP1Field};
     use sp1_recursion_executor::{
-        instruction as instr, linear_program, Bf16CircuitValueInt, Bf16MulWitness, Block, Executor,
-        Instruction, MemAccessKind, D,
+        instruction as instr, linear_program, Address, Bf16CircuitValueInt, Bf16MeanBatchInstr,
+        Bf16MulWitness, Block, Executor, Instruction, MemAccessKind, D,
     };
 
     use crate::{machine::RecursionAir, test::run_test_recursion};
@@ -400,6 +411,44 @@ mod tests {
         );
 
         let program = linear_program(instructions).unwrap();
+        let mut executor = Executor::<
+            SP1Field,
+            BinomialExtensionField<SP1Field, D>,
+            SP1DiffusionMatrix,
+        >::new(Arc::new(program.clone()), inner_perm());
+        executor.witness_stream = Vec::<Block<SP1Field>>::new().into();
+        executor.run().unwrap();
+
+        run_test_recursion(vec![executor.record], A::verillm_machine(), program).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prove_bf16_mean_with_precomputed_reciprocal() {
+        type A = RecursionAir<SP1Field, 3, 2>;
+
+        // mean([1, 3]) = (1 + 3) * 0.5 = 2. The atomic instruction emits one addition
+        // event followed by one multiplication event and no division event.
+        let instructions = vec![
+            instr::mem(MemAccessKind::Write, 1, 0, 0x3f80),
+            instr::mem(MemAccessKind::Write, 1, 1, 0x4040),
+            instr::mem(MemAccessKind::Write, 1, 3, 0x3f00),
+            Instruction::Bf16MeanBatch(Box::new(Bf16MeanBatchInstr {
+                value_addrs: [
+                    Address(SP1Field::from_canonical_u32(0)),
+                    Address(SP1Field::from_canonical_u32(1)),
+                ]
+                .into(),
+                first_destination: Address(SP1Field::from_canonical_u32(2)),
+                output_mult: SP1Field::one(),
+            })),
+            instr::mem(MemAccessKind::Read, 1, 4, 0x4000),
+        ];
+
+        let program = linear_program(instructions).unwrap();
+        assert_eq!(program.event_counts.bf16_add_sub_events, 1);
+        assert_eq!(program.event_counts.bf16_mul_events, 1);
+        assert_eq!(program.event_counts.bf16_div_events, 0);
+
         let mut executor = Executor::<
             SP1Field,
             BinomialExtensionField<SP1Field, D>,

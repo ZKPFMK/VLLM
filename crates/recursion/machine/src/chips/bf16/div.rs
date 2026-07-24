@@ -108,9 +108,6 @@ impl<F: PrimeField32> MachineAir<F> for Bf16DivChip {
         for analyzed in program.inner.iter() {
             let (offset, instruction) = match analyzed.inner() {
                 Instruction::Bf16Div(instruction) => (analyzed.offset(), *instruction),
-                Instruction::Bf16MeanBatch(batch) => {
-                    (analyzed.secondary_offset(), batch.div_instruction())
-                }
                 _ => continue,
             };
             if offset < active.start || offset >= active.end {

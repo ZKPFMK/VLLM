@@ -146,9 +146,9 @@ fn main() {
         executor.record.bf16_mul_events.len(),
         executor.record.bf16_div_events.len(),
     );
-    let circuit_mean_raw = executor.record.bf16_div_events[0].output.raw.as_canonical_u32() as u16;
+    let circuit_mean_raw = executor.record.bf16_mul_events[0].output.raw.as_canonical_u32() as u16;
     let circuit_variance_raw =
-        executor.record.bf16_div_events[1].output.raw.as_canonical_u32() as u16;
+        executor.record.bf16_mul_events[1].output.raw.as_canonical_u32() as u16;
     let circuit_variance_epsilon_raw =
         executor.record.bf16_add_sub_events[2302].output.raw.as_canonical_u32() as u16;
     let circuit_inverse_std_raw =

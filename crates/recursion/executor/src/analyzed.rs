@@ -113,8 +113,8 @@ impl<F> RawProgram<Instruction<F>> {
                                         &mut counts.bf16_add_sub_events,
                                         instr.add_sub_count(),
                                     );
-                                    let div_offset = incr(&mut counts.bf16_div_events, 1);
-                                    (add_sub_offset, div_offset)
+                                    let mul_offset = incr(&mut counts.bf16_mul_events, 1);
+                                    (add_sub_offset, mul_offset)
                                 }
                                 Instruction::Hint(HintInstr { output_addrs_mults })
                                 | Instruction::HintBits(HintBitsInstr {

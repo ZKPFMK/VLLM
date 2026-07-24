@@ -100,7 +100,7 @@ impl<F: AbstractField + Copy> Instruction<F> {
             Instruction::Bf16MeanBatch(ref instr) => {
                 let mut inputs = SmallVec::with_capacity(instr.value_addrs.len() + 1);
                 inputs.extend_from_slice(&instr.value_addrs);
-                inputs.push(instr.divisor_address());
+                inputs.push(instr.reciprocal_address());
                 (inputs, svec![instr.output_address()])
             }
             Instruction::HintBits(HintBitsInstr { ref output_addrs_mults, input_addr }) => {

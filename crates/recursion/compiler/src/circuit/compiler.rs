@@ -559,12 +559,12 @@ where
         let destination_count =
             op.values.len().checked_add(1).expect("BF16 mean destination count overflow");
         let first_destination = self.alloc_range(destination_count);
-        let divisor_addr = Address(
+        let reciprocal_addr = Address(
             first_destination.0 + SP1Field::from_canonical_usize(op.values.len().saturating_sub(1)),
         );
         let output_addr =
             Address(first_destination.0 + SP1Field::from_canonical_usize(op.values.len()));
-        self.track_batch_write(divisor_addr, SP1Field::one());
+        self.track_batch_write(reciprocal_addr, SP1Field::one());
         self.bind_batch_output(op.output.idx as usize, output_addr);
 
         let value_addrs = op
@@ -574,8 +574,8 @@ where
             .collect::<Vec<_>>()
             .into_boxed_slice();
         consumer(Instruction::Mem(MemInstr {
-            addrs: MemIo { inner: divisor_addr },
-            vals: MemIo { inner: Block::from(op.divisor) },
+            addrs: MemIo { inner: reciprocal_addr },
+            vals: MemIo { inner: Block::from(op.reciprocal) },
             mult: SP1Field::zero(),
             kind: MemAccessKind::Write,
         }));

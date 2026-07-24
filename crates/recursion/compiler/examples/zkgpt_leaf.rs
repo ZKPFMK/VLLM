@@ -161,15 +161,14 @@ impl EventCounts {
         let causal_scores = sequence_length * (sequence_length + 1) / 2;
         let strict_causal_scores = sequence_length * (sequence_length - 1) / 2;
 
-        let layer_norm_mul = sequence_length * 2 * hidden_size;
+        let layer_norm_mul = sequence_length * (2 * hidden_size + 2);
         let layer_norm_add_sub = sequence_length * (4 * hidden_size - 1);
         let layer_norm_unary = sequence_length * (hidden_size + 1);
-        let layer_norm_div = sequence_length * 2;
 
         let qkv_mul = sequence_length * hidden_size * qkv_head_width;
         let qkv_add_sub = sequence_length * qkv_head_width * (hidden_size - 1);
 
-        let attention_mul = causal_scores * (2 * head_dimension + 1);
+        let attention_mul = causal_scores * (2 * head_dimension + 2);
         let attention_add_sub =
             causal_scores * head_dimension + (head_dimension + 1) * strict_causal_scores;
 
@@ -177,7 +176,7 @@ impl EventCounts {
             mul: layer_norm_mul + qkv_mul + attention_mul,
             add_sub: layer_norm_add_sub + qkv_add_sub + attention_add_sub,
             unary: layer_norm_unary + causal_scores,
-            div: layer_norm_div + causal_scores,
+            div: sequence_length,
         }
     }
 
@@ -730,7 +729,8 @@ fn reference_sub(lhs: u16, rhs: u16) -> u16 {
 
 fn reference_mean(values: &[u16]) -> u16 {
     let sum = values[1..].iter().fold(values[0], |sum, &value| reference_add(sum, value));
-    Bf16DivWitness::new(sum, usize_to_bf16_raw(values.len())).output.raw
+    let reciprocal = Bf16DivWitness::new(0x3f80, usize_to_bf16_raw(values.len())).output.raw;
+    Bf16MulWitness::new(sum, reciprocal).output.raw
 }
 
 fn reference_layer_norm_row(
@@ -816,9 +816,10 @@ fn reference_attention_head(
     let sum = exponential_values[1..]
         .iter()
         .fold(exponential_values[0], |sum, &value| reference_add(sum, value));
+    let inverse_sum = Bf16DivWitness::new(0x3f80, sum).output.raw;
     let probabilities = exponential_values
         .into_iter()
-        .map(|value| Bf16DivWitness::new(value, sum).output.raw)
+        .map(|value| Bf16MulWitness::new(value, inverse_sum).output.raw)
         .collect::<Vec<_>>();
 
     (0..query.len())

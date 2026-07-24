@@ -30,10 +30,10 @@ const NUM_HEADS: usize = 12;
 const GPT2_LAYER_NORM_EPSILON: u16 = 0x3727;
 const GPT2_ATTENTION_SCALE: u16 = 0x3e00;
 
-const MUL_EVENTS_PER_BLOCK: usize = 7_082_508;
+const MUL_EVENTS_PER_BLOCK: usize = 7_082_524;
 const ADD_SUB_EVENTS_PER_BLOCK: usize = 7_086_334;
 const UNARY_EVENTS_PER_BLOCK: usize = 4_622;
-const DIV_EVENTS_PER_BLOCK: usize = 16;
+const DIV_EVENTS_PER_BLOCK: usize = 12;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Mode {
@@ -172,7 +172,8 @@ fn reference_mean(values: &[u16]) -> u16 {
     for &value in &values[1..] {
         sum = reference_add(sum, value);
     }
-    Bf16DivWitness::new(sum, usize_to_bf16_raw(values.len())).output.raw
+    let reciprocal = Bf16DivWitness::new(0x3f80, usize_to_bf16_raw(values.len())).output.raw;
+    reference_mul(sum, reciprocal)
 }
 
 fn reference_layer_norm(values: &[u16], weight: &[u16], bias: &[u16]) -> Vec<u16> {
@@ -243,7 +244,8 @@ fn reference_block(data: &BlockData) -> (Vec<u16>, Vec<u16>) {
         attention_max_hints.push(score);
         let shifted_score = reference_sub(score, score);
         let exponential = Bf16UnaryWitness::new(Bf16UnaryOpcode::Exponential, shifted_score).output;
-        let probability = Bf16DivWitness::new(exponential, exponential).output.raw;
+        let inverse_sum = Bf16DivWitness::new(0x3f80, exponential).output.raw;
+        let probability = reference_mul(exponential, inverse_sum);
         heads.extend(values[range].iter().map(|&value| reference_mul(probability, value)));
     }
 

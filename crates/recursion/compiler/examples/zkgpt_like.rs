@@ -133,10 +133,9 @@ impl EventCounts {
         let causal_scores = num_heads * sequence_length * (sequence_length + 1) / 2;
 
         // Two row-wise layer normalizations.
-        let layer_norm_mul = sequence_length * 4 * hidden_size;
+        let layer_norm_mul = sequence_length * (4 * hidden_size + 4);
         let layer_norm_add_sub = sequence_length * (8 * hidden_size - 2);
         let layer_norm_unary = sequence_length * (2 * hidden_size + 2);
-        let layer_norm_div = sequence_length * 4;
 
         // QKV, attention projection, MLP expansion, and MLP projection, all without bias.
         let linear_mul =
@@ -147,17 +146,17 @@ impl EventCounts {
                 - 2 * hidden_size);
 
         // Causal QK scores, max subtraction, softmax accumulation, and probability-weighted V.
-        let attention_mul = causal_scores * (2 * head_dimension + 1);
+        let attention_mul = causal_scores * (2 * head_dimension + 2);
         let attention_add_sub = causal_scores * head_dimension
             + (num_heads + hidden_size) * sequence_length * (sequence_length - 1) / 2;
         let attention_unary = causal_scores;
-        let attention_div = causal_scores;
+        let attention_div = num_heads * sequence_length;
 
         let per_layer = Self {
             mul: layer_norm_mul + linear_mul + attention_mul,
             add_sub: layer_norm_add_sub + linear_add_sub + attention_add_sub,
             unary: layer_norm_unary + attention_unary + sequence_length * linear_size,
-            div: layer_norm_div + attention_div,
+            div: attention_div,
         };
         Self {
             mul: per_layer.mul * layers,
@@ -181,15 +180,14 @@ impl EventCounts {
         let head_dimension = hidden_size / num_heads;
         let causal_scores = num_heads * sequence_length * (sequence_length + 1) / 2;
 
-        let layer_norm_mul = sequence_length * 4 * hidden_size;
+        let layer_norm_mul = sequence_length * (4 * hidden_size + 4);
         let layer_norm_add_sub = sequence_length * (8 * hidden_size - 2);
         let layer_norm_unary = sequence_length * (2 * hidden_size + 2);
-        let layer_norm_div = sequence_length * 4;
         let linear_mul =
             sequence_length * (4 * hidden_size * hidden_size + 2 * hidden_size * inner_size);
         // Standard GPT-2 adds a bias after every dot product and has two residual additions.
         let linear_and_residual_add_sub = linear_mul + 2 * sequence_length * hidden_size;
-        let attention_mul = causal_scores * (2 * head_dimension + 1);
+        let attention_mul = causal_scores * (2 * head_dimension + 2);
         let attention_add_sub = causal_scores * head_dimension
             + (num_heads + hidden_size) * sequence_length * (sequence_length - 1) / 2;
 
@@ -197,7 +195,7 @@ impl EventCounts {
             mul: layer_norm_mul + linear_mul + attention_mul,
             add_sub: layer_norm_add_sub + linear_and_residual_add_sub + attention_add_sub,
             unary: layer_norm_unary + causal_scores + sequence_length * inner_size,
-            div: layer_norm_div + causal_scores,
+            div: num_heads * sequence_length,
         };
         Self {
             mul: per_layer.mul * layers,

@@ -460,7 +460,7 @@ impl<F: AbstractField + Copy> Bf16LinearBatchInstr<F> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Bf16MeanBatchInstr<F> {
     pub value_addrs: Box<[Address<F>]>,
-    /// The contiguous range contains `n - 1` addition results, one divisor, and one output.
+    /// The contiguous range contains `n - 1` addition results, one reciprocal, and one output.
     pub first_destination: Address<F>,
     pub output_mult: F,
 }
@@ -485,7 +485,7 @@ impl<F: AbstractField + Copy> Bf16MeanBatchInstr<F> {
     }
 
     #[inline]
-    pub fn divisor_address(&self) -> Address<F> {
+    pub fn reciprocal_address(&self) -> Address<F> {
         self.destination_address(self.value_addrs.len() - 1)
     }
 
@@ -506,20 +506,20 @@ impl<F: AbstractField + Copy> Bf16MeanBatchInstr<F> {
                 lhs,
                 rhs: self.value_addrs[index + 1],
             },
-            // Every partial sum is consumed exactly once, by the next addition or division.
+            // Every partial sum is consumed exactly once, by the next addition or multiplication.
             mult: F::one(),
         }
     }
 
     #[inline]
-    pub fn div_instruction(&self) -> Bf16DivInstr<F> {
+    pub fn mul_instruction(&self) -> Bf16MulInstr<F> {
         let lhs = if self.value_addrs.len() == 1 {
             self.value_addrs[0]
         } else {
             self.destination_address(self.value_addrs.len() - 2)
         };
-        Bf16DivInstr {
-            addrs: Bf16DivIo { output: self.output_address(), lhs, rhs: self.divisor_address() },
+        Bf16MulInstr {
+            addrs: Bf16MulIo { output: self.output_address(), lhs, rhs: self.reciprocal_address() },
             mult: self.output_mult,
         }
     }
@@ -1019,19 +1019,22 @@ where
                         .write(add_witness.as_event());
                 }
 
-                let div_instruction = instr.div_instruction();
-                let divisor_raw =
-                    memory.mr_unchecked(div_instruction.addrs.rhs).val[0].as_canonical_u32();
-                assert!(divisor_raw < (1 << BF16_BITS), "BF16 mean divisor is not a 16-bit value");
-                let div_witness = Bf16DivWitness::new(sum_raw as u16, divisor_raw as u16);
+                let mul_instruction = instr.mul_instruction();
+                let reciprocal_raw =
+                    memory.mr_unchecked(mul_instruction.addrs.rhs).val[0].as_canonical_u32();
+                assert!(
+                    reciprocal_raw < (1 << BF16_BITS),
+                    "BF16 mean reciprocal is not a 16-bit value"
+                );
+                let mul_witness = Bf16MulWitness::new(sum_raw as u16, reciprocal_raw as u16);
                 memory.mw_unchecked(
-                    div_instruction.addrs.output,
-                    Block::from(F::from_canonical_u16(div_witness.output.raw)),
+                    mul_instruction.addrs.output,
+                    Block::from(F::from_canonical_u16(mul_witness.output.raw)),
                 );
                 UnsafeCell::raw_get(
-                    record.bf16_div_events[analyzed_instruction.secondary_offset].as_ptr(),
+                    record.bf16_mul_events[analyzed_instruction.secondary_offset].as_ptr(),
                 )
-                .write(div_witness.as_event());
+                .write(mul_witness.as_event());
             }
             Instruction::HintBits(HintBitsInstr { ref output_addrs_mults, input_addr }) => {
                 let num = memory.mr_unchecked(input_addr).val[0].as_canonical_u32();

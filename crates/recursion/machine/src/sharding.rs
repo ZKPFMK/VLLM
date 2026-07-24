@@ -456,9 +456,9 @@ mod tests {
             mem_var_events: 5_901_672,
             base_alu_events: 16,
             poseidon2_wide_events: 743_488,
-            bf16_mul_events: 177_759_180,
+            bf16_mul_events: 177_764_880,
             bf16_unary_events: 120_840,
-            bf16_div_events: 5_700,
+            bf16_div_events: 360,
             bf16_add_sub_events: 177_643_560,
             ..RecursionAirEventCount::default()
         };

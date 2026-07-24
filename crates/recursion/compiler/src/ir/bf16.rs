@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use slop_algebra::AbstractField;
 use sp1_primitives::SP1Field;
+use sp1_recursion_executor::Bf16DivWitness;
 
 use super::{
     Bf16DotProductOp, Bf16LinearNoBiasOp, Bf16MeanOp, Builder, Config, DslIr, Felt, IrIter,
@@ -189,6 +190,12 @@ fn usize_to_bf16_raw(value: usize) -> u16 {
     debug_assert!((128..256).contains(&mantissa));
 
     (((exponent + 127) as u16) << 7) | (mantissa as u16 - 128)
+}
+
+/// Compute the BF16-rounded reciprocal used when a divisor is known while building the circuit.
+fn bf16_reciprocal_raw(divisor: u16) -> u16 {
+    const BF16_ONE_RAW: u16 = 0x3f80;
+    Bf16DivWitness::new(BF16_ONE_RAW, divisor).output.raw
 }
 
 impl<C: Config> Builder<C> {
@@ -460,7 +467,11 @@ impl<C: Config> Builder<C> {
             sum = self.bf16_add(sum, value);
         }
 
-        exponential_values.into_iter().map(|value| self.bf16_div(value, sum)).collect()
+        // The normalization denominator is shared by every value in this softmax row. Compute its
+        // BF16 reciprocal once, then reuse the multiplication chip for every probability.
+        let one = self.constant(SP1Field::from_canonical_u16(0x3f80));
+        let inverse_sum = self.bf16_div(one, sum);
+        exponential_values.into_iter().map(|value| self.bf16_mul(value, inverse_sum)).collect()
     }
 
     /// Compute one attention head's BF16 weighted sum over a flattened value cache.
@@ -1111,16 +1122,18 @@ impl<C: Config> Builder<C> {
 
     /// Compute the mean of a non-empty BF16 vector.
     ///
-    /// Values are added from left to right, and the final sum is divided by the BF16 encoding of
-    /// `values.len()`.
+    /// Values are added from left to right, then the final sum is multiplied by the BF16-rounded
+    /// reciprocal of `values.len()`. The length is known while building the circuit, so this avoids
+    /// a runtime division event.
     pub fn bf16_mean(&mut self, values: &[Felt<SP1Field>]) -> Felt<SP1Field> {
         assert!(!values.is_empty(), "BF16 mean requires at least one value");
 
         let divisor_raw = usize_to_bf16_raw(values.len());
+        let reciprocal_raw = bf16_reciprocal_raw(divisor_raw);
         let output = self.uninit();
         self.push_op(DslIr::Bf16Mean(Box::new(Bf16MeanOp {
             values: values.into(),
-            divisor: SP1Field::from_canonical_u16(divisor_raw),
+            reciprocal: SP1Field::from_canonical_u16(reciprocal_raw),
             output,
         })));
         output
@@ -1223,7 +1236,8 @@ mod tests {
 
     fn reference_bf16_mean(values: &[u16]) -> u16 {
         let sum = values[1..].iter().fold(values[0], |sum, &value| reference_bf16_add(sum, value));
-        Bf16DivWitness::new(sum, usize_to_bf16_raw(values.len())).output.raw
+        let reciprocal = bf16_reciprocal_raw(usize_to_bf16_raw(values.len()));
+        Bf16MulWitness::new(sum, reciprocal).output.raw
     }
 
     fn reference_bf16_dot(lhs: &[u16], rhs: &[u16]) -> u16 {
@@ -1280,9 +1294,10 @@ mod tests {
         let sum = exponential_values[1..]
             .iter()
             .fold(exponential_values[0], |sum, &value| reference_bf16_add(sum, value));
+        let inverse_sum = Bf16DivWitness::new(0x3f80, sum).output.raw;
         exponential_values
             .into_iter()
-            .map(|value| Bf16DivWitness::new(value, sum).output.raw)
+            .map(|value| Bf16MulWitness::new(value, inverse_sum).output.raw)
             .collect()
     }
 
@@ -1571,9 +1586,9 @@ mod tests {
         let mut executor =
             Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
         executor.run().unwrap();
-        assert_eq!(executor.record.bf16_mul_events.len(), 1);
+        assert_eq!(executor.record.bf16_mul_events.len(), 2);
         assert!(executor.record.bf16_add_sub_events.is_empty());
-        assert_eq!(executor.record.bf16_div_events.len(), 1);
+        assert!(executor.record.bf16_div_events.is_empty());
     }
 
     #[test]
@@ -1755,7 +1770,8 @@ mod tests {
             .iter()
             .all(|event| event.opcode == Bf16UnaryOpcode::Exponential));
         assert_eq!(executor.record.bf16_add_sub_events.len(), raw_values.len() * 2 - 1);
-        assert_eq!(executor.record.bf16_div_events.len(), raw_values.len());
+        assert_eq!(executor.record.bf16_mul_events.len(), raw_values.len());
+        assert_eq!(executor.record.bf16_div_events.len(), 1);
     }
 
     #[test]
@@ -1807,7 +1823,7 @@ mod tests {
         let mut executor =
             Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
         executor.run().unwrap();
-        assert_eq!(executor.record.bf16_mul_events.len(), 10);
+        assert_eq!(executor.record.bf16_mul_events.len(), 12);
         assert_eq!(executor.record.bf16_add_sub_events.len(), 7);
         assert_eq!(executor.record.bf16_unary_events.len(), 2);
         assert!(executor
@@ -1815,7 +1831,7 @@ mod tests {
             .bf16_unary_events
             .iter()
             .all(|event| event.opcode == Bf16UnaryOpcode::Exponential));
-        assert_eq!(executor.record.bf16_div_events.len(), 2);
+        assert_eq!(executor.record.bf16_div_events.len(), 1);
     }
 
     #[test]
@@ -1956,7 +1972,7 @@ mod tests {
         let mut executor =
             Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
         executor.run().unwrap();
-        assert_eq!(executor.record.bf16_mul_events.len(), 12);
+        assert_eq!(executor.record.bf16_mul_events.len(), 14);
         assert_eq!(executor.record.bf16_add_sub_events.len(), 17);
         assert_eq!(executor.record.bf16_unary_events.len(), 5);
         assert_eq!(
@@ -1968,7 +1984,7 @@ mod tests {
                 .count(),
             raw_expansion_bias.len()
         );
-        assert_eq!(executor.record.bf16_div_events.len(), 2);
+        assert!(executor.record.bf16_div_events.is_empty());
     }
 
     #[test]
@@ -2045,10 +2061,10 @@ mod tests {
         let mut executor =
             Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
         executor.run().unwrap();
-        assert_eq!(executor.record.bf16_mul_events.len(), 37);
+        assert_eq!(executor.record.bf16_mul_events.len(), 42);
         assert_eq!(executor.record.bf16_add_sub_events.len(), 44);
         assert_eq!(executor.record.bf16_unary_events.len(), 9);
-        assert_eq!(executor.record.bf16_div_events.len(), 5);
+        assert_eq!(executor.record.bf16_div_events.len(), 1);
     }
 
     #[test]
@@ -2116,12 +2132,12 @@ mod tests {
             Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
         executor.run().unwrap();
 
-        // One block has 382 multiplications, 334 additions/subtractions, 50 unary lookups, and
-        // 14 divisions for this shape. The stack must repeat the exact computation twice.
-        assert_eq!(executor.record.bf16_mul_events.len(), 382 * NUM_BLOCKS);
+        // One block has 396 multiplications, 334 additions/subtractions, 50 unary lookups, and
+        // four divisions for this shape. The stack must repeat the exact computation twice.
+        assert_eq!(executor.record.bf16_mul_events.len(), 396 * NUM_BLOCKS);
         assert_eq!(executor.record.bf16_add_sub_events.len(), 334 * NUM_BLOCKS);
         assert_eq!(executor.record.bf16_unary_events.len(), 50 * NUM_BLOCKS);
-        assert_eq!(executor.record.bf16_div_events.len(), 14 * NUM_BLOCKS);
+        assert_eq!(executor.record.bf16_div_events.len(), 4 * NUM_BLOCKS);
     }
 
     #[test]
@@ -2222,10 +2238,10 @@ mod tests {
         let mut executor =
             Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
         executor.run().unwrap();
-        assert_eq!(executor.record.bf16_mul_events.len(), 178);
+        assert_eq!(executor.record.bf16_mul_events.len(), 204);
         assert_eq!(executor.record.bf16_add_sub_events.len(), 206);
         assert_eq!(executor.record.bf16_unary_events.len(), 44);
-        assert_eq!(executor.record.bf16_div_events.len(), 26);
+        assert_eq!(executor.record.bf16_div_events.len(), 4);
     }
 
     #[test]
@@ -2240,7 +2256,8 @@ mod tests {
             .map(|&value| builder.constant(SP1Field::from_canonical_u16(value)))
             .collect::<Vec<Felt<_>>>();
         let mean = builder.bf16_mean(&values);
-        builder.assert_felt_eq(mean, SP1Field::from_canonical_u16(0xbb3d));
+        let expected_mean = reference_bf16_mean(&raw_values);
+        builder.assert_felt_eq(mean, SP1Field::from_canonical_u16(expected_mean));
 
         let root_block = builder.into_root_block();
         assert!(
@@ -2266,7 +2283,8 @@ mod tests {
             Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
         executor.run().unwrap();
         assert_eq!(executor.record.bf16_add_sub_events.len(), raw_values.len() - 1);
-        assert_eq!(executor.record.bf16_div_events.len(), 1);
+        assert_eq!(executor.record.bf16_mul_events.len(), 1);
+        assert!(executor.record.bf16_div_events.is_empty());
     }
 
     #[test]
@@ -2281,8 +2299,18 @@ mod tests {
             .collect::<Vec<Felt<_>>>();
         let mean = builder.bf16_mean(&values);
         let variance = builder.bf16_variance(&values, mean);
-        builder.assert_felt_eq(mean, SP1Field::from_canonical_u16(0xbb3d));
-        builder.assert_felt_eq(variance, SP1Field::from_canonical_u16(0x3dee));
+        let expected_mean = reference_bf16_mean(&raw_values);
+        let centered = raw_values
+            .iter()
+            .map(|&value| reference_bf16_sub(value, expected_mean))
+            .collect::<Vec<_>>();
+        let squared = centered
+            .iter()
+            .map(|&value| Bf16UnaryWitness::new(Bf16UnaryOpcode::Square, value).output)
+            .collect::<Vec<_>>();
+        let expected_variance = reference_bf16_mean(&squared);
+        builder.assert_felt_eq(mean, SP1Field::from_canonical_u16(expected_mean));
+        builder.assert_felt_eq(variance, SP1Field::from_canonical_u16(expected_variance));
 
         let mut compiler = AsmCompiler::default();
         let program =
@@ -2292,8 +2320,8 @@ mod tests {
         executor.run().unwrap();
         assert_eq!(executor.record.bf16_add_sub_events.len(), 2302);
         assert_eq!(executor.record.bf16_unary_events.len(), 768);
-        assert!(executor.record.bf16_mul_events.is_empty());
-        assert_eq!(executor.record.bf16_div_events.len(), 2);
+        assert_eq!(executor.record.bf16_mul_events.len(), 2);
+        assert!(executor.record.bf16_div_events.is_empty());
     }
 
     #[test]
@@ -2336,8 +2364,8 @@ mod tests {
         executor.run().unwrap();
         assert_eq!(executor.record.bf16_add_sub_events.len(), 3071);
         assert_eq!(executor.record.bf16_unary_events.len(), 769);
-        assert_eq!(executor.record.bf16_mul_events.len(), 1536);
-        assert_eq!(executor.record.bf16_div_events.len(), 2);
+        assert_eq!(executor.record.bf16_mul_events.len(), 1538);
+        assert!(executor.record.bf16_div_events.is_empty());
     }
 
     #[test]

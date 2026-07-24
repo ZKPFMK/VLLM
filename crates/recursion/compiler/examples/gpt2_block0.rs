@@ -35,11 +35,11 @@ const NUM_HEADS: usize = 12;
 const GPT2_LAYER_NORM_EPSILON: u16 = 0x3727;
 const GPT2_ATTENTION_SCALE: u16 = 0x3e00;
 
-const EXPECTED_MUL_EVENTS: usize = 7_082_508;
+const EXPECTED_MUL_EVENTS: usize = 7_082_524;
 const EXPECTED_ADD_SUB_EVENTS: usize = 7_086_334;
 const EXPECTED_UNARY_EVENTS: usize = 4_622;
-const EXPECTED_DIV_EVENTS: usize = 16;
-const EXPECTED_IR_OPS: usize = 21_263_004;
+const EXPECTED_DIV_EVENTS: usize = 12;
+const EXPECTED_IR_OPS: usize = 21_263_028;
 const PROOF_LOG_BLOWUP: usize = 1;
 const PROOF_LOG_STACKING_HEIGHT: u32 = 22;
 const PROOF_MAX_LOG_ROW_COUNT: usize = 23;
@@ -203,7 +203,8 @@ fn reference_mean(values: &[u16]) -> u16 {
     for &value in &values[1..] {
         sum = reference_add(sum, value);
     }
-    Bf16DivWitness::new(sum, usize_to_bf16_raw(values.len())).output.raw
+    let reciprocal = Bf16DivWitness::new(0x3f80, usize_to_bf16_raw(values.len())).output.raw;
+    reference_mul(sum, reciprocal)
 }
 
 fn reference_layer_norm(values: &[u16], weight: &[u16], bias: &[u16], epsilon: u16) -> Vec<u16> {
@@ -276,7 +277,8 @@ fn reference_block0(data: &Block0Data) -> (Vec<u16>, Vec<u16>) {
         attention_max_hints.push(score);
         let shifted_score = reference_sub(score, score);
         let exponential = Bf16UnaryWitness::new(Bf16UnaryOpcode::Exponential, shifted_score).output;
-        let probability = Bf16DivWitness::new(exponential, exponential).output.raw;
+        let inverse_sum = Bf16DivWitness::new(0x3f80, exponential).output.raw;
+        let probability = reference_mul(exponential, inverse_sum);
         heads.extend(values[range].iter().map(|&value| reference_mul(probability, value)));
     }
 

@@ -38,7 +38,7 @@ pub struct Bf16LinearNoBiasOp {
 #[derive(Debug, Clone)]
 pub struct Bf16MeanOp {
     pub(crate) values: Box<[Felt<SP1Field>]>,
-    pub(crate) divisor: SP1Field,
+    pub(crate) reciprocal: SP1Field,
     pub(crate) output: Felt<SP1Field>,
 }
 

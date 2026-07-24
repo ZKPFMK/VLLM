@@ -114,10 +114,10 @@ impl EventCounts {
     fn for_shape(shape: Shape) -> Self {
         shape.validate();
         Self {
-            mul: shape.sequence_length * 2 * shape.hidden_size,
+            mul: shape.sequence_length * (2 * shape.hidden_size + 2),
             add_sub: shape.sequence_length * (4 * shape.hidden_size - 1),
             unary: shape.sequence_length * (shape.hidden_size + 1),
-            div: shape.sequence_length * 2,
+            div: 0,
         }
     }
 
@@ -429,7 +429,8 @@ fn reference_sub(lhs: u16, rhs: u16) -> u16 {
 
 fn reference_mean(values: &[u16]) -> u16 {
     let sum = values[1..].iter().fold(values[0], |sum, &value| reference_add(sum, value));
-    Bf16DivWitness::new(sum, usize_to_bf16_raw(values.len())).output.raw
+    let reciprocal = Bf16DivWitness::new(0x3f80, usize_to_bf16_raw(values.len())).output.raw;
+    Bf16MulWitness::new(sum, reciprocal).output.raw
 }
 
 fn reference_layer_norm_row(
@@ -605,10 +606,10 @@ fn print_estimate(shape: Shape, events: EventCounts) {
     let plan = plan_uniform_natural_shards(
         shape.sequence_length,
         Bf16EventsPerUnit {
-            mul: 2 * shape.hidden_size,
+            mul: 2 * shape.hidden_size + 2,
             add_sub: 4 * shape.hidden_size - 1,
             unary: shape.hidden_size + 1,
-            div: 2,
+            div: 0,
         },
         ShardLimits { max_log_rows: shape.max_log_rows(), ..ShardLimits::full() },
     );
