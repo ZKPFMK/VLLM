@@ -1568,6 +1568,7 @@ async fn run(arguments: Arguments) {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    sp1_core_machine::utils::setup_logger();
     run(parse_arguments()).await;
 }
 

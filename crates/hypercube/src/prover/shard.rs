@@ -19,6 +19,7 @@ use std::{
     future::Future,
     iter::once,
     sync::Arc,
+    time::Instant,
 };
 use thousands::Separable;
 use tracing::Instrument;
@@ -361,12 +362,16 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>> A
         let mut challenger = GC::default_challenger();
         pk.vk.observe_into(&mut challenger);
         // Generate the traces.
+        let trace_started = Instant::now();
         let main_trace_data = self
             .inner
             .trace_generator
             .generate_main_traces(record, self.max_log_row_count(), prover_permits)
-            .instrument(tracing::debug_span!("generate main traces"))
             .await;
+        tracing::debug!(
+            "proof phase: generate main traces elapsed={:.3}s",
+            trace_started.elapsed().as_secs_f64()
+        );
 
         let shard_data = ShardData { pk, main_trace_data };
 
@@ -388,12 +393,16 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>> A
     ) -> (ShardProof<GC, PcsProof<GC, SC>>, ProverPermit) {
         let mut challenger = GC::default_challenger();
         pk.vk.observe_into(&mut challenger);
+        let trace_started = Instant::now();
         let main_trace_data = self
             .inner
             .trace_generator
             .generate_main_traces(record, self.max_log_row_count(), prover_permits)
-            .instrument(tracing::debug_span!("generate batched main traces"))
             .await;
+        tracing::debug!(
+            "proof phase: generate batched main traces elapsed={:.3}s",
+            trace_started.elapsed().as_secs_f64()
+        );
 
         let shard_data = ShardData { pk, main_trace_data };
         let prover = self.clone();
@@ -410,12 +419,16 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>> A
         record: Record<GC, SC>,
         prover_permits: ProverSemaphore,
     ) -> (GC::Digest, Vec<(String, usize)>, ProverPermit) {
+        let trace_started = Instant::now();
         let main_trace_data = self
             .inner
             .trace_generator
             .generate_main_traces(record, self.max_log_row_count(), prover_permits)
-            .instrument(tracing::debug_span!("generate main traces for batch commitment"))
             .await;
+        tracing::debug!(
+            "proof phase: generate main traces for batch commitment elapsed={:.3}s",
+            trace_started.elapsed().as_secs_f64()
+        );
         let MainTraceData { traces, shard_chips, permit, .. } = main_trace_data;
         let real_heights = shard_chips
             .iter()
@@ -744,6 +757,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
         mut challenger: GC::Challenger,
         shared_challenges: Option<&LogUpGkrChallenges<GC::EF>>,
     ) -> (ShardProof<GC, PcsProof<GC, SC>>, ProverPermit) {
+        let core_started = Instant::now();
         let ShardData { pk, main_trace_data } = data;
         let MainTraceData { traces, public_values, shard_chips, permit } = main_trace_data;
 
@@ -767,10 +781,12 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
         challenger.observe_constant_length_slice(&public_values);
 
         // Commit to the traces.
+        let commit_started = Instant::now();
         let (main_commit, main_data) = {
             let _span = tracing::debug_span!("commit traces").entered();
             self.commit_traces(&traces)
         };
+        let commit_elapsed = commit_started.elapsed();
         // Observe the commitments.
         challenger.observe(main_commit);
         // Observe the number of chips.
@@ -785,6 +801,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
             }
         }
 
+        let logup_started = Instant::now();
         let logup_gkr_proof = {
             let _span = tracing::debug_span!("logup gkr proof").entered();
             if let Some(challenges) = shared_challenges {
@@ -806,6 +823,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
                 )
             }
         };
+        let logup_elapsed = logup_started.elapsed();
         // Get the challenge for batching constraints.
         let batching_challenge = challenger.sample_ext_element::<GC::EF>();
         // Get the challenge for batching the evaluations from the GKR proof.
@@ -822,6 +840,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
         }
 
         // Generate the zerocheck proof.
+        let zerocheck_started = Instant::now();
         let (shard_open_values, zerocheck_partial_sumcheck_proof) = {
             let _span = tracing::debug_span!("zerocheck").entered();
             self.zerocheck(
@@ -835,6 +854,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
                 &mut challenger,
             )
         };
+        let zerocheck_elapsed = zerocheck_started.elapsed();
 
         // Get the evaluation point for the trace polynomials.
         let evaluation_point = zerocheck_partial_sumcheck_proof.point_and_eval.0.clone();
@@ -869,6 +889,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
             .collect::<Rounds<_>>();
 
         // Generate the evaluation proof.
+        let evaluation_started = Instant::now();
         let evaluation_proof = {
             let _span = tracing::debug_span!("prove evaluation claims").entered();
             self.inner
@@ -881,6 +902,22 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
                 )
                 .unwrap()
         };
+        let evaluation_elapsed = evaluation_started.elapsed();
+
+        let core_elapsed = core_started.elapsed();
+        let measured_elapsed =
+            commit_elapsed + logup_elapsed + zerocheck_elapsed + evaluation_elapsed;
+        let other_elapsed = core_elapsed.saturating_sub(measured_elapsed);
+        tracing::debug!(
+            "proof phase summary: commit_traces={:.3}s logup_gkr={:.3}s \
+             zerocheck={:.3}s evaluation_claims={:.3}s other={:.3}s core_total={:.3}s",
+            commit_elapsed.as_secs_f64(),
+            logup_elapsed.as_secs_f64(),
+            zerocheck_elapsed.as_secs_f64(),
+            evaluation_elapsed.as_secs_f64(),
+            other_elapsed.as_secs_f64(),
+            core_elapsed.as_secs_f64(),
+        );
 
         let proof = ShardProof {
             main_commitment: main_commit,

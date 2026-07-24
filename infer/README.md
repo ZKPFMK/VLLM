@@ -219,6 +219,14 @@ python3 infer/zkgpt_block_recursion.py \
   --output-root /home/dj/proofs/zkgpt-12-block-recursion
 ```
 
+Proof phase profiling is enabled by default. For every event-leaf proof, the
+log reports wall-clock time for `generate main traces`, span-close timings for
+`commit traces`, `logup gkr proof`, `zerocheck`, and
+`prove evaluation claims`, plus one `proof phase summary` line. The existing
+`shard proof generated` line is the enclosing total, so it must not be added to
+the phase times. Set `SP1_ZKGPT_PROOF_PROFILE=0` to suppress these detailed
+timings.
+
 To prove only Block 0 by hand, run the two stages explicitly:
 
 ```bash
@@ -226,11 +234,15 @@ cargo build --release \
   -p sp1-recursion-compiler --example zkgpt_like \
   -p sp1-recursion-circuit --example zkgpt_block_recursion
 
+RUST_LOGGER=flat \
+RUST_LOG='sp1_hypercube::prover::simple=debug,sp1_hypercube::prover::shard=debug' \
 RAYON_NUM_THREADS="$(nproc)" target/release/examples/zkgpt_like \
   --prove-shards --allow-large-build --block 0 \
   --data-dir /home/dj/VLLM-models/gpt2-bf16/recursion/zkgpt-like-12x30-real-bf16 \
   --output-dir /home/dj/proofs/block-00
 
+RUST_LOGGER=flat \
+RUST_LOG='sp1_hypercube::prover::simple=debug,sp1_hypercube::prover::shard=debug' \
 RAYON_NUM_THREADS="$(nproc)" target/release/examples/zkgpt_block_recursion \
   --prove \
   --event-shard-manifest /home/dj/proofs/block-00/zkgpt_event_shards.manifest.json \

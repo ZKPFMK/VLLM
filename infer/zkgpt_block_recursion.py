@@ -400,6 +400,15 @@ def run_command(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
     environment["RAYON_NUM_THREADS"] = str(threads)
+    if environment.get("SP1_ZKGPT_PROOF_PROFILE", "1") != "0":
+        environment.setdefault("RUST_LOGGER", "flat")
+        environment.setdefault(
+            "RUST_LOG",
+            (
+                "sp1_hypercube::prover::simple=debug,"
+                "sp1_hypercube::prover::shard=debug"
+            ),
+        )
     started = time.perf_counter()
     print(f"[runner] run: {shlex.join(command)}", flush=True)
     with log_path.open("a", encoding="utf-8") as log:

@@ -1627,6 +1627,7 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    sp1_core_machine::utils::setup_logger();
     let arguments = parse_arguments();
     let events = EventCounts::for_shape(arguments.shape);
     println!("mode={:?}", arguments.mode);
