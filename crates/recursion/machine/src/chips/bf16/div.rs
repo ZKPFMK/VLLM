@@ -62,11 +62,7 @@ impl<F: PrimeField32> MachineAir<F> for Bf16DivChip {
     }
 
     fn preprocessed_num_rows(&self, program: &Self::Program) -> Option<usize> {
-        let count = program
-            .inner
-            .iter()
-            .filter(|instruction| matches!(instruction.inner(), Instruction::Bf16Div(_)))
-            .count();
+        let count = program.event_counts.bf16_div_events;
         self.preprocessed_num_rows_with_instrs_len(program, count)
     }
 
@@ -90,15 +86,8 @@ impl<F: PrimeField32> MachineAir<F> for Bf16DivChip {
             "generate_preprocessed_trace only supports SP1Field"
         );
 
-        let instructions = program
-            .inner
-            .iter()
-            .filter_map(|instruction| match instruction.inner() {
-                Instruction::Bf16Div(instruction) => Some(instruction),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let rows = self.preprocessed_num_rows_with_instrs_len(program, instructions.len()).unwrap();
+        let instruction_count = program.event_counts.bf16_div_events;
+        let rows = self.preprocessed_num_rows_with_instrs_len(program, instruction_count).unwrap();
 
         let values = unsafe {
             core::slice::from_raw_parts_mut(
@@ -107,23 +96,25 @@ impl<F: PrimeField32> MachineAir<F> for Bf16DivChip {
             )
         };
         unsafe {
-            let padding_start = instructions.len() * BF16_DIV_PREPROCESSED_COLS;
-            core::ptr::write_bytes(
-                values[padding_start..].as_mut_ptr(),
-                0,
-                values.len() - padding_start,
-            );
+            core::ptr::write_bytes(values.as_mut_ptr(), 0, values.len());
         }
 
-        let populated = instructions.len() * BF16_DIV_PREPROCESSED_COLS;
-        values[..populated]
-            .par_chunks_mut(BF16_DIV_PREPROCESSED_COLS)
-            .zip_eq(instructions)
-            .for_each(|(row, instruction)| {
-                let Bf16DivInstr { addrs, mult } = instruction;
-                let cols: &mut Bf16DivPreprocessedCols<F> = row.borrow_mut();
-                *cols = Bf16DivPreprocessedCols { is_real: F::one(), addrs: *addrs, mult: *mult };
-            });
+        let populate = |row: &mut [F], instruction: Bf16DivInstr<F>| {
+            let Bf16DivInstr { addrs, mult } = instruction;
+            let cols: &mut Bf16DivPreprocessedCols<F> = row.borrow_mut();
+            *cols = Bf16DivPreprocessedCols { is_real: F::one(), addrs, mult };
+        };
+        for analyzed in program.inner.iter() {
+            let (offset, instruction) = match analyzed.inner() {
+                Instruction::Bf16Div(instruction) => (analyzed.offset(), *instruction),
+                Instruction::Bf16MeanBatch(batch) => {
+                    (analyzed.secondary_offset(), batch.div_instruction())
+                }
+                _ => continue,
+            };
+            let start = offset * BF16_DIV_PREPROCESSED_COLS;
+            populate(&mut values[start..start + BF16_DIV_PREPROCESSED_COLS], instruction);
+        }
     }
 
     fn generate_dependencies(&self, _input: &Self::Record, _output: &mut Self::Record) {}

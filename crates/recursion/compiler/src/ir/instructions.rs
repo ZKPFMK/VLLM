@@ -16,47 +16,22 @@ use super::{Config, Ext, Felt, Var};
 pub struct Bf16DotProductOp {
     pub(crate) lhs: Box<[Felt<SP1Field>]>,
     pub(crate) rhs: Box<[Felt<SP1Field>]>,
-    pub(crate) first_destination: u32,
-}
-
-impl Bf16DotProductOp {
-    /// Number of scalar assembly instructions emitted by this compact operation.
-    pub(crate) fn scalar_instruction_count(&self) -> usize {
-        self.lhs
-            .len()
-            .checked_mul(2)
-            .and_then(|count| count.checked_sub(1))
-            .expect("BF16 dot product instruction count overflow")
-    }
+    pub(crate) output: Felt<SP1Field>,
 }
 
 /// A compact DSL representation of a bias-free BF16 linear transformation.
 ///
-/// The input is one row and `weight` is row-major `[input_features, output_features]`. Instead of
-/// materializing one [`DslIr::Bf16Mul`] or [`DslIr::Bf16Add`] node per scalar operation, the
-/// assembly compiler expands this descriptor directly into the same scalar instructions. The
-/// virtual destinations are reserved eagerly so later DSL operations can consume the outputs.
+/// The input is row-major `[rows, input_features]` and `weight` is row-major
+/// `[input_features, output_features]`. Instead of materializing one [`DslIr::Bf16Mul`] or
+/// [`DslIr::Bf16Add`] node per scalar operation, this descriptor compiles to one atomic executor
+/// instruction. The executor and BF16 chips derive the original scalar event schedule lazily.
 #[derive(Debug, Clone)]
 pub struct Bf16LinearNoBiasOp {
     pub(crate) input: Box<[Felt<SP1Field>]>,
     pub(crate) weight: Arc<[Felt<SP1Field>]>,
+    pub(crate) input_features: usize,
     pub(crate) output_features: usize,
-    pub(crate) first_destination: u32,
-}
-
-impl Bf16LinearNoBiasOp {
-    /// Number of scalar assembly instructions emitted by this compact operation.
-    pub(crate) fn scalar_instruction_count(&self) -> usize {
-        let instructions_per_output = self
-            .input
-            .len()
-            .checked_mul(2)
-            .and_then(|count| count.checked_sub(1))
-            .expect("bias-free BF16 linear instruction count overflow");
-        instructions_per_output
-            .checked_mul(self.output_features)
-            .expect("bias-free BF16 linear instruction count overflow")
-    }
+    pub(crate) output: Box<[Felt<SP1Field>]>,
 }
 
 /// A compact DSL representation of one left-to-right BF16 mean.
@@ -64,15 +39,7 @@ impl Bf16LinearNoBiasOp {
 pub struct Bf16MeanOp {
     pub(crate) values: Box<[Felt<SP1Field>]>,
     pub(crate) divisor: SP1Field,
-    pub(crate) first_destination: u32,
-}
-
-impl Bf16MeanOp {
-    /// Number of scalar assembly instructions emitted by this compact operation.
-    pub(crate) fn scalar_instruction_count(&self) -> usize {
-        // `n - 1` additions, one divisor constant, and one division.
-        self.values.len().checked_add(1).expect("BF16 mean instruction count overflow")
-    }
+    pub(crate) output: Felt<SP1Field>,
 }
 
 /// An intermeddiate instruction set for implementing programs.
@@ -204,12 +171,14 @@ pub enum DslIr<C: Config> {
     Bf16Mul(Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>),
     /// Computes one compact left-to-right BF16 dot product.
     ///
-    /// This is lowered to the existing scalar BF16 multiply/add instructions before execution.
+    /// This compiles to one atomic batch instruction. The executor and BF16 chips derive the
+    /// existing scalar multiply/add event schedule lazily.
     Bf16DotProduct(Box<Bf16DotProductOp>),
     /// Applies one compact bias-free BF16 linear transformation.
     ///
-    /// This is lowered to the existing scalar BF16 multiply/add instructions before execution, so
-    /// it does not change proof events or chip constraints.
+    /// This compiles to one atomic batch instruction. The executor and BF16 chips derive the
+    /// existing scalar multiply/add event schedule lazily, so proof events and chip constraints
+    /// remain unchanged.
     Bf16LinearNoBias(Box<Bf16LinearNoBiasOp>),
     /// Squares one raw 16-bit BF16 value with a direct lookup.
     Bf16Square(Felt<SP1Field>, Felt<SP1Field>),
@@ -227,7 +196,8 @@ pub enum DslIr<C: Config> {
     Bf16Sub(Felt<SP1Field>, Felt<SP1Field>, Felt<SP1Field>),
     /// Computes one compact left-to-right BF16 mean.
     ///
-    /// This is lowered to the existing add, constant-write, and divide instructions.
+    /// This compiles to one atomic batch instruction plus its divisor constant write. The executor
+    /// and BF16 chips derive the existing scalar add/divide event schedule lazily.
     Bf16Mean(Box<Bf16MeanOp>),
 
     // Assertions.

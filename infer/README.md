@@ -124,9 +124,12 @@ cargo run -p sp1-recursion-compiler --release --example zkgpt_like -- \
 ```
 
 `--small` selects the deterministic synthetic fixture because checkpoint tensors
-have the fixed full shape. Full-size `--build`, `--execute`, and `--prove` modes
-load the real BF16 fixture by default. Use `--data-dir PATH` to override its
-location; `--synthetic` is available only for explicit structural experiments.
+have the fixed full shape. Full-size `--build`, `--compile`, `--execute`, and
+`--prove` modes load the real BF16 fixture by default. Use `--data-dir PATH` to
+override its location; `--synthetic` is available only for explicit structural
+experiments. `--compile` stops after assembly compilation and program validation,
+so the compact batch-instruction path can be benchmarked without allocating the
+executor record or generating traces.
 
 On a machine provisioned for the full experiment, build the release binary first
 and then run the complete 12-layer, 30-token proof without including Rust compile

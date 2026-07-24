@@ -332,6 +332,201 @@ pub struct Bf16AddSubInstr<F> {
 
 // -------------------------------------------------------------------------------------------------
 
+/// One batch of row-major, bias-free BF16 matrix multiplication.
+///
+/// This is an atomic recursion-program instruction. It deliberately keeps the scalar
+/// multiplication and left-to-right accumulation schedule out of the serialized program. The
+/// executor and the BF16 chips derive the exact same scalar events and memory addresses from this
+/// descriptor.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Bf16LinearBatchInstr<F> {
+    /// Flattened `[rows, input_features]` input addresses.
+    pub input_addrs: Box<[Address<F>]>,
+    /// Row-major `[input_features, output_features]` weight addresses.
+    pub weight_addrs: Box<[Address<F>]>,
+    /// First address in the contiguous scalar-intermediate range.
+    pub first_destination: Address<F>,
+    /// Multiplicity of every externally visible `[rows, output_features]` result.
+    pub output_mults: Box<[F]>,
+    pub rows: usize,
+    pub input_features: usize,
+    pub output_features: usize,
+}
+
+impl<F> Bf16LinearBatchInstr<F> {
+    #[inline]
+    pub fn dot_count(&self) -> usize {
+        self.rows.checked_mul(self.output_features).expect("BF16 linear batch dot count overflow")
+    }
+
+    #[inline]
+    pub fn destinations_per_dot(&self) -> usize {
+        self.input_features
+            .checked_mul(2)
+            .and_then(|count| count.checked_sub(1))
+            .expect("BF16 linear batch destination count overflow")
+    }
+
+    #[inline]
+    pub fn destination_count(&self) -> usize {
+        self.dot_count()
+            .checked_mul(self.destinations_per_dot())
+            .expect("BF16 linear batch destination count overflow")
+    }
+
+    #[inline]
+    pub fn mul_count(&self) -> usize {
+        self.dot_count()
+            .checked_mul(self.input_features)
+            .expect("BF16 linear batch multiplication count overflow")
+    }
+
+    #[inline]
+    pub fn add_sub_count(&self) -> usize {
+        self.dot_count()
+            .checked_mul(self.input_features.saturating_sub(1))
+            .expect("BF16 linear batch addition count overflow")
+    }
+}
+
+impl<F: AbstractField + Copy> Bf16LinearBatchInstr<F> {
+    #[inline]
+    pub fn destination_address(&self, offset: usize) -> Address<F> {
+        debug_assert!(offset < self.destination_count());
+        Address(self.first_destination.0 + F::from_canonical_usize(offset))
+    }
+
+    #[inline]
+    pub fn output_address(&self, dot_index: usize) -> Address<F> {
+        debug_assert!(dot_index < self.dot_count());
+        self.destination_address(
+            dot_index * self.destinations_per_dot() + self.destinations_per_dot() - 1,
+        )
+    }
+
+    #[inline]
+    pub fn mul_instruction(&self, index: usize) -> Bf16MulInstr<F> {
+        debug_assert!(index < self.mul_count());
+        let dot_index = index / self.input_features;
+        let input_index = index % self.input_features;
+        let row = dot_index / self.output_features;
+        let output_index = dot_index % self.output_features;
+        let dot_destination = dot_index * self.destinations_per_dot();
+        let output_offset =
+            dot_destination + if input_index == 0 { 0 } else { 2 * input_index - 1 };
+        let mult = if self.input_features == 1 { self.output_mults[dot_index] } else { F::one() };
+
+        Bf16MulInstr {
+            addrs: Bf16MulIo {
+                output: self.destination_address(output_offset),
+                lhs: self.input_addrs[row * self.input_features + input_index],
+                rhs: self.weight_addrs[input_index * self.output_features + output_index],
+            },
+            mult,
+        }
+    }
+
+    #[inline]
+    pub fn add_sub_instruction(&self, index: usize) -> Bf16AddSubInstr<F> {
+        let additions_per_dot = self.input_features.saturating_sub(1);
+        debug_assert!(index < self.add_sub_count());
+        debug_assert!(additions_per_dot > 0);
+        let dot_index = index / additions_per_dot;
+        let addition_index = index % additions_per_dot;
+        let input_index = addition_index + 1;
+        let dot_destination = dot_index * self.destinations_per_dot();
+        let lhs_offset = if input_index == 1 { 0 } else { 2 * input_index - 2 };
+        let rhs_offset = 2 * input_index - 1;
+        let output_offset = 2 * input_index;
+        let mult = if input_index + 1 == self.input_features {
+            self.output_mults[dot_index]
+        } else {
+            F::one()
+        };
+
+        Bf16AddSubInstr {
+            opcode: Bf16AddSubOpcode::Add,
+            addrs: Bf16AddSubIo {
+                output: self.destination_address(dot_destination + output_offset),
+                lhs: self.destination_address(dot_destination + lhs_offset),
+                rhs: self.destination_address(dot_destination + rhs_offset),
+            },
+            mult,
+        }
+    }
+}
+
+/// One left-to-right BF16 mean kept as an atomic recursion-program instruction.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Bf16MeanBatchInstr<F> {
+    pub value_addrs: Box<[Address<F>]>,
+    /// The contiguous range contains `n - 1` addition results, one divisor, and one output.
+    pub first_destination: Address<F>,
+    pub output_mult: F,
+}
+
+impl<F> Bf16MeanBatchInstr<F> {
+    #[inline]
+    pub fn add_sub_count(&self) -> usize {
+        self.value_addrs.len().saturating_sub(1)
+    }
+
+    #[inline]
+    pub fn destination_count(&self) -> usize {
+        self.value_addrs.len().checked_add(1).expect("BF16 mean batch destination count overflow")
+    }
+}
+
+impl<F: AbstractField + Copy> Bf16MeanBatchInstr<F> {
+    #[inline]
+    pub fn destination_address(&self, offset: usize) -> Address<F> {
+        debug_assert!(offset < self.destination_count());
+        Address(self.first_destination.0 + F::from_canonical_usize(offset))
+    }
+
+    #[inline]
+    pub fn divisor_address(&self) -> Address<F> {
+        self.destination_address(self.value_addrs.len() - 1)
+    }
+
+    #[inline]
+    pub fn output_address(&self) -> Address<F> {
+        self.destination_address(self.value_addrs.len())
+    }
+
+    #[inline]
+    pub fn add_sub_instruction(&self, index: usize) -> Bf16AddSubInstr<F> {
+        debug_assert!(index < self.add_sub_count());
+        let lhs =
+            if index == 0 { self.value_addrs[0] } else { self.destination_address(index - 1) };
+        Bf16AddSubInstr {
+            opcode: Bf16AddSubOpcode::Add,
+            addrs: Bf16AddSubIo {
+                output: self.destination_address(index),
+                lhs,
+                rhs: self.value_addrs[index + 1],
+            },
+            // Every partial sum is consumed exactly once, by the next addition or division.
+            mult: F::one(),
+        }
+    }
+
+    #[inline]
+    pub fn div_instruction(&self) -> Bf16DivInstr<F> {
+        let lhs = if self.value_addrs.len() == 1 {
+            self.value_addrs[0]
+        } else {
+            self.destination_address(self.value_addrs.len() - 2)
+        };
+        Bf16DivInstr {
+            addrs: Bf16DivIo { output: self.output_address(), lhs, rhs: self.divisor_address() },
+            mult: self.output_mult,
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+
 /// The inputs and outputs to the operations for prefix sum checks.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrefixSumChecksIo<V> {
@@ -753,6 +948,90 @@ where
                 memory.mw_unchecked(output, Block::from(F::from_canonical_u16(witness.output.raw)));
                 UnsafeCell::raw_get(record.bf16_add_sub_events[offset].as_ptr())
                     .write(witness.as_event());
+            }
+            Instruction::Bf16LinearBatch(ref instr) => {
+                let add_sub_offset = analyzed_instruction.secondary_offset;
+                (0..instr.dot_count()).into_par_iter().for_each(|dot_index| unsafe {
+                    let mut sum_raw = 0u16;
+                    for input_index in 0..instr.input_features {
+                        let mul_index = dot_index * instr.input_features + input_index;
+                        let mul_instruction = instr.mul_instruction(mul_index);
+                        let Bf16MulIo { output, lhs, rhs } = mul_instruction.addrs;
+                        let lhs_raw = memory.mr_unchecked(lhs).val[0].as_canonical_u32();
+                        let rhs_raw = memory.mr_unchecked(rhs).val[0].as_canonical_u32();
+                        assert!(
+                            lhs_raw < (1 << BF16_BITS),
+                            "left BF16 batch input is not a 16-bit value"
+                        );
+                        assert!(
+                            rhs_raw < (1 << BF16_BITS),
+                            "right BF16 batch input is not a 16-bit value"
+                        );
+
+                        let mul_witness = Bf16MulWitness::new(lhs_raw as u16, rhs_raw as u16);
+                        let product_raw = mul_witness.output.raw;
+                        memory
+                            .mw_unchecked(output, Block::from(F::from_canonical_u16(product_raw)));
+                        UnsafeCell::raw_get(record.bf16_mul_events[offset + mul_index].as_ptr())
+                            .write(mul_witness.as_event());
+
+                        if input_index == 0 {
+                            sum_raw = product_raw;
+                        } else {
+                            let additions_per_dot = instr.input_features - 1;
+                            let add_index = dot_index * additions_per_dot + input_index - 1;
+                            let add_instruction = instr.add_sub_instruction(add_index);
+                            let add_witness =
+                                Bf16AddSubWitness::new(sum_raw, product_raw, Bf16AddSubOpcode::Add);
+                            sum_raw = add_witness.output.raw;
+                            memory.mw_unchecked(
+                                add_instruction.addrs.output,
+                                Block::from(F::from_canonical_u16(sum_raw)),
+                            );
+                            UnsafeCell::raw_get(
+                                record.bf16_add_sub_events[add_sub_offset + add_index].as_ptr(),
+                            )
+                            .write(add_witness.as_event());
+                        }
+                    }
+                });
+            }
+            Instruction::Bf16MeanBatch(ref instr) => {
+                let mut sum_raw =
+                    memory.mr_unchecked(instr.value_addrs[0]).val[0].as_canonical_u32();
+                assert!(sum_raw < (1 << BF16_BITS), "BF16 mean input is not a 16-bit value");
+                for add_index in 0..instr.add_sub_count() {
+                    let rhs_raw = memory.mr_unchecked(instr.value_addrs[add_index + 1]).val[0]
+                        .as_canonical_u32();
+                    assert!(rhs_raw < (1 << BF16_BITS), "BF16 mean input is not a 16-bit value");
+                    let add_instruction = instr.add_sub_instruction(add_index);
+                    let add_witness = Bf16AddSubWitness::new(
+                        sum_raw as u16,
+                        rhs_raw as u16,
+                        Bf16AddSubOpcode::Add,
+                    );
+                    sum_raw = u32::from(add_witness.output.raw);
+                    memory.mw_unchecked(
+                        add_instruction.addrs.output,
+                        Block::from(F::from_canonical_u16(add_witness.output.raw)),
+                    );
+                    UnsafeCell::raw_get(record.bf16_add_sub_events[offset + add_index].as_ptr())
+                        .write(add_witness.as_event());
+                }
+
+                let div_instruction = instr.div_instruction();
+                let divisor_raw =
+                    memory.mr_unchecked(div_instruction.addrs.rhs).val[0].as_canonical_u32();
+                assert!(divisor_raw < (1 << BF16_BITS), "BF16 mean divisor is not a 16-bit value");
+                let div_witness = Bf16DivWitness::new(sum_raw as u16, divisor_raw as u16);
+                memory.mw_unchecked(
+                    div_instruction.addrs.output,
+                    Block::from(F::from_canonical_u16(div_witness.output.raw)),
+                );
+                UnsafeCell::raw_get(
+                    record.bf16_div_events[analyzed_instruction.secondary_offset].as_ptr(),
+                )
+                .write(div_witness.as_event());
             }
             Instruction::HintBits(HintBitsInstr { ref output_addrs_mults, input_addr }) => {
                 let num = memory.mr_unchecked(input_addr).val[0].as_canonical_u32();

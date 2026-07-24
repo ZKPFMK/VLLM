@@ -65,6 +65,19 @@ where
         self.read_vaddr_internal(vaddr, true)
     }
 
+    /// Map a virtual address to its physical address and add several reads at once.
+    ///
+    /// Batch instructions use this instead of invoking `read` once per scalar event.
+    pub fn read_vaddr_many(&mut self, vaddr: usize, multiplicity: usize) -> Address<SP1Field> {
+        let addr = self.read_vaddr_internal(vaddr, false);
+        let mult = self
+            .addr_to_mult
+            .get_mut(addr.as_usize())
+            .unwrap_or_else(|| panic!("expected entry: addr_to_mult[{}]", addr.as_usize()));
+        *mult += SP1Field::from_canonical_usize(multiplicity);
+        addr
+    }
+
     #[allow(clippy::uninlined_format_args)]
     pub fn read_vaddr_internal(&mut self, vaddr: usize, increment_mult: bool) -> Address<SP1Field> {
         use vec_map::Entry;
@@ -100,6 +113,46 @@ where
             Entry::Occupied(entry) => {
                 panic!("unexpected entry: virtual_to_physical[{:?}] = {:?}", vaddr, entry.get())
             }
+        }
+    }
+
+    /// Reserve a contiguous physical-address range without creating one compiler map entry per
+    /// scalar intermediate.
+    fn alloc_range(&mut self, len: usize) -> Address<SP1Field> {
+        assert!(len > 0, "cannot allocate an empty address range");
+        let start = self.next_addr.as_canonical_u64();
+        let end = start
+            .checked_add(u64::try_from(len).expect("address range length does not fit u64"))
+            .expect("physical address range overflow");
+        self.next_addr = SP1Field::from_canonical_u64(end);
+        assert_eq!(
+            self.next_addr.as_canonical_u64(),
+            end,
+            "physical address range exceeds the field"
+        );
+        Address(SP1Field::from_canonical_u64(start))
+    }
+
+    /// Associate an externally visible virtual result with an address inside a batch range.
+    fn bind_batch_output(&mut self, vaddr: usize, addr: Address<SP1Field>) {
+        use vec_map::Entry;
+        match self.virtual_to_physical.entry(vaddr) {
+            Entry::Vacant(entry) => {
+                entry.insert(addr);
+            }
+            Entry::Occupied(entry) => {
+                panic!("unexpected entry: virtual_to_physical[{vaddr:?}] = {:?}", entry.get())
+            }
+        }
+        if let Some(mult) = self.addr_to_mult.insert(addr.as_usize(), SP1Field::zero()) {
+            panic!("unexpected entry in addr_to_mult: {mult:?}");
+        }
+    }
+
+    /// Track a write at an already-reserved batch address with a known read multiplicity.
+    fn track_batch_write(&mut self, addr: Address<SP1Field>, mult: SP1Field) {
+        if let Some(previous) = self.addr_to_mult.insert(addr.as_usize(), mult) {
+            panic!("unexpected entry in addr_to_mult: {previous:?}");
         }
     }
 
@@ -387,62 +440,81 @@ where
         })
     }
 
-    /// Lower a compact dot product while preserving scalar BF16 rounding after every operation.
-    fn bf16_dot_product(
+    /// Compile one or more row-major dot products into an atomic executor instruction.
+    fn bf16_linear_batch(
         &mut self,
-        op: Bf16DotProductOp,
-        mut consumer: impl FnMut(Instruction<SP1Field>),
-    ) {
-        debug_assert!(!op.lhs.is_empty());
-        debug_assert_eq!(op.lhs.len(), op.rhs.len());
+        input: &[Felt<SP1Field>],
+        weight: &[Felt<SP1Field>],
+        input_features: usize,
+        output_features: usize,
+        output: &[Felt<SP1Field>],
+    ) -> Instruction<SP1Field> {
+        debug_assert!(input_features > 0);
+        debug_assert!(output_features > 0);
+        debug_assert_eq!(input.len() % input_features, 0);
+        let rows = input.len() / input_features;
+        debug_assert_eq!(weight.len(), input_features * output_features);
+        debug_assert_eq!(output.len(), rows * output_features);
 
-        let mut sum = VirtualFelt::new(op.first_destination as usize);
-        consumer(self.bf16_mul(sum, op.lhs[0], op.rhs[0]));
-        for input_index in 1..op.lhs.len() {
-            let product = VirtualFelt::new(op.first_destination as usize + 2 * input_index - 1);
-            consumer(self.bf16_mul(product, op.lhs[input_index], op.rhs[input_index]));
-            let next_sum = VirtualFelt::new(op.first_destination as usize + 2 * input_index);
-            consumer(self.bf16_add_sub(Bf16AddSubOpcode::Add, next_sum, sum, product));
-            sum = next_sum;
+        let destinations_per_dot = input_features
+            .checked_mul(2)
+            .and_then(|count| count.checked_sub(1))
+            .expect("BF16 linear batch destination count overflow");
+        let dot_count =
+            rows.checked_mul(output_features).expect("BF16 linear batch dot count overflow");
+        let destination_count = dot_count
+            .checked_mul(destinations_per_dot)
+            .expect("BF16 linear batch destination count overflow");
+        let first_destination = self.alloc_range(destination_count);
+
+        // Each row input participates in every output column. Every weight participates once per
+        // row. Update memory multiplicities in bulk instead of replaying every scalar operation.
+        let input_addrs = input
+            .iter()
+            .map(|value| self.read_vaddr_many(value.idx as usize, output_features))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let weight_addrs = weight
+            .iter()
+            .map(|value| self.read_vaddr_many(value.idx as usize, rows))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        for (dot_index, value) in output.iter().enumerate() {
+            let output_offset =
+                dot_index * destinations_per_dot + destinations_per_dot.saturating_sub(1);
+            let output_addr =
+                Address(first_destination.0 + SP1Field::from_canonical_usize(output_offset));
+            self.bind_batch_output(value.idx as usize, output_addr);
         }
+
+        Instruction::Bf16LinearBatch(Box::new(Bf16LinearBatchInstr {
+            input_addrs,
+            weight_addrs,
+            first_destination,
+            output_mults: vec![SP1Field::zero(); dot_count].into_boxed_slice(),
+            rows,
+            input_features,
+            output_features,
+        }))
     }
 
-    /// Lower a compact BF16 linear DSL operation to the existing scalar instructions.
-    ///
-    /// Keeping this expansion at the assembly boundary avoids allocating hundreds of millions of
-    /// scalar `DslIr` nodes while preserving the exact instruction order, virtual addresses, BF16
-    /// rounding points, execution events, and proof-chip inputs.
-    fn bf16_linear_no_bias(
-        &mut self,
-        op: Bf16LinearNoBiasOp,
-        mut consumer: impl FnMut(Instruction<SP1Field>),
-    ) {
-        let input_features = op.input.len();
-        debug_assert!(input_features > 0);
-        debug_assert!(op.output_features > 0);
-        debug_assert_eq!(op.weight.len(), input_features * op.output_features);
+    /// Keep a compact dot product atomic through assembly compilation.
+    fn bf16_dot_product(&mut self, op: Bf16DotProductOp) -> Instruction<SP1Field> {
+        debug_assert!(!op.lhs.is_empty());
+        debug_assert_eq!(op.lhs.len(), op.rhs.len());
+        self.bf16_linear_batch(&op.lhs, &op.rhs, op.lhs.len(), 1, &[op.output])
+    }
 
-        let destinations_per_output = 2 * input_features - 1;
-        for output_index in 0..op.output_features {
-            let dot_destination =
-                op.first_destination as usize + output_index * destinations_per_output;
-            let mut sum = VirtualFelt::new(dot_destination);
-            consumer(self.bf16_mul(sum, op.input[0], op.weight[output_index]));
-
-            for input_index in 1..input_features {
-                // Match `Builder::bf16_dot` exactly: product and running-sum destinations are
-                // interleaved, and accumulation proceeds strictly from left to right.
-                let product = VirtualFelt::new(dot_destination + 2 * input_index - 1);
-                consumer(self.bf16_mul(
-                    product,
-                    op.input[input_index],
-                    op.weight[input_index * op.output_features + output_index],
-                ));
-                let next_sum = VirtualFelt::new(dot_destination + 2 * input_index);
-                consumer(self.bf16_add_sub(Bf16AddSubOpcode::Add, next_sum, sum, product));
-                sum = next_sum;
-            }
-        }
+    /// Keep a row-major BF16 linear operation atomic through assembly compilation.
+    fn bf16_linear_no_bias(&mut self, op: Bf16LinearNoBiasOp) -> Instruction<SP1Field> {
+        self.bf16_linear_batch(
+            &op.input,
+            &op.weight,
+            op.input_features,
+            op.output_features,
+            &op.output,
+        )
     }
 
     #[inline(always)]
@@ -481,33 +553,37 @@ where
         })
     }
 
-    /// Lower a compact mean to left-to-right BF16 additions followed by one BF16 division.
+    /// Keep a compact mean atomic through assembly compilation.
     fn bf16_mean(&mut self, op: Bf16MeanOp, mut consumer: impl FnMut(Instruction<SP1Field>)) {
         debug_assert!(!op.values.is_empty());
+        let destination_count =
+            op.values.len().checked_add(1).expect("BF16 mean destination count overflow");
+        let first_destination = self.alloc_range(destination_count);
+        let divisor_addr = Address(
+            first_destination.0 + SP1Field::from_canonical_usize(op.values.len().saturating_sub(1)),
+        );
+        let output_addr =
+            Address(first_destination.0 + SP1Field::from_canonical_usize(op.values.len()));
+        self.track_batch_write(divisor_addr, SP1Field::one());
+        self.bind_batch_output(op.output.idx as usize, output_addr);
 
-        let divisor = VirtualFelt::new(op.first_destination as usize + op.values.len() - 1);
-        let output = VirtualFelt::new(op.first_destination as usize + op.values.len());
-        if op.values.len() == 1 {
-            consumer(self.mem_write_const(divisor, Imm::F(op.divisor)));
-            consumer(self.bf16_div(output, op.values[0], divisor));
-            return;
-        }
-
-        let mut sum = VirtualFelt::new(op.first_destination as usize);
-        consumer(self.bf16_add_sub(Bf16AddSubOpcode::Add, sum, op.values[0], op.values[1]));
-        for input_index in 2..op.values.len() {
-            let next_sum = VirtualFelt::new(op.first_destination as usize + input_index - 1);
-            consumer(self.bf16_add_sub(
-                Bf16AddSubOpcode::Add,
-                next_sum,
-                sum,
-                op.values[input_index],
-            ));
-            sum = next_sum;
-        }
-
-        consumer(self.mem_write_const(divisor, Imm::F(op.divisor)));
-        consumer(self.bf16_div(output, sum, divisor));
+        let value_addrs = op
+            .values
+            .iter()
+            .map(|value| self.read_vaddr_many(value.idx as usize, 1))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        consumer(Instruction::Mem(MemInstr {
+            addrs: MemIo { inner: divisor_addr },
+            vals: MemIo { inner: Block::from(op.divisor) },
+            mult: SP1Field::zero(),
+            kind: MemAccessKind::Write,
+        }));
+        consumer(Instruction::Bf16MeanBatch(Box::new(Bf16MeanBatchInstr {
+            value_addrs,
+            first_destination,
+            output_mult: SP1Field::zero(),
+        })));
     }
 
     #[inline(always)]
@@ -726,8 +802,8 @@ where
 
             DslIr::Select(bit, dst1, dst2, lhs, rhs) => f(self.select(bit, dst1, dst2, lhs, rhs)),
             DslIr::Bf16Mul(dst, lhs, rhs) => f(self.bf16_mul(dst, lhs, rhs)),
-            DslIr::Bf16DotProduct(op) => self.bf16_dot_product(*op, f),
-            DslIr::Bf16LinearNoBias(op) => self.bf16_linear_no_bias(*op, f),
+            DslIr::Bf16DotProduct(op) => f(self.bf16_dot_product(*op)),
+            DslIr::Bf16LinearNoBias(op) => f(self.bf16_linear_no_bias(*op)),
             DslIr::Bf16Square(dst, input) => f(self.bf16_square(dst, input)),
             DslIr::Bf16Rsqrt(dst, input) => f(self.bf16_rsqrt(dst, input)),
             DslIr::Bf16Exponential(dst, input) => f(self.bf16_exponential(dst, input)),
@@ -836,15 +912,6 @@ where
                 }
                 op => {
                     let bb = maybe_bb.get_or_insert_with(Default::default);
-                    let instruction_count = match &op {
-                        DslIr::Bf16DotProduct(op) => op.scalar_instruction_count(),
-                        DslIr::Bf16LinearNoBias(op) => op.scalar_instruction_count(),
-                        DslIr::Bf16Mean(op) => op.scalar_instruction_count(),
-                        _ => 0,
-                    };
-                    // A compact node can expand to millions of scalar instructions. Reserve once
-                    // to avoid repeated allocation and copying while lowering it.
-                    bb.instrs.reserve(instruction_count);
                     self.compile_one(op, |item| match item {
                         Ok(instr) => {
                             #[cfg(feature = "debug")]
@@ -958,6 +1025,16 @@ where
                     mult,
                     ..
                 }) => backfill((mult, addr)),
+                Instruction::Bf16LinearBatch(instr) => {
+                    for dot_index in 0..instr.dot_count() {
+                        let addr = instr.output_address(dot_index);
+                        backfill((&mut instr.output_mults[dot_index], &addr));
+                    }
+                }
+                Instruction::Bf16MeanBatch(instr) => {
+                    let addr = instr.output_address();
+                    backfill((&mut instr.output_mult, &addr));
+                }
                 Instruction::HintBits(HintBitsInstr { output_addrs_mults, .. })
                 | Instruction::Hint(HintInstr { output_addrs_mults, .. }) => {
                     output_addrs_mults.iter_mut().for_each(|(addr, mult)| backfill((mult, addr)));
@@ -1039,7 +1116,9 @@ where
                 }
             }
         });
-        let total_memory = self.addr_to_mult.len() + self.consts.len();
+        // Batch instructions reserve scalar-intermediate address ranges without inserting one
+        // compiler bookkeeping entry per address.
+        let total_memory = self.next_addr.as_canonical_u64() as usize;
         tracing::debug_span!("backfill mult").in_scope(|| self.backfill_all(program.iter_mut()));
 
         // Put in the constants.
@@ -1083,6 +1162,8 @@ const fn instr_name<F>(instr: &Instruction<F>) -> &'static str {
         Instruction::Bf16Unary(_) => "Bf16Unary",
         Instruction::Bf16Div(_) => "Bf16Div",
         Instruction::Bf16AddSub(_) => "Bf16AddSub",
+        Instruction::Bf16LinearBatch(_) => "Bf16LinearBatch",
+        Instruction::Bf16MeanBatch(_) => "Bf16MeanBatch",
         Instruction::HintBits(_) => "HintBits",
         Instruction::PrefixSumChecks(_) => "PrefixSumChecks",
         Instruction::Print(_) => "Print",
@@ -1141,18 +1222,6 @@ trait Reg {
     fn write_many(&self, compiler: &mut AsmCompiler, len: usize) -> Vec<Address<SP1Field>>;
 }
 
-/// A virtual BF16 destination reserved by a compact DSL operation.
-#[derive(Clone, Copy)]
-struct VirtualFelt {
-    idx: u32,
-}
-
-impl VirtualFelt {
-    fn new(idx: usize) -> Self {
-        Self { idx: u32::try_from(idx).expect("virtual BF16 address does not fit u32") }
-    }
-}
-
 macro_rules! impl_reg_vaddr {
     ($a:ty) => {
         impl Reg for $a {
@@ -1177,7 +1246,6 @@ macro_rules! impl_reg_vaddr {
 impl_reg_vaddr!(Var<SP1Field>);
 impl_reg_vaddr!(Felt<SP1Field>);
 impl_reg_vaddr!(Ext<SP1Field, SP1ExtensionField>);
-impl_reg_vaddr!(VirtualFelt);
 
 impl Reg for Imm<SP1Field, SP1ExtensionField> {
     fn read(&self, compiler: &mut AsmCompiler) -> Address<SP1Field> {

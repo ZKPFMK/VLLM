@@ -54,6 +54,7 @@ enum Mode {
     #[default]
     Estimate,
     Build,
+    Compile,
     Execute,
     Prove,
     CheckData,
@@ -272,6 +273,7 @@ fn parse_arguments() -> Arguments {
         match argument.to_str() {
             Some("--estimate") => mode = Mode::Estimate,
             Some("--build") => mode = Mode::Build,
+            Some("--compile") => mode = Mode::Compile,
             Some("--execute") => mode = Mode::Execute,
             Some("--prove") => mode = Mode::Prove,
             Some("--check-data") => mode = Mode::CheckData,
@@ -995,6 +997,19 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
     let mut compiler = AsmCompiler::default();
     let program = Arc::new(compiler.compile_inner(block).validate().unwrap());
     println!("compiled: elapsed={:.3}s", compile_started.elapsed().as_secs_f64());
+    assert_eq!(program.event_counts.bf16_mul_events as u128, expected.mul);
+    assert_eq!(program.event_counts.bf16_add_sub_events as u128, expected.add_sub);
+    assert_eq!(program.event_counts.bf16_unary_events as u128, expected.unary);
+    assert_eq!(program.event_counts.bf16_div_events as u128, expected.div);
+    if arguments.mode == Mode::Compile {
+        println!(
+            "compiled program: instructions={} total_memory={}",
+            program.inner.iter().count(),
+            program.total_memory
+        );
+        println!("completed: elapsed={:.3}s", total_started.elapsed().as_secs_f64());
+        return;
+    }
     fs::create_dir_all(&arguments.output_dir).unwrap_or_else(|error| {
         panic!("failed to create {}: {error}", arguments.output_dir.display())
     });

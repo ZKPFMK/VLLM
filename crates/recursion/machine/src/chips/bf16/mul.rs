@@ -80,11 +80,7 @@ impl<F: PrimeField32> MachineAir<F> for Bf16MulChip {
     }
 
     fn preprocessed_num_rows(&self, program: &Self::Program) -> Option<usize> {
-        let count = program
-            .inner
-            .iter()
-            .filter(|instruction| matches!(instruction.inner(), Instruction::Bf16Mul(_)))
-            .count();
+        let count = program.event_counts.bf16_mul_events;
         self.preprocessed_num_rows_with_instrs_len(program, count)
     }
 
@@ -109,15 +105,8 @@ impl<F: PrimeField32> MachineAir<F> for Bf16MulChip {
             "generate_preprocessed_trace only supports SP1Field"
         );
 
-        let instructions = program
-            .inner
-            .iter()
-            .filter_map(|instruction| match instruction.inner() {
-                Instruction::Bf16Mul(instruction) => Some(instruction),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let rows = self.preprocessed_num_rows_with_instrs_len(program, instructions.len()).unwrap();
+        let instruction_count = program.event_counts.bf16_mul_events;
+        let rows = self.preprocessed_num_rows_with_instrs_len(program, instruction_count).unwrap();
 
         let values = unsafe {
             core::slice::from_raw_parts_mut(
@@ -126,22 +115,36 @@ impl<F: PrimeField32> MachineAir<F> for Bf16MulChip {
             )
         };
         unsafe {
-            let padding_start = instructions.len() * BF16_MUL_ACCESS_COLS;
-            core::ptr::write_bytes(
-                values[padding_start..].as_mut_ptr(),
-                0,
-                values.len() - padding_start,
-            );
+            core::ptr::write_bytes(values.as_mut_ptr(), 0, values.len());
         }
 
-        let populated = instructions.len() * BF16_MUL_ACCESS_COLS;
-        values[..populated].par_chunks_mut(BF16_MUL_ACCESS_COLS).zip_eq(instructions).for_each(
-            |(row, instruction)| {
-                let Bf16MulInstr { addrs, mult } = instruction;
-                let cols: &mut Bf16MulAccessCols<F> = row.borrow_mut();
-                *cols = Bf16MulAccessCols { is_real: F::one(), addrs: *addrs, mult: *mult };
-            },
-        );
+        let populate = |row: &mut [F], instruction: &Bf16MulInstr<F>| {
+            let Bf16MulInstr { addrs, mult } = instruction;
+            let cols: &mut Bf16MulAccessCols<F> = row.borrow_mut();
+            *cols = Bf16MulAccessCols { is_real: F::one(), addrs: *addrs, mult: *mult };
+        };
+
+        for analyzed in program.inner.iter() {
+            match analyzed.inner() {
+                Instruction::Bf16Mul(instruction) => {
+                    let start = analyzed.offset() * BF16_MUL_ACCESS_COLS;
+                    populate(&mut values[start..start + BF16_MUL_ACCESS_COLS], instruction);
+                }
+                Instruction::Bf16LinearBatch(batch) => {
+                    let start = analyzed.offset() * BF16_MUL_ACCESS_COLS;
+                    let end = start + batch.mul_count() * BF16_MUL_ACCESS_COLS;
+                    values[start..end].par_chunks_mut(BF16_MUL_ACCESS_COLS).enumerate().for_each(
+                        |(index, row)| {
+                            let instruction = batch.mul_instruction(index);
+                            let Bf16MulInstr { addrs, mult } = instruction;
+                            let cols: &mut Bf16MulAccessCols<F> = row.borrow_mut();
+                            *cols = Bf16MulAccessCols { is_real: F::one(), addrs, mult };
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 
     fn generate_dependencies(&self, _input: &Self::Record, _output: &mut Self::Record) {}

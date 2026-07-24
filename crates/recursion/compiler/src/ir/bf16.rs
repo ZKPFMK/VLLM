@@ -262,24 +262,13 @@ impl<C: Config> Builder<C> {
         assert!(!lhs.is_empty(), "BF16 dot product requires at least one value");
         assert_eq!(lhs.len(), rhs.len(), "BF16 dot product length mismatch");
 
-        let destination_count = lhs
-            .len()
-            .checked_mul(2)
-            .and_then(|count| count.checked_sub(1))
-            .expect("BF16 dot product destination count overflow");
-        let destination_count =
-            u32::try_from(destination_count).expect("BF16 dot product has too many variables");
-        let first_destination = self.variable_count();
-        let next_destination = first_destination
-            .checked_add(destination_count)
-            .expect("BF16 dot product variable address overflow");
-        self.inner.get_mut().variable_count = next_destination;
-
-        let output = Felt::new(next_destination - 1, self.felt_handle.as_mut());
+        // Scalar intermediate addresses are reserved by the assembly batch instruction. Only the
+        // externally visible result needs a DSL variable.
+        let output = self.uninit();
         self.push_op(DslIr::Bf16DotProduct(Box::new(Bf16DotProductOp {
             lhs: lhs.into(),
             rhs: rhs.into(),
-            first_destination,
+            output,
         })));
         output
     }
@@ -330,8 +319,7 @@ impl<C: Config> Builder<C> {
         self.bf16_linear_no_bias_shared(input, Arc::from(weight), output_features)
     }
 
-    /// Build a compact bias-free BF16 linear operation while sharing the matrix allocation between
-    /// parallel input rows.
+    /// Build one compact bias-free BF16 linear operation.
     fn bf16_linear_no_bias_shared(
         &mut self,
         input: &[Felt<SP1Field>],
@@ -350,42 +338,14 @@ impl<C: Config> Builder<C> {
             "bias-free BF16 linear weight shape mismatch"
         );
 
-        // One left-to-right dot product allocates one multiplication result for its first element,
-        // then one multiplication and one addition result for every remaining element.
-        let destinations_per_output = input
-            .len()
-            .checked_mul(2)
-            .and_then(|count| count.checked_sub(1))
-            .expect("bias-free BF16 linear destination count overflow");
-        let destination_count = destinations_per_output
-            .checked_mul(output_features)
-            .expect("bias-free BF16 linear destination count overflow");
-        let destination_count =
-            u32::try_from(destination_count).expect("bias-free BF16 linear has too many variables");
-        let first_destination = self.variable_count();
-        let next_destination = first_destination
-            .checked_add(destination_count)
-            .expect("bias-free BF16 linear variable address overflow");
-        self.inner.get_mut().variable_count = next_destination;
-
-        let handle = self.felt_handle.as_mut() as *mut _;
-        let outputs = (0..output_features)
-            .map(|output_index| {
-                let output_offset = output_index
-                    .checked_mul(destinations_per_output)
-                    .and_then(|offset| offset.checked_add(destinations_per_output - 1))
-                    .expect("bias-free BF16 linear output address overflow");
-                let output_offset = u32::try_from(output_offset)
-                    .expect("bias-free BF16 linear output address does not fit u32");
-                Felt::new(first_destination + output_offset, handle)
-            })
-            .collect();
+        let outputs = (0..output_features).map(|_| self.uninit()).collect::<Vec<_>>();
 
         self.push_op(DslIr::Bf16LinearNoBias(Box::new(Bf16LinearNoBiasOp {
             input: input.into(),
             weight,
+            input_features: input.len(),
             output_features,
-            first_destination,
+            output: outputs.clone().into(),
         })));
         outputs
     }
@@ -403,13 +363,16 @@ impl<C: Config> Builder<C> {
         assert_eq!(weight.len() % input_features, 0, "BF16 row-wise linear weight shape mismatch");
         let output_features = weight.len() / input_features;
         assert!(output_features > 0, "BF16 row-wise linear requires an output feature");
-        let weight: Arc<[Felt<SP1Field>]> = Arc::from(weight);
-
-        let rows: Vec<Vec<_>> =
-            input.chunks_exact(input_features).ir_par_map_collect(self, |builder, row| {
-                builder.bf16_linear_no_bias_shared(row, Arc::clone(&weight), output_features)
-            });
-        rows.into_iter().flatten().collect()
+        let rows = input.len() / input_features;
+        let output = (0..rows * output_features).map(|_| self.uninit()).collect::<Vec<_>>();
+        self.push_op(DslIr::Bf16LinearNoBias(Box::new(Bf16LinearNoBiasOp {
+            input: input.into(),
+            weight: Arc::from(weight),
+            input_features,
+            output_features,
+            output: output.clone().into(),
+        })));
+        output
     }
 
     /// Split one GPT-2 QKV projection into query, key, and value heads.
@@ -1154,24 +1117,11 @@ impl<C: Config> Builder<C> {
         assert!(!values.is_empty(), "BF16 mean requires at least one value");
 
         let divisor_raw = usize_to_bf16_raw(values.len());
-        // Reserve `n - 1` addition destinations, one divisor constant, and the final division
-        // destination. This is exactly the address order produced by the former scalar builder.
-        let destination_count = values
-            .len()
-            .checked_add(1)
-            .and_then(|count| u32::try_from(count).ok())
-            .expect("BF16 mean has too many variables");
-        let first_destination = self.variable_count();
-        let next_destination = first_destination
-            .checked_add(destination_count)
-            .expect("BF16 mean variable address overflow");
-        self.inner.get_mut().variable_count = next_destination;
-
-        let output = Felt::new(next_destination - 1, self.felt_handle.as_mut());
+        let output = self.uninit();
         self.push_op(DslIr::Bf16Mean(Box::new(Bf16MeanOp {
             values: values.into(),
             divisor: SP1Field::from_canonical_u16(divisor_raw),
-            first_destination,
+            output,
         })));
         output
     }
@@ -1239,7 +1189,7 @@ mod tests {
     use sp1_primitives::{SP1DiffusionMatrix, SP1ExtensionField};
     use sp1_recursion_executor::{
         Bf16AddSubOpcode, Bf16AddSubWitness, Bf16DivWitness, Bf16MulWitness, Bf16UnaryOpcode,
-        Bf16UnaryWitness, Executor,
+        Bf16UnaryWitness, Executor, Instruction,
     };
 
     use crate::circuit::{AsmBuilder, AsmCompiler};
@@ -1585,11 +1535,45 @@ mod tests {
         );
         let mut compiler = AsmCompiler::default();
         let program = Arc::new(compiler.compile_inner(root_block).validate().unwrap());
+        assert_eq!(
+            program
+                .inner
+                .iter()
+                .filter(|instruction| {
+                    matches!(instruction.inner(), Instruction::Bf16LinearBatch(_))
+                })
+                .count(),
+            1
+        );
+        assert!(!program.inner.iter().any(|instruction| {
+            matches!(instruction.inner(), Instruction::Bf16Mul(_) | Instruction::Bf16AddSub(_))
+        }));
         let mut executor =
             Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
         executor.run().unwrap();
         assert_eq!(executor.record.bf16_mul_events.len(), raw_lhs.len());
         assert_eq!(executor.record.bf16_add_sub_events.len(), raw_lhs.len() - 1);
+    }
+
+    #[test]
+    fn compiles_and_executes_singleton_bf16_batches() {
+        let mut builder: Builder<crate::circuit::AsmConfig> = AsmBuilder::default();
+        let lhs = builder.constant(SP1Field::from_canonical_u16(0x4000));
+        let rhs = builder.constant(SP1Field::from_canonical_u16(0x4040));
+        let dot = builder.bf16_dot(&[lhs], &[rhs]);
+        let mean = builder.bf16_mean(&[dot]);
+        builder.assert_felt_eq(dot, SP1Field::from_canonical_u16(0x40c0));
+        builder.assert_felt_eq(mean, SP1Field::from_canonical_u16(0x40c0));
+
+        let mut compiler = AsmCompiler::default();
+        let program =
+            Arc::new(compiler.compile_inner(builder.into_root_block()).validate().unwrap());
+        let mut executor =
+            Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
+        executor.run().unwrap();
+        assert_eq!(executor.record.bf16_mul_events.len(), 1);
+        assert!(executor.record.bf16_add_sub_events.is_empty());
+        assert_eq!(executor.record.bf16_div_events.len(), 1);
     }
 
     #[test]
@@ -1658,25 +1642,33 @@ mod tests {
         }
 
         let root_block = builder.into_root_block();
-        let linear_rows = root_block
+        let linear = root_block
             .ops
             .iter()
             .find_map(|op| match op {
-                DslIr::Parallel(rows)
-                    if rows.len() == raw_input.len() / INPUT_FEATURES
-                        && rows.iter().all(|row| {
-                            matches!(row.ops.as_slice(), [DslIr::Bf16LinearNoBias(_)])
-                        }) =>
+                DslIr::Bf16LinearNoBias(op)
+                    if op.input_features == INPUT_FEATURES
+                        && op.output_features == OUTPUT_FEATURES =>
                 {
-                    Some(rows)
+                    Some(op)
                 }
                 _ => None,
             })
-            .expect("row-wise linear must use one compact DSL operation per row");
-        assert_eq!(linear_rows.len(), 2);
+            .expect("row-wise linear must use one compact DSL operation for all rows");
+        assert_eq!(linear.input.len() / linear.input_features, 2);
 
         let mut compiler = AsmCompiler::default();
         let program = Arc::new(compiler.compile_inner(root_block).validate().unwrap());
+        assert_eq!(
+            program
+                .inner
+                .iter()
+                .filter(|instruction| {
+                    matches!(instruction.inner(), Instruction::Bf16LinearBatch(_))
+                })
+                .count(),
+            1
+        );
         let mut executor =
             Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
         executor.run().unwrap();
@@ -2113,7 +2105,10 @@ mod tests {
             .iter()
             .filter(|op| matches!(op, DslIr::Parallel(rows) if rows.len() == SEQUENCE_LENGTH))
             .count();
-        assert_eq!(parallel_stages, 8 * NUM_BLOCKS);
+        let linear_batches =
+            root_block.ops.iter().filter(|op| matches!(op, DslIr::Bf16LinearNoBias(_))).count();
+        assert_eq!(linear_batches, 4 * NUM_BLOCKS);
+        assert_eq!(parallel_stages, 4 * NUM_BLOCKS);
 
         let mut compiler = AsmCompiler::default();
         let program = Arc::new(compiler.compile_inner(root_block).validate().unwrap());
@@ -2254,6 +2249,19 @@ mod tests {
         );
         let mut compiler = AsmCompiler::default();
         let program = Arc::new(compiler.compile_inner(root_block).validate().unwrap());
+        assert_eq!(
+            program
+                .inner
+                .iter()
+                .filter(|instruction| {
+                    matches!(instruction.inner(), Instruction::Bf16MeanBatch(_))
+                })
+                .count(),
+            1
+        );
+        assert!(!program.inner.iter().any(|instruction| {
+            matches!(instruction.inner(), Instruction::Bf16AddSub(_) | Instruction::Bf16Div(_))
+        }));
         let mut executor =
             Executor::<SP1Field, SP1ExtensionField, SP1DiffusionMatrix>::new(program, inner_perm());
         executor.run().unwrap();

@@ -11,15 +11,33 @@ use crate::{
 pub struct AnalyzedInstruction<F> {
     pub(crate) inner: Instruction<F>,
     pub(crate) offset: usize,
+    /// A second event-vector offset used by atomic instructions that emit two event kinds.
+    pub(crate) secondary_offset: usize,
 }
 
 impl<F> AnalyzedInstruction<F> {
     pub const fn new(inner: Instruction<F>, offset: usize) -> Self {
-        Self { inner, offset }
+        Self { inner, offset, secondary_offset: 0 }
+    }
+
+    pub const fn new_with_secondary(
+        inner: Instruction<F>,
+        offset: usize,
+        secondary_offset: usize,
+    ) -> Self {
+        Self { inner, offset, secondary_offset }
     }
 
     pub const fn inner(&self) -> &Instruction<F> {
         &self.inner
+    }
+
+    pub const fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub const fn secondary_offset(&self) -> usize {
+        self.secondary_offset
     }
 }
 
@@ -50,55 +68,95 @@ impl<F> RawProgram<Instruction<F>> {
                         .instrs
                         .into_iter()
                         .map(|instr| {
-                            let start_offset = match &instr {
-                                Instruction::BaseAlu(_) => incr(&mut counts.base_alu_events, 1),
-                                Instruction::ExtAlu(_) => incr(&mut counts.ext_alu_events, 1),
-                                Instruction::Mem(_) => incr(&mut counts.mem_const_events, 1),
+                            let (start_offset, secondary_offset) = match &instr {
+                                Instruction::BaseAlu(_) => {
+                                    (incr(&mut counts.base_alu_events, 1), 0)
+                                }
+                                Instruction::ExtAlu(_) => (incr(&mut counts.ext_alu_events, 1), 0),
+                                Instruction::Mem(_) => (incr(&mut counts.mem_const_events, 1), 0),
                                 Instruction::ExtFelt(_) => {
-                                    incr(&mut counts.ext_felt_conversion_events, 1)
+                                    (incr(&mut counts.ext_felt_conversion_events, 1), 0)
                                 }
                                 Instruction::Poseidon2(_) => {
-                                    incr(&mut counts.poseidon2_wide_events, 1)
+                                    (incr(&mut counts.poseidon2_wide_events, 1), 0)
                                 }
                                 Instruction::Poseidon2LinearLayer(_) => {
-                                    incr(&mut counts.poseidon2_linear_layer_events, 1)
+                                    (incr(&mut counts.poseidon2_linear_layer_events, 1), 0)
                                 }
                                 Instruction::Poseidon2SBox(_) => {
-                                    incr(&mut counts.poseidon2_sbox_events, 1)
+                                    (incr(&mut counts.poseidon2_sbox_events, 1), 0)
                                 }
-                                Instruction::Select(_) => incr(&mut counts.select_events, 1),
-                                Instruction::Bf16Mul(_) => incr(&mut counts.bf16_mul_events, 1),
-                                Instruction::Bf16Unary(_) => incr(&mut counts.bf16_unary_events, 1),
-                                Instruction::Bf16Div(_) => incr(&mut counts.bf16_div_events, 1),
+                                Instruction::Select(_) => (incr(&mut counts.select_events, 1), 0),
+                                Instruction::Bf16Mul(_) => {
+                                    (incr(&mut counts.bf16_mul_events, 1), 0)
+                                }
+                                Instruction::Bf16Unary(_) => {
+                                    (incr(&mut counts.bf16_unary_events, 1), 0)
+                                }
+                                Instruction::Bf16Div(_) => {
+                                    (incr(&mut counts.bf16_div_events, 1), 0)
+                                }
                                 Instruction::Bf16AddSub(_) => {
-                                    incr(&mut counts.bf16_add_sub_events, 1)
+                                    (incr(&mut counts.bf16_add_sub_events, 1), 0)
+                                }
+                                Instruction::Bf16LinearBatch(instr) => {
+                                    let mul_offset =
+                                        incr(&mut counts.bf16_mul_events, instr.mul_count());
+                                    let add_sub_offset = incr(
+                                        &mut counts.bf16_add_sub_events,
+                                        instr.add_sub_count(),
+                                    );
+                                    (mul_offset, add_sub_offset)
+                                }
+                                Instruction::Bf16MeanBatch(instr) => {
+                                    let add_sub_offset = incr(
+                                        &mut counts.bf16_add_sub_events,
+                                        instr.add_sub_count(),
+                                    );
+                                    let div_offset = incr(&mut counts.bf16_div_events, 1);
+                                    (add_sub_offset, div_offset)
                                 }
                                 Instruction::Hint(HintInstr { output_addrs_mults })
                                 | Instruction::HintBits(HintBitsInstr {
                                     output_addrs_mults,
                                     input_addr: _, // No receive interaction for the hint operation
-                                }) => incr(&mut counts.mem_var_events, output_addrs_mults.len()),
+                                }) => {
+                                    (incr(&mut counts.mem_var_events, output_addrs_mults.len()), 0)
+                                }
                                 Instruction::HintExt2Felts(HintExt2FeltsInstr {
                                     output_addrs_mults,
                                     input_addr: _, // No receive interaction for the hint operation
-                                }) => incr(&mut counts.mem_var_events, output_addrs_mults.len()),
-                                Instruction::PrefixSumChecks(instr) => {
-                                    incr(&mut counts.prefix_sum_checks_events, instr.addrs.x1.len())
+                                }) => {
+                                    (incr(&mut counts.mem_var_events, output_addrs_mults.len()), 0)
                                 }
-                                Instruction::HintAddCurve(instr) => incr(
-                                    &mut counts.mem_var_events,
-                                    instr.output_x_addrs_mults.len()
-                                        + instr.output_y_addrs_mults.len(),
+                                Instruction::PrefixSumChecks(instr) => (
+                                    incr(
+                                        &mut counts.prefix_sum_checks_events,
+                                        instr.addrs.x1.len(),
+                                    ),
+                                    0,
+                                ),
+                                Instruction::HintAddCurve(instr) => (
+                                    incr(
+                                        &mut counts.mem_var_events,
+                                        instr.output_x_addrs_mults.len()
+                                            + instr.output_y_addrs_mults.len(),
+                                    ),
+                                    0,
                                 ),
                                 Instruction::CommitPublicValues(_) => {
-                                    incr(&mut counts.commit_pv_hash_events, 1)
+                                    (incr(&mut counts.commit_pv_hash_events, 1), 0)
                                 }
                                 // Just return 0 as a place holder, the executor code will not
                                 // create any events on these types anyway.
-                                Instruction::Print(_) | Instruction::DebugBacktrace(_) => 0,
+                                Instruction::Print(_) | Instruction::DebugBacktrace(_) => (0, 0),
                             };
 
-                            AnalyzedInstruction::new(instr, start_offset)
+                            AnalyzedInstruction::new_with_secondary(
+                                instr,
+                                start_offset,
+                                secondary_offset,
+                            )
                         })
                         .collect();
 

@@ -97,11 +97,7 @@ impl<F: PrimeField32> MachineAir<F> for Bf16AddSubChip {
     }
 
     fn preprocessed_num_rows(&self, program: &Self::Program) -> Option<usize> {
-        let count = program
-            .inner
-            .iter()
-            .filter(|instruction| matches!(instruction.inner(), Instruction::Bf16AddSub(_)))
-            .count();
+        let count = program.event_counts.bf16_add_sub_events;
         self.preprocessed_num_rows_with_instrs_len(program, count)
     }
 
@@ -126,15 +122,8 @@ impl<F: PrimeField32> MachineAir<F> for Bf16AddSubChip {
             "generate_preprocessed_trace only supports SP1Field"
         );
 
-        let instructions = program
-            .inner
-            .iter()
-            .filter_map(|instruction| match instruction.inner() {
-                Instruction::Bf16AddSub(instruction) => Some(instruction),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let rows = self.preprocessed_num_rows_with_instrs_len(program, instructions.len()).unwrap();
+        let instruction_count = program.event_counts.bf16_add_sub_events;
+        let rows = self.preprocessed_num_rows_with_instrs_len(program, instruction_count).unwrap();
 
         let values = unsafe {
             core::slice::from_raw_parts_mut(
@@ -143,27 +132,53 @@ impl<F: PrimeField32> MachineAir<F> for Bf16AddSubChip {
             )
         };
         unsafe {
-            let padding_start = instructions.len() * BF16_ADD_SUB_ACCESS_COLS;
-            core::ptr::write_bytes(
-                values[padding_start..].as_mut_ptr(),
-                0,
-                values.len() - padding_start,
-            );
+            core::ptr::write_bytes(values.as_mut_ptr(), 0, values.len());
         }
 
-        let populated = instructions.len() * BF16_ADD_SUB_ACCESS_COLS;
-        values[..populated].par_chunks_mut(BF16_ADD_SUB_ACCESS_COLS).zip_eq(instructions).for_each(
-            |(row, instruction)| {
-                let Bf16AddSubInstr { opcode, addrs, mult } = instruction;
-                let cols: &mut Bf16AddSubAccessCols<F> = row.borrow_mut();
-                *cols = Bf16AddSubAccessCols {
-                    is_real: F::one(),
-                    op_code: F::from_canonical_u8(opcode.as_u8()),
-                    addrs: *addrs,
-                    mult: *mult,
-                };
-            },
-        );
+        let populate = |row: &mut [F], instruction: &Bf16AddSubInstr<F>| {
+            let Bf16AddSubInstr { opcode, addrs, mult } = instruction;
+            let cols: &mut Bf16AddSubAccessCols<F> = row.borrow_mut();
+            *cols = Bf16AddSubAccessCols {
+                is_real: F::one(),
+                op_code: F::from_canonical_u8(opcode.as_u8()),
+                addrs: *addrs,
+                mult: *mult,
+            };
+        };
+
+        for analyzed in program.inner.iter() {
+            let (start, count) = match analyzed.inner() {
+                Instruction::Bf16AddSub(instruction) => {
+                    let start = analyzed.offset() * BF16_ADD_SUB_ACCESS_COLS;
+                    populate(&mut values[start..start + BF16_ADD_SUB_ACCESS_COLS], instruction);
+                    continue;
+                }
+                Instruction::Bf16LinearBatch(batch) => {
+                    (analyzed.secondary_offset(), batch.add_sub_count())
+                }
+                Instruction::Bf16MeanBatch(batch) => (analyzed.offset(), batch.add_sub_count()),
+                _ => continue,
+            };
+            let start = start * BF16_ADD_SUB_ACCESS_COLS;
+            let end = start + count * BF16_ADD_SUB_ACCESS_COLS;
+            values[start..end].par_chunks_mut(BF16_ADD_SUB_ACCESS_COLS).enumerate().for_each(
+                |(index, row)| {
+                    let instruction = match analyzed.inner() {
+                        Instruction::Bf16LinearBatch(batch) => batch.add_sub_instruction(index),
+                        Instruction::Bf16MeanBatch(batch) => batch.add_sub_instruction(index),
+                        _ => unreachable!(),
+                    };
+                    let Bf16AddSubInstr { opcode, addrs, mult } = instruction;
+                    let cols: &mut Bf16AddSubAccessCols<F> = row.borrow_mut();
+                    *cols = Bf16AddSubAccessCols {
+                        is_real: F::one(),
+                        op_code: F::from_canonical_u8(opcode.as_u8()),
+                        addrs,
+                        mult,
+                    };
+                },
+            );
+        }
     }
 
     fn generate_dependencies(&self, _input: &Self::Record, _output: &mut Self::Record) {}

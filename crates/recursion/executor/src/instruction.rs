@@ -30,9 +30,11 @@ pub enum Instruction<F> {
     Bf16Unary(Bf16UnaryInstr<F>),
     Bf16Div(Bf16DivInstr<F>),
     Bf16AddSub(Bf16AddSubInstr<F>),
+    Bf16LinearBatch(Box<Bf16LinearBatchInstr<F>>),
+    Bf16MeanBatch(Box<Bf16MeanBatchInstr<F>>),
 }
 
-impl<F: Copy> Instruction<F> {
+impl<F: AbstractField + Copy> Instruction<F> {
     #[cfg(any(test, feature = "program_validation"))]
     #[allow(clippy::type_complexity)]
     #[must_use]
@@ -86,6 +88,21 @@ impl<F: Copy> Instruction<F> {
                 addrs: Bf16AddSubIo { output, lhs, rhs },
                 ..
             }) => (svec![lhs, rhs], svec![output]),
+            Instruction::Bf16LinearBatch(ref instr) => {
+                let mut inputs =
+                    SmallVec::with_capacity(instr.input_addrs.len() + instr.weight_addrs.len());
+                inputs.extend_from_slice(&instr.input_addrs);
+                inputs.extend_from_slice(&instr.weight_addrs);
+                let outputs =
+                    (0..instr.dot_count()).map(|index| instr.output_address(index)).collect();
+                (inputs, outputs)
+            }
+            Instruction::Bf16MeanBatch(ref instr) => {
+                let mut inputs = SmallVec::with_capacity(instr.value_addrs.len() + 1);
+                inputs.extend_from_slice(&instr.value_addrs);
+                inputs.push(instr.divisor_address());
+                (inputs, svec![instr.output_address()])
+            }
             Instruction::HintBits(HintBitsInstr { ref output_addrs_mults, input_addr }) => {
                 (svec![input_addr], output_addrs_mults.iter().map(|(a, _)| *a).collect())
             }
