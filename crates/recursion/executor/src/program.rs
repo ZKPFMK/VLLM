@@ -1,12 +1,82 @@
 use crate::{analyzed::AnalyzedInstruction, shape::RecursionShape, *};
 use serde::{Deserialize, Serialize};
-use slop_algebra::Field;
-use sp1_hypercube::{air::MachineProgram, septic_digest::SepticDigest, UntrustedConfig};
+use slop_algebra::{AbstractField, Field};
+use slop_symmetric::Permutation;
+use sp1_hypercube::{
+    air::MachineProgram, inner_perm, septic_digest::SepticDigest, UntrustedConfig,
+};
+use sp1_primitives::SP1Field;
 use std::ops::{Deref, DerefMut};
 
 pub use basic_block::BasicBlock;
 pub use raw::RawProgram;
 pub use seq_block::SeqBlock;
+
+/// Domain and version for the descriptor committed by an independently provable event shard.
+pub const EVENT_SHARD_DESCRIPTOR_DOMAIN: u32 = 0x564c_4d53;
+pub const EVENT_SHARD_DESCRIPTOR_VERSION: u32 = 1;
+
+/// Commit the global event counts and this shard's exact ranges.
+///
+/// The digest is constrained by the public-values chip from preprocessed program metadata. A
+/// recursion join can therefore check range coverage without trusting a host manifest.
+#[must_use]
+pub fn event_shard_descriptor_digest(
+    global_counts: RecursionAirEventCount,
+    ranges: RecursionEventRanges,
+) -> [SP1Field; DIGEST_SIZE] {
+    let counts = [
+        global_counts.mem_const_events,
+        global_counts.mem_var_events,
+        global_counts.base_alu_events,
+        global_counts.poseidon2_wide_events,
+        global_counts.bf16_mul_events,
+        global_counts.bf16_unary_events,
+        global_counts.bf16_div_events,
+        global_counts.bf16_add_sub_events,
+        global_counts.commit_pv_hash_events,
+    ];
+    let ranges = [
+        ranges.mem_const,
+        ranges.mem_var,
+        ranges.base_alu,
+        ranges.poseidon2_wide,
+        ranges.bf16_mul,
+        ranges.bf16_unary,
+        ranges.bf16_div,
+        ranges.bf16_add_sub,
+        ranges.commit_pv_hash,
+    ];
+    let mut fields = Vec::with_capacity(2 + counts.len() + 2 * ranges.len());
+    fields.push(SP1Field::from_canonical_u32(EVENT_SHARD_DESCRIPTOR_VERSION));
+    fields.extend(counts.map(SP1Field::from_canonical_usize));
+    for range in ranges {
+        fields.push(SP1Field::from_canonical_usize(range.start));
+        fields.push(SP1Field::from_canonical_usize(range.end));
+    }
+
+    let mut state = [SP1Field::zero(); PERMUTATION_WIDTH];
+    state[0] = SP1Field::from_canonical_u32(EVENT_SHARD_DESCRIPTOR_DOMAIN);
+    state[1] = SP1Field::from_canonical_usize(fields.len());
+    inner_perm().permute_mut(&mut state);
+    for chunk in fields.chunks(HASH_RATE) {
+        state[..HASH_RATE].fill(SP1Field::zero());
+        state[..chunk.len()].copy_from_slice(chunk);
+        inner_perm().permute_mut(&mut state);
+    }
+    state[..DIGEST_SIZE].try_into().unwrap()
+}
+
+#[must_use]
+pub fn event_shard_program_digest(
+    program: &RecursionProgram<SP1Field>,
+) -> Option<[SP1Field; DIGEST_SIZE]> {
+    let ranges = program.event_ranges?;
+    let global_counts = program
+        .global_event_counts
+        .expect("an event-range program must retain its global event counts");
+    Some(event_shard_descriptor_digest(global_counts, ranges))
+}
 
 /// A well-formed recursion program. See [`Self::new_unchecked`] for guaranteed (safety) invariants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +146,7 @@ impl<F: Clone> RecursionProgram<F> {
         assert!(contained(ranges.commit_pv_hash, full.commit_pv_hash));
 
         let mut root = self.0.clone();
+        root.global_event_counts = Some(root.global_event_counts.unwrap_or(root.event_counts));
         root.event_counts = ranges.event_counts();
         root.event_ranges = Some(ranges);
         // SAFETY: only event summary metadata changed; the instruction graph remains the already
@@ -239,6 +310,7 @@ mod validation {
             total_memory: 0,
             shape: None,
             event_counts: counts,
+            global_event_counts: None,
             event_ranges: None,
         }
         .validate()
@@ -251,6 +323,9 @@ pub struct RootProgram<F> {
     pub total_memory: usize,
     pub shape: Option<RecursionShape<F>>,
     pub event_counts: RecursionAirEventCount,
+    /// Event counts of the unsplit program. Present on an event-range view.
+    #[serde(default)]
+    pub global_event_counts: Option<RecursionAirEventCount>,
     /// Optional slices of the global event vectors used by one trace shard.
     pub event_ranges: Option<RecursionEventRanges>,
 }
@@ -263,6 +338,7 @@ impl<F> Default for RootProgram<F> {
             total_memory: Default::default(),
             shape: None,
             event_counts: Default::default(),
+            global_event_counts: None,
             event_ranges: None,
         }
     }

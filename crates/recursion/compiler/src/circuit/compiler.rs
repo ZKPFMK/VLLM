@@ -1147,6 +1147,7 @@ where
             total_memory,
             shape: None,
             event_counts: counts,
+            global_event_counts: None,
             event_ranges: None,
         }
     }

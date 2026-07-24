@@ -8,6 +8,7 @@ use crate::chips::{
     alu_base::{BaseAluChip, NUM_BASE_ALU_ENTRIES_PER_ROW},
     alu_ext::{ExtAluChip, NUM_EXT_ALU_ENTRIES_PER_ROW},
     bf16::{Bf16AddSubChip, Bf16DivChip, Bf16LookupChip, Bf16MulChip, Bf16UnaryChip},
+    global_memory_boundary::GlobalMemoryBoundaryChip,
     mem::{constant::NUM_CONST_MEM_ENTRIES_PER_ROW, MemoryConstChip, MemoryVarChip},
     poseidon2_helper::{
         convert::{ConvertChip, NUM_CONVERT_ENTRIES_PER_ROW},
@@ -49,6 +50,7 @@ pub enum RecursionAir<
     Bf16Unary(Bf16UnaryChip),
     Bf16Div(Bf16DivChip),
     Bf16AddSub(Bf16AddSubChip),
+    GlobalMemoryBoundary(GlobalMemoryBoundaryChip),
 }
 
 impl<
@@ -86,6 +88,7 @@ impl<
             RecursionAir::Bf16Unary(Bf16UnaryChip),
             RecursionAir::Bf16Div(Bf16DivChip),
             RecursionAir::Bf16AddSub(Bf16AddSubChip),
+            RecursionAir::GlobalMemoryBoundary(GlobalMemoryBoundaryChip),
             RecursionAir::PublicValues(PublicValuesChip),
         ]
         .map(Chip::new)
@@ -133,6 +136,7 @@ impl<
             RecursionAir::Bf16Unary(Bf16UnaryChip),
             RecursionAir::Bf16Div(Bf16DivChip),
             RecursionAir::Bf16AddSub(Bf16AddSubChip),
+            RecursionAir::GlobalMemoryBoundary(GlobalMemoryBoundaryChip),
             RecursionAir::PublicValues(PublicValuesChip),
         ]
         .map(Chip::new)

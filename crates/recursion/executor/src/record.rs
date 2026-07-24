@@ -18,9 +18,24 @@ use crate::{
 };
 
 use super::{
-    BaseAluEvent, CommitPublicValuesEvent, ExtAluEvent, MemEvent, Poseidon2Event, RecursionProgram,
-    SelectEvent,
+    Address, BaseAluEvent, Block, CommitPublicValuesEvent, ExtAluEvent, MemEvent, Poseidon2Event,
+    RecursionProgram, SelectEvent,
 };
+
+/// One compressed memory-bus imbalance carried across recursion event shards.
+///
+/// The regular memory LogUp uses this row with the opposite direction to close the current
+/// shard. The global-boundary chip also hashes `(addr, value)` and accumulates the signed,
+/// multiplicity-weighted hash in public values. Those public accumulators must sum to zero when
+/// the independently generated shard proofs are recursively joined.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(C)]
+pub struct GlobalMemoryBoundaryEvent<F> {
+    pub addr: Address<F>,
+    pub value: Block<F>,
+    pub multiplicity: F,
+    pub is_receive: bool,
+}
 
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
 pub struct ExecutionRecord<F> {
@@ -46,6 +61,9 @@ pub struct ExecutionRecord<F> {
     pub bf16_add_sub_events: Vec<Bf16AddSubEvent<F>>,
     pub prefix_sum_checks_events: Vec<PrefixSumChecksEvent<F>>,
     pub commit_pv_hash_events: Vec<CommitPublicValuesEvent<F>>,
+    /// Compressed cross-shard memory interactions. These are derived after event sharding.
+    #[serde(default)]
+    pub global_memory_boundary_events: Vec<GlobalMemoryBoundaryEvent<F>>,
 }
 
 #[derive(Debug)]
@@ -102,6 +120,7 @@ impl<F> UnsafeRecord<F> {
             bf16_add_sub_events: std::mem::transmute(self.bf16_add_sub_events),
             prefix_sum_checks_events: std::mem::transmute(self.prefix_sum_checks_events),
             commit_pv_hash_events: std::mem::transmute(self.commit_pv_hash_events),
+            global_memory_boundary_events: Vec::new(),
         }
     }
 
@@ -163,6 +182,7 @@ impl<F: PrimeField32> MachineRecord for ExecutionRecord<F> {
             ("bf16_add_sub_events", self.bf16_add_sub_events.len()),
             ("prefix_sum_checks_events", self.prefix_sum_checks_events.len()),
             ("commit_pv_hash_events", self.commit_pv_hash_events.len()),
+            ("global_memory_boundary_events", self.global_memory_boundary_events.len()),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v))
@@ -190,6 +210,7 @@ impl<F: PrimeField32> MachineRecord for ExecutionRecord<F> {
             bf16_add_sub_events,
             prefix_sum_checks_events,
             commit_pv_hash_events,
+            global_memory_boundary_events,
         } = self;
         base_alu_events.append(&mut other.base_alu_events);
         ext_alu_events.append(&mut other.ext_alu_events);
@@ -206,6 +227,7 @@ impl<F: PrimeField32> MachineRecord for ExecutionRecord<F> {
         bf16_add_sub_events.append(&mut other.bf16_add_sub_events);
         prefix_sum_checks_events.append(&mut other.prefix_sum_checks_events);
         commit_pv_hash_events.append(&mut other.commit_pv_hash_events);
+        global_memory_boundary_events.append(&mut other.global_memory_boundary_events);
     }
 
     fn public_values<T: AbstractField>(&self) -> Vec<T> {
@@ -263,7 +285,12 @@ impl<F: Copy> ExecutionRecord<F> {
             bf16_add_sub_events,
             prefix_sum_checks_events,
             commit_pv_hash_events,
+            global_memory_boundary_events,
         } = self;
+        assert!(
+            global_memory_boundary_events.is_empty(),
+            "global memory boundaries must be derived after event sharding"
+        );
         assert!(ext_alu_events.is_empty());
         assert!(ext_felt_conversion_events.is_empty());
         assert!(poseidon2_linear_layer_events.is_empty());
@@ -323,6 +350,7 @@ impl<F: Copy> ExecutionRecord<F> {
                         &mut commit_pv_hash,
                         ranges.commit_pv_hash.len(),
                     ),
+                    global_memory_boundary_events: Vec::new(),
                 }
             })
             .collect::<Vec<_>>();

@@ -18,6 +18,7 @@ slop-symmetric = { workspace = true }
 sp1-derive = { workspace = true }
 tracing = { workspace = true }
 sp1-hypercube = { workspace = true }
+sp1-primitives = { workspace = true }
 hashbrown = { workspace = true, features = ["serde"] }
 itertools = { workspace = true }
 libm = { workspace = true }

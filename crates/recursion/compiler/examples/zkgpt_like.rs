@@ -1,7 +1,6 @@
 #![allow(clippy::print_stdout)]
 
 use std::{
-    collections::BTreeSet,
     fmt::Write as _,
     fs::{self, File},
     path::{Path, PathBuf},
@@ -11,12 +10,11 @@ use std::{
 
 use slop_algebra::{AbstractField, Field, PrimeField32};
 use slop_basefold::FriConfig;
-use slop_challenger::{CanObserve, IopCtx};
+use slop_challenger::IopCtx;
 use slop_symmetric::Permutation;
 use sp1_hypercube::{
-    air::MachineAir, inner_perm, prover::simple_prover, HashableKey, InnerSC, LogUpGkrChallenges,
-    LogUpGkrVerifier, MachineProof, MachineVerifyingKey, SP1PcsProofInner, ShardProof,
-    ShardVerifier,
+    air::MachineAir, inner_perm, prover::simple_prover, HashableKey, MachineProof,
+    MachineVerifyingKey, SP1PcsProofInner, ShardProof, ShardVerifier,
 };
 use sp1_primitives::{
     fri_params::{unique_decoding_queries, SP1_PROOF_OF_WORK_BITS},
@@ -28,10 +26,12 @@ use sp1_recursion_compiler::{
 };
 use sp1_recursion_executor::{
     Bf16AddSubEvent, Bf16DivEvent, Bf16MulEvent, Bf16UnaryEvent, Block, ExecutionRecord, Executor,
-    RecursionProgram, DIGEST_SIZE, HASH_RATE, PERMUTATION_WIDTH,
+    RecursionAirEventCount, RecursionEventRanges, RecursionProgram, DIGEST_SIZE, HASH_RATE,
+    PERMUTATION_WIDTH,
 };
 use sp1_recursion_machine::{
     chips::bf16::{NUM_BF16_ADD_SUB_EVENTS_PER_ROW, NUM_BF16_MUL_EVENTS_PER_ROW},
+    chips::global_memory_boundary::prepare_event_shard_boundary,
     sharding::{plan_event_shards, ShardLimits},
     RecursionAir,
 };
@@ -50,10 +50,10 @@ const PROOF_LOG_STACKING_HEIGHT: u32 = 22;
 // requires max_log_row_count < 29, so 28 is both necessary and the largest supported value.
 const PROOF_MAX_LOG_ROW_COUNT: usize = 28;
 const BLOCK_PROTOCOL_VERSION: u32 = 2;
-const EVENT_BLOCK_RECURSION_PROTOCOL_VERSION: u32 = 1;
+const EVENT_BLOCK_RECURSION_PROTOCOL_VERSION: u32 = 2;
 const EVENT_BLOCK_RECURSION_STAGE: &str = "zkgpt_block_shard_recursion";
-const EVENT_SHARD_BATCH_DOMAIN: u32 = 0x5a4b_4556;
 const EVENT_SHARD_TRANSCRIPT_DOMAIN: u32 = 0x5a4b_4557;
+const EVENT_SHARD_PROTOCOL_VERSION: u32 = 3;
 
 type StoredProof = MachineProof<SP1GlobalContext, SP1PcsProofInner>;
 type StoredVerifyingKey = MachineVerifyingKey<SP1GlobalContext>;
@@ -248,33 +248,47 @@ struct ProofArtifacts {
 
 #[derive(Debug, Clone)]
 struct EventShardBatchBinding {
+    ranges: RecursionEventRanges,
     verifying_key: StoredVerifyingKey,
     main_commitment: StoredDigest,
     real_heights: Vec<(String, usize)>,
 }
 
-fn derive_event_shard_batch_challenges(
-    bindings: &[EventShardBatchBinding],
-    beta_seed_dimension: usize,
-) -> LogUpGkrChallenges<SP1ExtensionField> {
-    assert!(!bindings.is_empty(), "an event shard batch cannot be empty");
-    let mut challenger = SP1GlobalContext::default_challenger();
-    challenger.observe(SP1Field::from_canonical_u32(EVENT_SHARD_BATCH_DOMAIN));
-    challenger.observe(SP1Field::from_canonical_usize(bindings.len()));
-    for (index, binding) in bindings.iter().enumerate() {
-        challenger.observe(SP1Field::from_canonical_usize(index));
-        binding.verifying_key.observe_into(&mut challenger);
-        challenger.observe(binding.main_commitment);
-        challenger.observe(SP1Field::from_canonical_usize(binding.real_heights.len()));
-        for (name, height) in &binding.real_heights {
-            challenger.observe(SP1Field::from_canonical_usize(name.len()));
-            for byte in name.bytes() {
-                challenger.observe(SP1Field::from_canonical_u8(byte));
-            }
-            challenger.observe(SP1Field::from_canonical_usize(*height));
-        }
-    }
-    LogUpGkrChallenges::sample::<SP1Field, _>(&mut challenger, beta_seed_dimension)
+fn event_count_fields(counts: RecursionAirEventCount) -> [usize; 9] {
+    [
+        counts.mem_const_events,
+        counts.mem_var_events,
+        counts.base_alu_events,
+        counts.poseidon2_wide_events,
+        counts.bf16_mul_events,
+        counts.bf16_unary_events,
+        counts.bf16_div_events,
+        counts.bf16_add_sub_events,
+        counts.commit_pv_hash_events,
+    ]
+}
+
+fn event_range_fields(ranges: RecursionEventRanges) -> [usize; 18] {
+    [
+        ranges.mem_const.start,
+        ranges.mem_const.end,
+        ranges.mem_var.start,
+        ranges.mem_var.end,
+        ranges.base_alu.start,
+        ranges.base_alu.end,
+        ranges.poseidon2_wide.start,
+        ranges.poseidon2_wide.end,
+        ranges.bf16_mul.start,
+        ranges.bf16_mul.end,
+        ranges.bf16_unary.start,
+        ranges.bf16_unary.end,
+        ranges.bf16_div.start,
+        ranges.bf16_div.end,
+        ranges.bf16_add_sub.start,
+        ranges.bf16_add_sub.end,
+        ranges.commit_pv_hash.start,
+        ranges.commit_pv_hash.end,
+    ]
 }
 
 fn commit_fields(domain: u32, values: &[SP1Field]) -> [SP1Field; DIGEST_SIZE] {
@@ -293,10 +307,11 @@ fn commit_fields(domain: u32, values: &[SP1Field]) -> [SP1Field; DIGEST_SIZE] {
 fn event_shard_transcript(
     shape: Shape,
     block: Option<usize>,
+    global_counts: RecursionAirEventCount,
     bindings: &[EventShardBatchBinding],
 ) -> [SP1Field; DIGEST_SIZE] {
     let mut fields = [
-        2,
+        EVENT_SHARD_PROTOCOL_VERSION,
         shape.sequence_length as u32,
         shape.hidden_size as u32,
         shape.num_heads as u32,
@@ -306,8 +321,10 @@ fn event_shard_transcript(
     ]
     .map(SP1Field::from_canonical_u32)
     .to_vec();
+    fields.extend(event_count_fields(global_counts).map(SP1Field::from_canonical_usize));
     for (index, binding) in bindings.iter().enumerate() {
         fields.push(SP1Field::from_canonical_usize(index));
+        fields.extend(event_range_fields(binding.ranges).map(SP1Field::from_canonical_usize));
         fields.extend(binding.verifying_key.hash_koalabear());
         fields.extend(binding.main_commitment);
         fields.push(SP1Field::from_canonical_usize(binding.real_heights.len()));
@@ -1257,7 +1274,6 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
         let shard_records = record.into_event_shards(shard_programs);
 
         type A = RecursionAir<SP1Field, 3, 2>;
-        type SC = InnerSC<A>;
         let verifier = ShardVerifier::from_basefold_parameters(
             FriConfig::new(
                 PROOF_LOG_BLOWUP,
@@ -1269,66 +1285,66 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
             A::verillm_machine(),
         );
         let prover = simple_prover(verifier);
-        let all_chips = prover.machine().chips().iter().cloned().collect::<BTreeSet<_>>();
-        let beta_seed_dimension =
-            LogUpGkrVerifier::<SP1GlobalContext, SC>::beta_seed_dimension(&all_chips);
-
-        // Phase one commits every shard before any lookup challenge is sampled. We deliberately
-        // regenerate these deterministic traces in phase two so only one large trace is resident
-        // at a time.
-        let batch_commit_started = Instant::now();
-        let mut bindings = Vec::with_capacity(shard_records.len());
-        for (shard, record) in plan.shards.iter().zip(&shard_records) {
-            println!(
-                "committing event shard {}/{} for shared lookup transcript",
-                shard.index + 1,
-                plan.shards.len()
-            );
-            let (setup, verifying_key) = prover.setup(record.program.clone()).await;
-            drop(setup);
-            let (main_commitment, real_heights) =
-                prover.commit_shard_main_traces(record.clone()).await;
-            bindings.push(EventShardBatchBinding { verifying_key, main_commitment, real_heights });
-        }
-        let shared_challenges = derive_event_shard_batch_challenges(&bindings, beta_seed_dimension);
-        println!(
-            "event shard batch committed: shards={} elapsed={:.3}s",
-            bindings.len(),
-            batch_commit_started.elapsed().as_secs_f64()
-        );
 
         let mut artifacts = Vec::with_capacity(plan.shards.len());
-        let mut batch_residual = SP1ExtensionField::zero();
-        for ((shard, record), binding) in plan.shards.iter().zip(shard_records).zip(&bindings) {
+        let mut bindings = Vec::with_capacity(plan.shards.len());
+        let mut global_memory_accumulator = [SP1Field::zero(); 14];
+        let mut total_boundary_events = 0usize;
+        for (shard, mut record) in plan.shards.iter().zip(shard_records) {
+            let boundary_started = Instant::now();
+            let shard_accumulator = prepare_event_shard_boundary(&mut record);
+            global_memory_accumulator
+                .iter_mut()
+                .zip(shard_accumulator)
+                .for_each(|(total, value)| *total += value);
             let artifact_stem = arguments
                 .block
                 .map(|block| format!("{}_s{:03}", block_stem(block), shard.index))
                 .unwrap_or_else(|| format!("zkgpt_like_s{:03}", shard.index));
+            let boundary_events = record.global_memory_boundary_events.len();
+            total_boundary_events += boundary_events;
+            let boundary_rows = boundary_events.next_multiple_of(32).max(16);
+            let exact_shape =
+                prover.shape_from_record(&record).expect("VeriLLM machine has no shard shape");
+            let exact_trace_area = exact_shape.preprocessed_area + exact_shape.main_area;
+            assert!(
+                boundary_rows <= plan.limits.max_rows(),
+                "event shard {} global boundary has {} rows, exceeding the configured {}-row limit",
+                shard.index,
+                boundary_rows,
+                plan.limits.max_rows()
+            );
+            if exact_trace_area > plan.limits.max_trace_area {
+                println!(
+                    "warning: event shard {} exact trace area {} exceeds planner target {} after \
+                     adding global memory boundaries",
+                    shard.index, exact_trace_area, plan.limits.max_trace_area
+                );
+            }
             println!(
-                "proving event shard {}/{}: max_rows={} trace_area={}",
+                "proving independent event shard {}/{}: planned_max_rows={} \
+                 planned_trace_area={} boundary_events={} boundary_rows={} exact_trace_area={}",
                 shard.index + 1,
                 plan.shards.len(),
                 shard.estimate.max_rows(),
-                shard.estimate.total_area
+                shard.estimate.total_area,
+                boundary_events,
+                boundary_rows,
+                exact_trace_area
+            );
+            println!(
+                "prepared shard memory boundary: events={} elapsed={:.3}s",
+                boundary_events,
+                boundary_started.elapsed().as_secs_f64()
             );
             let setup_started = Instant::now();
             let (pk, verifying_key) = prover.setup(record.program.clone()).await;
-            assert_eq!(
-                verifying_key, binding.verifying_key,
-                "event shard verifying key changed between batch phases"
-            );
             let pk = unsafe { pk.into_inner() };
             println!("shard setup: elapsed={:.3}s", setup_started.elapsed().as_secs_f64());
 
             let prove_started = Instant::now();
-            let shard_proof = prover
-                .prove_shard_with_logup_challenges(pk, record, shared_challenges.clone())
-                .await;
-            assert_eq!(
-                shard_proof.main_commitment, binding.main_commitment,
-                "event shard main commitment changed between batch phases"
-            );
-            let proof_heights = shard_proof
+            let shard_proof = prover.prove_shard(pk, record).await;
+            let real_heights = shard_proof
                 .opened_values
                 .chips
                 .iter()
@@ -1339,28 +1355,25 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
                     )
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(
-                proof_heights, binding.real_heights,
-                "event shard real heights changed between batch phases"
-            );
             println!(
                 "shard proof generated: elapsed={:.3}s",
                 prove_started.elapsed().as_secs_f64()
             );
 
             let verify_started = Instant::now();
-            let local_residual = prover
-                .verify_shard_with_logup_challenges(
-                    &verifying_key,
-                    &shard_proof,
-                    &shared_challenges,
-                )
-                .expect("batched event shard proof must verify");
-            batch_residual += local_residual;
+            prover
+                .verify(&verifying_key, &MachineProof::from(vec![shard_proof.clone()]))
+                .expect("independent event shard proof must verify");
             println!(
                 "shard proof verified: elapsed={:.3}s",
                 verify_started.elapsed().as_secs_f64()
             );
+            bindings.push(EventShardBatchBinding {
+                ranges: shard.ranges,
+                verifying_key: verifying_key.clone(),
+                main_commitment: shard_proof.main_commitment,
+                real_heights,
+            });
             let proof = write_event_shard_proof(
                 &arguments.output_dir,
                 &artifact_stem,
@@ -1435,6 +1448,17 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
             .unwrap();
             writeln!(artifact, "      \"main_area\": {},", shard.estimate.main_area).unwrap();
             writeln!(artifact, "      \"trace_area\": {},", shard.estimate.total_area).unwrap();
+            writeln!(artifact, "      \"global_memory_boundary_events\": {boundary_events},")
+                .unwrap();
+            writeln!(artifact, "      \"global_memory_boundary_rows\": {boundary_rows},").unwrap();
+            writeln!(
+                artifact,
+                "      \"exact_preprocessed_area\": {},",
+                exact_shape.preprocessed_area
+            )
+            .unwrap();
+            writeln!(artifact, "      \"exact_main_area\": {},", exact_shape.main_area).unwrap();
+            writeln!(artifact, "      \"exact_trace_area\": {exact_trace_area},").unwrap();
             writeln!(artifact, "      \"proof_file\": \"{}\",", proof.proof_file).unwrap();
             writeln!(artifact, "      \"proof_bytes\": {},", proof.proof_bytes).unwrap();
             writeln!(artifact, "      \"verifying_key_file\": \"{}\",", proof.verifying_key_file)
@@ -1445,24 +1469,30 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
             artifacts.push(artifact);
         }
         assert!(
-            batch_residual.is_zero(),
-            "event shard lookup residuals do not cancel under the shared batch challenges"
+            global_memory_accumulator.iter().all(Field::is_zero),
+            "event-shard global memory accumulators do not close"
         );
-        println!("event shard lookup batch closed: residual=0");
-        let block_transcript = event_shard_transcript(shape, arguments.block, &bindings);
+        println!(
+            "independent event shard proofs closed locally; global memory accumulator closed: \
+             boundary_events={total_boundary_events}"
+        );
+        let block_transcript =
+            event_shard_transcript(shape, arguments.block, plan.global_counts, &bindings);
         let manifest_path = arguments.output_dir.join("zkgpt_event_shards.manifest.json");
         let mut manifest = String::new();
         writeln!(manifest, "{{").unwrap();
-        writeln!(manifest, "  \"version\": 2,").unwrap();
+        writeln!(manifest, "  \"version\": {EVENT_SHARD_PROTOCOL_VERSION},").unwrap();
         writeln!(manifest, "  \"stage\": \"zkgpt_event_shards\",").unwrap();
-        writeln!(manifest, "  \"lookup_protocol\": \"shared_challenge_batch\",").unwrap();
+        writeln!(manifest, "  \"lookup_protocol\": \"independent_global_memory_accumulator\",")
+            .unwrap();
         writeln!(manifest, "  \"lookup_batch_closed\": true,").unwrap();
         writeln!(
             manifest,
             "  \"transcript_binding\": \
-             \"ordered_verifying_keys_main_trace_commitments_real_heights\","
+             \"global_event_counts_ordered_ranges_verifying_keys_main_trace_commitments_real_heights\","
         )
         .unwrap();
+        writeln!(manifest, "  \"global_memory_accumulator\": \"poseidon_vector_14\",").unwrap();
         writeln!(manifest, "  \"sequence_length\": {},", shape.sequence_length).unwrap();
         writeln!(manifest, "  \"hidden_size\": {},", shape.hidden_size).unwrap();
         writeln!(manifest, "  \"num_heads\": {},", shape.num_heads).unwrap();
@@ -1473,7 +1503,21 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
             digest_hex(&block_transcript)
         )
         .unwrap();
-        writeln!(manifest, "  \"beta_seed_dimension\": {beta_seed_dimension},").unwrap();
+        writeln!(manifest, "  \"global_event_counts\": {{").unwrap();
+        writeln!(manifest, "    \"mem_const\": {},", plan.global_counts.mem_const_events).unwrap();
+        writeln!(manifest, "    \"mem_var\": {},", plan.global_counts.mem_var_events).unwrap();
+        writeln!(manifest, "    \"base_alu\": {},", plan.global_counts.base_alu_events).unwrap();
+        writeln!(manifest, "    \"poseidon2_wide\": {},", plan.global_counts.poseidon2_wide_events)
+            .unwrap();
+        writeln!(manifest, "    \"bf16_mul\": {},", plan.global_counts.bf16_mul_events).unwrap();
+        writeln!(manifest, "    \"bf16_unary\": {},", plan.global_counts.bf16_unary_events)
+            .unwrap();
+        writeln!(manifest, "    \"bf16_div\": {},", plan.global_counts.bf16_div_events).unwrap();
+        writeln!(manifest, "    \"bf16_add_sub\": {},", plan.global_counts.bf16_add_sub_events)
+            .unwrap();
+        writeln!(manifest, "    \"commit_pv_hash\": {}", plan.global_counts.commit_pv_hash_events)
+            .unwrap();
+        writeln!(manifest, "  }},").unwrap();
         match arguments.block {
             Some(block) => writeln!(manifest, "  \"block\": {block},").unwrap(),
             None => writeln!(manifest, "  \"block\": null,").unwrap(),

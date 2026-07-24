@@ -1,16 +1,20 @@
 use crate::builder::SP1RecursionAirBuilder;
 use slop_air::{Air, AirBuilder, BaseAir, PairBuilder};
-use slop_algebra::PrimeField32;
+use slop_algebra::{AbstractField, PrimeField32};
 use slop_matrix::Matrix;
 use sp1_derive::AlignedBorrow;
-use sp1_hypercube::air::MachineAir;
+use sp1_hypercube::{
+    air::{AirInteraction, InteractionScope, MachineAir},
+    InteractionKind,
+};
 use sp1_primitives::SP1Field;
 use sp1_recursion_executor::{
-    ExecutionRecord, Instruction, RecursionProgram, RecursionPublicValues, DIGEST_SIZE,
-    RECURSIVE_PROOF_NUM_PV_ELTS,
+    event_shard_descriptor_digest, ExecutionRecord, Instruction, RecursionProgram,
+    RecursionPublicValues, DIGEST_SIZE, RECURSIVE_PROOF_NUM_PV_ELTS,
 };
 use std::{
     borrow::{Borrow, BorrowMut},
+    iter::once,
     mem::MaybeUninit,
 };
 
@@ -32,6 +36,10 @@ pub struct PublicValuesChip;
 pub struct PublicValuesPreprocessedCols<T: Copy> {
     pub pv_idx: [T; DIGEST_SIZE],
     pub pv_mem: MemoryAccessColsChips<T>,
+    /// One on the first row of an event-range program.
+    pub event_shard_enabled: T,
+    /// Commitment to global event counts and this program view's exact ranges.
+    pub event_shard_digest: [T; DIGEST_SIZE],
 }
 
 /// The cols for a CommitPVHash invocation.
@@ -39,6 +47,10 @@ pub struct PublicValuesPreprocessedCols<T: Copy> {
 #[repr(C)]
 pub struct PublicValuesCols<T: Copy> {
     pub pv_element: T,
+    /// Event-shard global-accumulation endpoint copied into main columns so lookup interactions do
+    /// not directly contain public-value expressions.
+    pub event_shard_count: T,
+    pub event_shard_accumulator: [T; 14],
 }
 
 impl<F> BaseAir<F> for PublicValuesChip {
@@ -132,6 +144,18 @@ impl<F: PrimeField32> MachineAir<F> for PublicValuesChip {
                 cols.pv_mem = MemoryAccessCols { addr: *addr, mult: F::one() };
             }
         }
+
+        if let Some(ranges) = program.event_ranges {
+            let global_counts = program
+                .global_event_counts
+                .expect("an event-range program must retain global event counts");
+            let digest = event_shard_descriptor_digest(global_counts, ranges);
+            let cols: &mut PublicValuesPreprocessedCols<F> =
+                values[..NUM_PUBLIC_VALUES_PREPROCESSED_COLS].borrow_mut();
+            cols.event_shard_enabled = F::one();
+            cols.event_shard_digest =
+                digest.map(|value| F::from_canonical_u32(value.as_canonical_u32()));
+        }
     }
 
     fn generate_trace_into(
@@ -165,6 +189,15 @@ impl<F: PrimeField32> MachineAir<F> for PublicValuesChip {
                 cols.pv_element = *element;
             }
         }
+
+        if input.program.event_ranges.is_some() {
+            let cols: &mut PublicValuesCols<F> = values[..NUM_PUBLIC_VALUES_COLS].borrow_mut();
+            cols.event_shard_count = input.public_values.num_included_shard;
+            cols.event_shard_accumulator[..7]
+                .copy_from_slice(&input.public_values.global_cumulative_sum.0.x.0);
+            cols.event_shard_accumulator[7..]
+                .copy_from_slice(&input.public_values.global_cumulative_sum.0.y.0);
+        }
     }
 
     fn included(&self, _record: &Self::Record) -> bool {
@@ -193,7 +226,46 @@ where
 
         for (i, pv_elm) in public_values.digest.iter().enumerate() {
             builder.when(local_prepr.pv_idx[i]).assert_eq(pv_elm.clone(), local.pv_element);
+            builder
+                .when(local_prepr.event_shard_enabled)
+                .assert_eq(pv_elm.clone(), local_prepr.event_shard_digest[i]);
         }
+        builder.assert_bool(local_prepr.event_shard_enabled);
+
+        builder
+            .when(local_prepr.event_shard_enabled)
+            .assert_eq(local.event_shard_count, public_values.num_included_shard.clone());
+        for (actual, expected) in local.event_shard_accumulator.iter().zip(
+            public_values
+                .global_cumulative_sum
+                .0
+                .x
+                .0
+                .iter()
+                .chain(public_values.global_cumulative_sum.0.y.0.iter()),
+        ) {
+            builder.when(local_prepr.event_shard_enabled).assert_eq(*actual, expected.clone());
+        }
+
+        let zero = AB::Expr::zero();
+        builder.send(
+            AirInteraction::new(
+                once(zero.clone()).chain((0..14).map(|_| zero.clone())).collect(),
+                local_prepr.event_shard_enabled.into(),
+                InteractionKind::GlobalAccumulation,
+            ),
+            InteractionScope::Local,
+        );
+        builder.receive(
+            AirInteraction::new(
+                once(local.event_shard_count.into())
+                    .chain(local.event_shard_accumulator.map(Into::into))
+                    .collect(),
+                local_prepr.event_shard_enabled.into(),
+                InteractionKind::GlobalAccumulation,
+            ),
+            InteractionScope::Local,
+        );
     }
 }
 

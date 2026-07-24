@@ -164,12 +164,19 @@ the model into LayerNorm/attention/MLP subcircuits. The default limits are
 `2^22` rows per chip and `3 * 2^27` total main-plus-preprocessed cells per leaf.
 The current full `30 x 768` Block plan contains about 25 event leaves.
 
-Every leaf first commits its main trace. The ordered verifying keys, main trace
-commitments, chip names, and real heights jointly derive one shared LogUp
-challenge. Each leaf proof may have a nonzero local lookup residual; the batch
-is accepted only when all residuals sum to zero under that same challenge. A
-recursion circuit verifies all leaves, checks the residual sum, recomputes the
-ordered trace-batch digest, and emits one Block wrapper proof.
+Every leaf now uses its own Fiat-Shamir transcript and is independently
+provable. Cross-leaf recursion-memory messages are closed locally by a
+`GlobalMemoryBoundary` trace. The same boundary messages contribute to a
+14-coordinate Poseidon accumulator exposed in each leaf's public values. The
+Block recursion circuit verifies every leaf proof independently, checks exact
+ordered event-range coverage, requires the coordinate-wise global accumulator
+sum to be zero, recomputes the ordered trace digest, and emits one Block wrapper
+proof. There is no all-leaf commitment barrier or shared LogUp challenge before
+leaf proving.
+
+This format uses event-leaf protocol v3, Block-wrapper protocol v2, and
+Block-recursion protocol v3. Artifacts from the earlier shared-challenge format
+are intentionally rejected; use a fresh output root for the first run.
 
 The public hidden-state input is placed in `MemoryConst`; model parameters and
 attention hints enter through the private witness stream. There are no separate
@@ -231,7 +238,7 @@ The final Block-0 artifact is
 `zkgpt_block_00_shard_recursion.manifest.json`. Its proof can be used directly
 as a child of the 12-Block recursion tree.
 
-`--resume` validates the event-leaf files, trace-batch metadata, Block wrapper
+`--resume` validates the event-leaf files, range and global-accumulator metadata, Block wrapper
 artifacts, and adjacent Block ranges before skipping completed work. The runner
 writes `zkgpt_block_recursion.run.json` and prints the final recursion manifest
 path. After completion, verify the serialized final proof, its public recursion

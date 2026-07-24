@@ -8184,6 +8184,7 @@ dependencies = [
  "smallvec",
  "sp1-derive",
  "sp1-hypercube",
+ "sp1-primitives 6.3.1",
  "static_assertions",
  "thiserror 1.0.69",
  "tracing",
@@ -8225,6 +8226,7 @@ dependencies = [
 name = "sp1-recursion-machine"
 version = "6.3.1"
 dependencies = [
+ "hashbrown 0.14.5",
  "itertools 0.14.0",
  "rand 0.8.6",
  "slop-air",

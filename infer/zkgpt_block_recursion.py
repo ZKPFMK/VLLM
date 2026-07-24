@@ -32,9 +32,11 @@ HIDDEN_SIZE = 768
 NUM_HEADS = 12
 LINEAR_SIZE = 2304
 BLOCK_STAGE = "zkgpt_block_shard_recursion"
-BLOCK_PROTOCOL_VERSION = 1
+BLOCK_PROTOCOL_VERSION = 2
 EVENT_SHARD_STAGE = "zkgpt_event_shards"
+EVENT_SHARD_PROTOCOL_VERSION = 3
 RECURSION_STAGE = "zkgpt_block_recursion"
+RECURSION_PROTOCOL_VERSION = 3
 RUN_MANIFEST = "zkgpt_block_recursion.run.json"
 
 
@@ -161,23 +163,65 @@ def validate_event_shard_manifest(path: Path, expected_block: int) -> dict[str, 
             raise ValidationError(
                 f"{path}: expected {key}={value}, found {data.get(key)!r}"
             )
-    if data.get("lookup_protocol") != "shared_challenge_batch":
+    if data.get("version") != EVENT_SHARD_PROTOCOL_VERSION:
+        raise ValidationError(
+            f"{path}: expected event-shard protocol version "
+            f"{EVENT_SHARD_PROTOCOL_VERSION}"
+        )
+    if data.get("lookup_protocol") != "independent_global_memory_accumulator":
         raise ValidationError(f"{path}: unsupported lookup protocol")
     if data.get("lookup_batch_closed") is not True:
         raise ValidationError(f"{path}: lookup batch is not closed")
     if (
         data.get("transcript_binding")
-        != "ordered_verifying_keys_main_trace_commitments_real_heights"
+        != "global_event_counts_ordered_ranges_verifying_keys_main_trace_commitments_real_heights"
     ):
         raise ValidationError(f"{path}: unsupported trace transcript binding")
+    if data.get("global_memory_accumulator") != "poseidon_vector_14":
+        raise ValidationError(f"{path}: unsupported global memory accumulator")
     require_digest(data, "block_transcript_commitment", path)
     require_file(path.parent, data.get("private_output_file"), "private output", path)
     artifacts = data.get("artifacts")
     if not isinstance(artifacts, list) or data.get("shards") != len(artifacts) or not artifacts:
         raise ValidationError(f"{path}: invalid event-shard artifact count")
+    event_names = (
+        "mem_const",
+        "mem_var",
+        "base_alu",
+        "poseidon2_wide",
+        "bf16_mul",
+        "bf16_unary",
+        "bf16_div",
+        "bf16_add_sub",
+        "commit_pv_hash",
+    )
+    global_counts = data.get("global_event_counts")
+    if not isinstance(global_counts, dict) or any(
+        not isinstance(global_counts.get(name), int) or global_counts[name] < 0
+        for name in event_names
+    ):
+        raise ValidationError(f"{path}: invalid global event counts")
+    expected_starts = {name: 0 for name in event_names}
     for index, artifact in enumerate(artifacts):
         if not isinstance(artifact, dict) or artifact.get("index") != index:
             raise ValidationError(f"{path}: event shard {index} is missing or unordered")
+        ranges = artifact.get("ranges")
+        if not isinstance(ranges, dict):
+            raise ValidationError(f"{path}: event shard {index} has no ranges")
+        for name in event_names:
+            value = ranges.get(name)
+            if (
+                not isinstance(value, list)
+                or len(value) != 2
+                or any(not isinstance(endpoint, int) for endpoint in value)
+                or value[0] != expected_starts[name]
+                or value[0] > value[1]
+                or value[1] > global_counts[name]
+            ):
+                raise ValidationError(
+                    f"{path}: event shard {index} has invalid {name} range {value!r}"
+                )
+            expected_starts[name] = value[1]
         require_file(path.parent, artifact.get("proof_file"), f"shard {index} proof", path)
         require_file(
             path.parent,
@@ -185,6 +229,9 @@ def validate_event_shard_manifest(path: Path, expected_block: int) -> dict[str, 
             f"shard {index} verifying key",
             path,
         )
+    for name in event_names:
+        if expected_starts[name] != global_counts[name]:
+            raise ValidationError(f"{path}: event shards do not fully cover {name}")
     return data
 
 
@@ -233,8 +280,11 @@ def load_recursion_node(path: Path, expected_start: int, expected_end: int) -> N
     data = read_json(path)
     if data.get("stage") != RECURSION_STAGE:
         raise ValidationError(f"{path}: not a Block recursion manifest")
-    if data.get("version") != 2:
-        raise ValidationError(f"{path}: expected recursion protocol version 2")
+    if data.get("version") != RECURSION_PROTOCOL_VERSION:
+        raise ValidationError(
+            f"{path}: expected recursion protocol version "
+            f"{RECURSION_PROTOCOL_VERSION}"
+        )
     require_shape(data, path)
     if data.get("start_block") != expected_start or data.get("end_block") != expected_end:
         raise ValidationError(
@@ -477,7 +527,7 @@ def write_run_manifest(
 ) -> None:
     final_data = read_json(final.manifest)
     value = {
-        "version": 2,
+        "version": 3,
         "stage": "zkgpt_full_block_recursion",
         "blocks": NUM_BLOCKS,
         "block_proofs": NUM_BLOCKS,

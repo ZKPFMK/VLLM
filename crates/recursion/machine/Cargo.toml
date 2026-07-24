@@ -24,6 +24,7 @@ slop-algebra = { workspace = true }
 slop-maybe-rayon = { workspace = true }
 slop-symmetric = { workspace = true }
 itertools = { workspace = true }
+hashbrown = { workspace = true }
 strum = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
 rand = { workspace = true }

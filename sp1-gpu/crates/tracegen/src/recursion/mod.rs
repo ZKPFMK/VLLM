@@ -137,6 +137,8 @@ pub(crate) mod tests {
                 total_memory: 0, // Will be filled in.
                 shape: None,
                 event_counts: Default::default(),
+                global_event_counts: None,
+                event_ranges: None,
             })
         };
 
