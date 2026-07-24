@@ -12,7 +12,7 @@ pub use basic_block::BasicBlock;
 pub use raw::RawProgram;
 pub use seq_block::SeqBlock;
 
-/// Domain and version for the descriptor committed by an independently provable event shard.
+/// Domain and version for the descriptor committed by an event shard.
 pub const EVENT_SHARD_DESCRIPTOR_DOMAIN: u32 = 0x564c_4d53;
 pub const EVENT_SHARD_DESCRIPTOR_VERSION: u32 = 1;
 

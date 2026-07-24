@@ -164,22 +164,23 @@ the model into LayerNorm/attention/MLP subcircuits. The default limits are
 `2^22` rows per chip and `3 * 2^27` total main-plus-preprocessed cells per leaf.
 The current full `30 x 768` Block plan contains about 25 event leaves.
 
-Every leaf now uses its own Fiat-Shamir transcript and is independently
-provable. Cross-leaf recursion-memory messages are closed locally by a
-`GlobalMemoryBoundary` trace. The same boundary messages contribute to a
-14-coordinate Poseidon accumulator exposed in each leaf's public values. The
-Block recursion circuit verifies every leaf proof independently, checks exact
-ordered event-range coverage, requires the coordinate-wise global accumulator
-sum to be zero, recomputes the ordered trace digest, and emits one Block wrapper
-proof. There is no all-leaf commitment barrier or shared LogUp challenge before
-leaf proving. Because boundary rows are only known after execution, each planned
-leaf is checked against its exact proof shape before proving; an oversized leaf
-is recursively bisected by event range until both the row and trace-area limits
-are satisfied.
+The leaves form one shared LogUp batch. First, the prover commits every leaf's
+main trace; only after all commitments and real heights are fixed does it sample
+one common lookup challenge. Each leaf proof may have a nonzero local lookup
+residual. The Block recursion circuit verifies every proof with the same
+challenge, checks exact ordered event-range coverage and descriptor digests,
+requires the residuals to sum to zero, recomputes the ordered trace digest, and
+emits one Block wrapper proof.
 
-This format uses event-leaf protocol v3, Block-wrapper protocol v2, and
-Block-recursion protocol v3. Artifacts from the earlier shared-challenge format
-are intentionally rejected; use a fresh output root for the first run.
+This removes the previous per-leaf `GlobalMemoryBoundary` trace, which could
+dominate a leaf with roughly one million rows and 215 columns. To bound memory
+during the commitment barrier, only `--commit-jobs` commitments run at once
+(default 2). Main traces are regenerated one at a time during proving instead
+of retaining all of them in RAM.
+
+This format uses event-leaf protocol v4, Block-wrapper protocol v3, and
+Block-recursion protocol v3. Artifacts from the previous boundary-accumulator
+format are intentionally rejected; use a fresh output root for the first run.
 
 The public hidden-state input is placed in `MemoryConst`; model parameters and
 attention hints enter through the private witness stream. There are no separate
@@ -215,6 +216,7 @@ Build and run this path on the Linux proving server:
 python3 infer/zkgpt_block_recursion.py \
   --prove --build --resume \
   --threads "$(nproc)" \
+  --commit-jobs 2 \
   --data-dir /home/dj/VLLM-models/gpt2-bf16/recursion/zkgpt-like-12x30-real-bf16 \
   --output-root /home/dj/proofs/zkgpt-12-block-recursion
 ```
@@ -238,6 +240,7 @@ RUST_LOGGER=flat \
 RUST_LOG='sp1_hypercube::prover::simple=debug,sp1_hypercube::prover::shard=debug' \
 RAYON_NUM_THREADS="$(nproc)" target/release/examples/zkgpt_like \
   --prove-shards --allow-large-build --block 0 \
+  --commit-jobs 2 \
   --data-dir /home/dj/VLLM-models/gpt2-bf16/recursion/zkgpt-like-12x30-real-bf16 \
   --output-dir /home/dj/proofs/block-00
 
@@ -253,11 +256,12 @@ The final Block-0 artifact is
 `zkgpt_block_00_shard_recursion.manifest.json`. Its proof can be used directly
 as a child of the 12-Block recursion tree.
 
-`--resume` validates the event-leaf files, range and global-accumulator metadata, Block wrapper
-artifacts, and adjacent Block ranges before skipping completed work. The runner
-writes `zkgpt_block_recursion.run.json` and prints the final recursion manifest
-path. After completion, verify the serialized final proof, its public recursion
-transcript, and its verifying-key commitment again with:
+`--resume` validates the event-leaf files, shared-lookup metadata, exact event
+ranges, Block wrapper artifacts, and adjacent Block ranges before skipping
+completed work. The runner writes `zkgpt_block_recursion.run.json` and prints
+the final recursion manifest path. After completion, verify the serialized
+final proof, its public recursion transcript, and its verifying-key commitment
+again with:
 
 ```bash
 python3 infer/zkgpt_block_recursion.py \

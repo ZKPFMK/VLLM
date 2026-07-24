@@ -46,10 +46,11 @@ class BlockRecursionRunnerTests(unittest.TestCase):
 
     def test_later_block_consumes_the_previous_directory(self) -> None:
         command = block_command(
-            Path("/proofs"), Path("/model"), Path("/bin"), 7
+            Path("/proofs"), Path("/model"), Path("/bin"), 7, 3
         )
         self.assertEqual(command[0], "/bin/zkgpt_like")
         self.assertIn("--prove-shards", command)
+        self.assertEqual(command[command.index("--commit-jobs") + 1], "3")
         self.assertIn("/proofs/blocks/block-06", command)
         self.assertIn("/proofs/blocks/block-07", command)
 

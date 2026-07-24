@@ -13,7 +13,6 @@ use crate::chips::bf16::{
 };
 use crate::chips::{
     alu_base::{NUM_BASE_ALU_COLS, NUM_BASE_ALU_ENTRIES_PER_ROW, NUM_BASE_ALU_PREPROCESSED_COLS},
-    global_memory_boundary::GLOBAL_MEMORY_BOUNDARY_COLS,
     mem::{
         constant::{
             NUM_CONST_MEM_ENTRIES_PER_ROW, NUM_MEM_INIT_COLS as NUM_MEM_CONST_COLS,
@@ -104,8 +103,6 @@ pub struct VerillmTraceEstimate {
     pub bf16_unary_rows: usize,
     pub bf16_div_rows: usize,
     pub bf16_add_sub_rows: usize,
-    /// Minimum rows; the exact compressed boundary count is only known after execution.
-    pub global_memory_boundary_rows: usize,
     pub public_values_rows: usize,
     pub preprocessed_area: usize,
     pub main_area: usize,
@@ -125,7 +122,6 @@ impl VerillmTraceEstimate {
             self.bf16_unary_rows,
             self.bf16_div_rows,
             self.bf16_add_sub_rows,
-            self.global_memory_boundary_rows,
             self.public_values_rows,
         ]
         .into_iter()
@@ -184,7 +180,6 @@ pub fn estimate_verillm_trace(counts: RecursionAirEventCount) -> VerillmTraceEst
     let bf16_unary_rows = proof_rows(counts.bf16_unary_events, 1);
     let bf16_div_rows = proof_rows(counts.bf16_div_events, 1);
     let bf16_add_sub_rows = proof_rows(counts.bf16_add_sub_events, NUM_BF16_ADD_SUB_EVENTS_PER_ROW);
-    let global_memory_boundary_rows = 16;
     let public_values_rows = 1 << PUB_VALUES_LOG_HEIGHT;
 
     let preprocessed_area = memory_const_rows * NUM_MEM_CONST_PREPROCESSED_COLS
@@ -206,7 +201,6 @@ pub fn estimate_verillm_trace(counts: RecursionAirEventCount) -> VerillmTraceEst
         + bf16_unary_rows * BF16_UNARY_COLS
         + bf16_div_rows * BF16_DIV_COLS
         + bf16_add_sub_rows * BF16_ADD_SUB_COLS
-        + global_memory_boundary_rows * GLOBAL_MEMORY_BOUNDARY_COLS
         + public_values_rows * NUM_PUBLIC_VALUES_COLS;
     let stacking_area = 1 << LOG_STACKING_HEIGHT;
     let preprocessed_area = preprocessed_area.next_multiple_of(stacking_area);
@@ -222,7 +216,6 @@ pub fn estimate_verillm_trace(counts: RecursionAirEventCount) -> VerillmTraceEst
         bf16_unary_rows,
         bf16_div_rows,
         bf16_add_sub_rows,
-        global_memory_boundary_rows,
         public_values_rows,
         preprocessed_area,
         main_area,

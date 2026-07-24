@@ -32,9 +32,9 @@ HIDDEN_SIZE = 768
 NUM_HEADS = 12
 LINEAR_SIZE = 2304
 BLOCK_STAGE = "zkgpt_block_shard_recursion"
-BLOCK_PROTOCOL_VERSION = 2
+BLOCK_PROTOCOL_VERSION = 3
 EVENT_SHARD_STAGE = "zkgpt_event_shards"
-EVENT_SHARD_PROTOCOL_VERSION = 3
+EVENT_SHARD_PROTOCOL_VERSION = 4
 RECURSION_STAGE = "zkgpt_block_recursion"
 RECURSION_PROTOCOL_VERSION = 3
 RUN_MANIFEST = "zkgpt_block_recursion.run.json"
@@ -168,7 +168,7 @@ def validate_event_shard_manifest(path: Path, expected_block: int) -> dict[str, 
             f"{path}: expected event-shard protocol version "
             f"{EVENT_SHARD_PROTOCOL_VERSION}"
         )
-    if data.get("lookup_protocol") != "independent_global_memory_accumulator":
+    if data.get("lookup_protocol") != "shared_challenge_batch_v2":
         raise ValidationError(f"{path}: unsupported lookup protocol")
     if data.get("lookup_batch_closed") is not True:
         raise ValidationError(f"{path}: lookup batch is not closed")
@@ -177,8 +177,11 @@ def validate_event_shard_manifest(path: Path, expected_block: int) -> dict[str, 
         != "global_event_counts_ordered_ranges_verifying_keys_main_trace_commitments_real_heights"
     ):
         raise ValidationError(f"{path}: unsupported trace transcript binding")
-    if data.get("global_memory_accumulator") != "poseidon_vector_14":
-        raise ValidationError(f"{path}: unsupported global memory accumulator")
+    if (
+        not isinstance(data.get("beta_seed_dimension"), int)
+        or data["beta_seed_dimension"] <= 0
+    ):
+        raise ValidationError(f"{path}: invalid shared LogUp beta seed dimension")
     require_digest(data, "block_transcript_commitment", path)
     require_file(path.parent, data.get("private_output_file"), "private output", path)
     artifacts = data.get("artifacts")
@@ -322,7 +325,11 @@ def load_blocks(output_root: Path) -> list[Node]:
 
 
 def block_command(
-    output_root: Path, data_dir: Path, bin_dir: Path, block: int
+    output_root: Path,
+    data_dir: Path,
+    bin_dir: Path,
+    block: int,
+    commit_jobs: int,
 ) -> list[str]:
     command = [
         str(bin_dir / "zkgpt_like"),
@@ -334,6 +341,8 @@ def block_command(
         str(data_dir),
         "--output-dir",
         str(block_dir(output_root, block)),
+        "--commit-jobs",
+        str(commit_jobs),
     ]
     if block > 0:
         command.extend(
@@ -536,7 +545,7 @@ def write_run_manifest(
 ) -> None:
     final_data = read_json(final.manifest)
     value = {
-        "version": 3,
+        "version": 4,
         "stage": "zkgpt_full_block_recursion",
         "blocks": NUM_BLOCKS,
         "block_proofs": NUM_BLOCKS,
@@ -597,11 +606,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, default=default_data_dir(root))
     parser.add_argument("--bin-dir", type=Path, default=default_bin_dir(root))
     parser.add_argument("--threads", type=int, default=max(1, os.cpu_count() or 1))
+    parser.add_argument(
+        "--commit-jobs",
+        type=int,
+        default=2,
+        help="bounded concurrent main-trace commitments per Block (default: 2)",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--build", action="store_true")
     args = parser.parse_args(argv)
     if args.threads <= 0:
         parser.error("--threads must be positive")
+    if args.commit_jobs <= 0:
+        parser.error("--commit-jobs must be positive")
     if args.resume and not args.prove:
         parser.error("--resume is only valid with --prove")
     if args.build and not args.prove:
@@ -680,7 +697,17 @@ def run(args: argparse.Namespace) -> int:
             print(f"[runner] skip valid Block {block}")
             events.append({"kind": "block", "block": block, "status": "skipped"})
         elif args.dry_run:
-            print(shlex.join(block_command(output_root, data_dir, bin_dir, block)))
+            print(
+                shlex.join(
+                    block_command(
+                        output_root,
+                        data_dir,
+                        bin_dir,
+                        block,
+                        args.commit_jobs,
+                    )
+                )
+            )
             print(shlex.join(block_recursion_command(output_root, bin_dir, block)))
             node = Node(
                 manifest=path,
@@ -698,7 +725,13 @@ def run(args: argparse.Namespace) -> int:
                 print(f"[runner] skip valid event leaves for Block {block}")
             else:
                 leaf_elapsed = run_command(
-                    block_command(output_root, data_dir, bin_dir, block),
+                    block_command(
+                        output_root,
+                        data_dir,
+                        bin_dir,
+                        block,
+                        args.commit_jobs,
+                    ),
                     root,
                     output_root / "logs" / f"block-{block:02d}-event-leaves.log",
                     args.threads,

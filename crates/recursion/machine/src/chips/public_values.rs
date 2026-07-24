@@ -1,12 +1,9 @@
 use crate::builder::SP1RecursionAirBuilder;
 use slop_air::{Air, AirBuilder, BaseAir, PairBuilder};
-use slop_algebra::{AbstractField, PrimeField32};
+use slop_algebra::PrimeField32;
 use slop_matrix::Matrix;
 use sp1_derive::AlignedBorrow;
-use sp1_hypercube::{
-    air::{AirInteraction, InteractionScope, MachineAir},
-    InteractionKind,
-};
+use sp1_hypercube::air::MachineAir;
 use sp1_primitives::SP1Field;
 use sp1_recursion_executor::{
     event_shard_descriptor_digest, ExecutionRecord, Instruction, RecursionProgram,
@@ -14,7 +11,6 @@ use sp1_recursion_executor::{
 };
 use std::{
     borrow::{Borrow, BorrowMut},
-    iter::once,
     mem::MaybeUninit,
 };
 
@@ -47,10 +43,6 @@ pub struct PublicValuesPreprocessedCols<T: Copy> {
 #[repr(C)]
 pub struct PublicValuesCols<T: Copy> {
     pub pv_element: T,
-    /// Event-shard global-accumulation endpoint copied into main columns so lookup interactions do
-    /// not directly contain public-value expressions.
-    pub event_shard_count: T,
-    pub event_shard_accumulator: [T; 14],
 }
 
 impl<F> BaseAir<F> for PublicValuesChip {
@@ -189,15 +181,6 @@ impl<F: PrimeField32> MachineAir<F> for PublicValuesChip {
                 cols.pv_element = *element;
             }
         }
-
-        if input.program.event_ranges.is_some() {
-            let cols: &mut PublicValuesCols<F> = values[..NUM_PUBLIC_VALUES_COLS].borrow_mut();
-            cols.event_shard_count = input.public_values.num_included_shard;
-            cols.event_shard_accumulator[..7]
-                .copy_from_slice(&input.public_values.global_cumulative_sum.0.x.0);
-            cols.event_shard_accumulator[7..]
-                .copy_from_slice(&input.public_values.global_cumulative_sum.0.y.0);
-        }
     }
 
     fn included(&self, _record: &Self::Record) -> bool {
@@ -231,41 +214,6 @@ where
                 .assert_eq(pv_elm.clone(), local_prepr.event_shard_digest[i]);
         }
         builder.assert_bool(local_prepr.event_shard_enabled);
-
-        builder
-            .when(local_prepr.event_shard_enabled)
-            .assert_eq(local.event_shard_count, public_values.num_included_shard.clone());
-        for (actual, expected) in local.event_shard_accumulator.iter().zip(
-            public_values
-                .global_cumulative_sum
-                .0
-                .x
-                .0
-                .iter()
-                .chain(public_values.global_cumulative_sum.0.y.0.iter()),
-        ) {
-            builder.when(local_prepr.event_shard_enabled).assert_eq(*actual, expected.clone());
-        }
-
-        let zero = AB::Expr::zero();
-        builder.send(
-            AirInteraction::new(
-                once(zero.clone()).chain((0..14).map(|_| zero.clone())).collect(),
-                local_prepr.event_shard_enabled.into(),
-                InteractionKind::GlobalAccumulation,
-            ),
-            InteractionScope::Local,
-        );
-        builder.receive(
-            AirInteraction::new(
-                once(local.event_shard_count.into())
-                    .chain(local.event_shard_accumulator.map(Into::into))
-                    .collect(),
-                local_prepr.event_shard_enabled.into(),
-                InteractionKind::GlobalAccumulation,
-            ),
-            InteractionScope::Local,
-        );
     }
 }
 

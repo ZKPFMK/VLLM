@@ -1,7 +1,7 @@
 #![allow(clippy::print_stdout)]
 
 use std::{
-    collections::VecDeque,
+    collections::BTreeSet,
     fmt::Write as _,
     fs::{self, File},
     path::{Path, PathBuf},
@@ -11,11 +11,12 @@ use std::{
 
 use slop_algebra::{AbstractField, Field, PrimeField32};
 use slop_basefold::FriConfig;
-use slop_challenger::IopCtx;
+use slop_challenger::{CanObserve, IopCtx};
 use slop_symmetric::Permutation;
 use sp1_hypercube::{
-    air::MachineAir, inner_perm, prover::simple_prover, HashableKey, MachineProof,
-    MachineVerifyingKey, SP1PcsProofInner, ShardProof, ShardVerifier,
+    air::MachineAir, inner_perm, prover::simple_prover, HashableKey, InnerSC, LogUpGkrChallenges,
+    LogUpGkrVerifier, MachineProof, MachineVerifyingKey, SP1PcsProofInner, ShardProof,
+    ShardVerifier,
 };
 use sp1_primitives::{
     fri_params::{unique_decoding_queries, SP1_PROOF_OF_WORK_BITS},
@@ -26,16 +27,16 @@ use sp1_recursion_compiler::{
     prelude::{Bf16ZkGptBlockParams, Builder, Felt},
 };
 use sp1_recursion_executor::{
-    Bf16AddSubEvent, Bf16DivEvent, Bf16MulEvent, Bf16UnaryEvent, Block, EventRange,
+    event_shard_program_digest, Bf16AddSubEvent, Bf16DivEvent, Bf16MulEvent, Bf16UnaryEvent, Block,
     ExecutionRecord, Executor, RecursionAirEventCount, RecursionEventRanges, RecursionProgram,
     DIGEST_SIZE, HASH_RATE, PERMUTATION_WIDTH,
 };
 use sp1_recursion_machine::{
     chips::bf16::{NUM_BF16_ADD_SUB_EVENTS_PER_ROW, NUM_BF16_MUL_EVENTS_PER_ROW},
-    chips::global_memory_boundary::prepare_event_shard_boundary,
-    sharding::{estimate_verillm_trace, plan_event_shards, ShardLimits},
+    sharding::{plan_event_shards, ShardLimits},
     RecursionAir,
 };
+use tokio::task::JoinSet;
 
 const DEFAULT_LAYERS: usize = 12;
 const DEFAULT_SEQUENCE_LENGTH: usize = 30;
@@ -51,10 +52,11 @@ const PROOF_LOG_STACKING_HEIGHT: u32 = 22;
 // requires max_log_row_count < 29, so 28 is both necessary and the largest supported value.
 const PROOF_MAX_LOG_ROW_COUNT: usize = 28;
 const BLOCK_PROTOCOL_VERSION: u32 = 2;
-const EVENT_BLOCK_RECURSION_PROTOCOL_VERSION: u32 = 2;
+const EVENT_BLOCK_RECURSION_PROTOCOL_VERSION: u32 = 3;
 const EVENT_BLOCK_RECURSION_STAGE: &str = "zkgpt_block_shard_recursion";
+const EVENT_SHARD_BATCH_DOMAIN: u32 = 0x5a4b_4556;
 const EVENT_SHARD_TRANSCRIPT_DOMAIN: u32 = 0x5a4b_4557;
-const EVENT_SHARD_PROTOCOL_VERSION: u32 = 3;
+const EVENT_SHARD_PROTOCOL_VERSION: u32 = 4;
 
 type StoredProof = MachineProof<SP1GlobalContext, SP1PcsProofInner>;
 type StoredVerifyingKey = MachineVerifyingKey<SP1GlobalContext>;
@@ -218,6 +220,7 @@ struct Arguments {
     block: Option<usize>,
     previous_block_dir: Option<PathBuf>,
     shard_limits: ShardLimits,
+    commit_jobs: usize,
 }
 
 #[derive(Debug)]
@@ -292,45 +295,36 @@ fn event_range_fields(ranges: RecursionEventRanges) -> [usize; 18] {
     ]
 }
 
-const fn bisect_event_range(range: EventRange) -> [EventRange; 2] {
-    let middle = range.start + range.len() / 2;
-    [EventRange { start: range.start, end: middle }, EventRange { start: middle, end: range.end }]
-}
-
-fn bisect_event_ranges(ranges: RecursionEventRanges) -> [RecursionEventRanges; 2] {
-    let mem_const = bisect_event_range(ranges.mem_const);
-    let mem_var = bisect_event_range(ranges.mem_var);
-    let base_alu = bisect_event_range(ranges.base_alu);
-    let poseidon2_wide = bisect_event_range(ranges.poseidon2_wide);
-    let bf16_mul = bisect_event_range(ranges.bf16_mul);
-    let bf16_unary = bisect_event_range(ranges.bf16_unary);
-    let bf16_div = bisect_event_range(ranges.bf16_div);
-    let bf16_add_sub = bisect_event_range(ranges.bf16_add_sub);
-    let commit_pv_hash = bisect_event_range(ranges.commit_pv_hash);
-    [
-        RecursionEventRanges {
-            mem_const: mem_const[0],
-            mem_var: mem_var[0],
-            base_alu: base_alu[0],
-            poseidon2_wide: poseidon2_wide[0],
-            bf16_mul: bf16_mul[0],
-            bf16_unary: bf16_unary[0],
-            bf16_div: bf16_div[0],
-            bf16_add_sub: bf16_add_sub[0],
-            commit_pv_hash: commit_pv_hash[0],
-        },
-        RecursionEventRanges {
-            mem_const: mem_const[1],
-            mem_var: mem_var[1],
-            base_alu: base_alu[1],
-            poseidon2_wide: poseidon2_wide[1],
-            bf16_mul: bf16_mul[1],
-            bf16_unary: bf16_unary[1],
-            bf16_div: bf16_div[1],
-            bf16_add_sub: bf16_add_sub[1],
-            commit_pv_hash: commit_pv_hash[1],
-        },
-    ]
+fn derive_event_shard_batch_challenges(
+    global_counts: RecursionAirEventCount,
+    bindings: &[EventShardBatchBinding],
+    beta_seed_dimension: usize,
+) -> LogUpGkrChallenges<SP1ExtensionField> {
+    assert!(!bindings.is_empty(), "an event shard batch cannot be empty");
+    let mut challenger = SP1GlobalContext::default_challenger();
+    challenger.observe(SP1Field::from_canonical_u32(EVENT_SHARD_BATCH_DOMAIN));
+    challenger.observe(SP1Field::from_canonical_u32(EVENT_SHARD_PROTOCOL_VERSION));
+    challenger.observe(SP1Field::from_canonical_usize(bindings.len()));
+    for count in event_count_fields(global_counts) {
+        challenger.observe(SP1Field::from_canonical_usize(count));
+    }
+    for (index, binding) in bindings.iter().enumerate() {
+        challenger.observe(SP1Field::from_canonical_usize(index));
+        for endpoint in event_range_fields(binding.ranges) {
+            challenger.observe(SP1Field::from_canonical_usize(endpoint));
+        }
+        binding.verifying_key.observe_into(&mut challenger);
+        challenger.observe(binding.main_commitment);
+        challenger.observe(SP1Field::from_canonical_usize(binding.real_heights.len()));
+        for (name, height) in &binding.real_heights {
+            challenger.observe(SP1Field::from_canonical_usize(name.len()));
+            for byte in name.bytes() {
+                challenger.observe(SP1Field::from_canonical_u8(byte));
+            }
+            challenger.observe(SP1Field::from_canonical_usize(*height));
+        }
+    }
+    LogUpGkrChallenges::sample::<SP1Field, _>(&mut challenger, beta_seed_dimension)
 }
 
 fn commit_fields(domain: u32, values: &[SP1Field]) -> [SP1Field; DIGEST_SIZE] {
@@ -445,6 +439,12 @@ fn parse_arguments() -> Arguments {
     let mut block = None;
     let mut previous_block_dir = None;
     let mut shard_limits = ShardLimits::core_style();
+    let mut commit_jobs = std::env::var("SP1_ZKGPT_COMMIT_JOBS")
+        .ok()
+        .map(|value| {
+            value.parse().unwrap_or_else(|error| panic!("invalid SP1_ZKGPT_COMMIT_JOBS: {error}"))
+        })
+        .unwrap_or(2);
     let mut arguments = std::env::args_os().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.to_str() {
@@ -490,6 +490,7 @@ fn parse_arguments() -> Arguments {
             Some("--max-shard-area") => {
                 shard_limits.max_trace_area = parse_usize(arguments.next(), "--max-shard-area")
             }
+            Some("--commit-jobs") => commit_jobs = parse_usize(arguments.next(), "--commit-jobs"),
             Some("--synthetic") => synthetic = true,
             Some("--real") => synthetic = false,
             Some("--data-dir") => {
@@ -522,6 +523,7 @@ fn parse_arguments() -> Arguments {
         );
     }
     shape.validate();
+    assert!(commit_jobs > 0, "--commit-jobs must be positive");
     Arguments {
         mode,
         shape,
@@ -532,6 +534,7 @@ fn parse_arguments() -> Arguments {
         block,
         previous_block_dir,
         shard_limits,
+        commit_jobs,
     }
 }
 
@@ -1313,9 +1316,18 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
             .iter()
             .map(|shard| Arc::new(program.with_event_ranges(shard.ranges)))
             .collect::<Vec<_>>();
-        let shard_records = record.into_event_shards(shard_programs);
+        let mut shard_records = record.into_event_shards(shard_programs);
+        for record in &mut shard_records {
+            assert!(
+                record.commit_pv_hash_events.is_empty(),
+                "event-shard descriptor public values require no CommitPublicValues event"
+            );
+            record.public_values.digest =
+                event_shard_program_digest(&record.program).expect("event shard digest is missing");
+        }
 
         type A = RecursionAir<SP1Field, 3, 2>;
+        type SC = InnerSC<A>;
         let verifier = ShardVerifier::from_basefold_parameters(
             FriConfig::new(
                 PROOF_LOG_BLOWUP,
@@ -1326,103 +1338,121 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
             PROOF_MAX_LOG_ROW_COUNT,
             A::verillm_machine(),
         );
-        let prover = simple_prover(verifier);
+        let prover = Arc::new(simple_prover(verifier));
+        let all_chips = prover.machine().chips().iter().cloned().collect::<BTreeSet<_>>();
+        let beta_seed_dimension =
+            LogUpGkrVerifier::<SP1GlobalContext, SC>::beta_seed_dimension(&all_chips);
 
-        let initial_shard_count = plan.shards.len();
-        let mut pending = plan
-            .shards
-            .iter()
-            .zip(shard_records)
-            .map(|(shard, record)| (shard.ranges, shard.estimate, record))
-            .collect::<VecDeque<_>>();
-        let mut artifacts = Vec::with_capacity(initial_shard_count);
-        let mut bindings = Vec::with_capacity(initial_shard_count);
-        let mut global_memory_accumulator = [SP1Field::zero(); 14];
-        let mut total_boundary_events = 0usize;
-        while let Some((ranges, estimate, mut record)) = pending.pop_front() {
-            let boundary_started = Instant::now();
-            let shard_accumulator = prepare_event_shard_boundary(&mut record);
-            let boundary_events = record.global_memory_boundary_events.len();
-            let boundary_rows = boundary_events.next_multiple_of(32).max(16);
+        // Every main commitment must exist before Fiat-Shamir samples the common lookup
+        // challenges. Keep only a bounded number of duplicate shard records resident while this
+        // phase runs; phase two deterministically regenerates one trace at a time.
+        let batch_commit_started = Instant::now();
+        let commit_jobs = arguments.commit_jobs.min(shard_records.len()).max(1);
+        let mut join_set = JoinSet::new();
+        let mut next_shard = 0usize;
+        let mut completed_shards = 0usize;
+        let mut unordered_bindings = (0..shard_records.len()).map(|_| None).collect::<Vec<_>>();
+        while completed_shards < shard_records.len() {
+            while next_shard < shard_records.len() && join_set.len() < commit_jobs {
+                let shard_index = next_shard;
+                let ranges = plan.shards[shard_index].ranges;
+                let record = shard_records[shard_index].clone();
+                let prover = prover.clone();
+                let shard_count = shard_records.len();
+                join_set.spawn(async move {
+                    let started = Instant::now();
+                    println!(
+                        "committing event shard {}/{} for shared lookup transcript",
+                        shard_index + 1,
+                        shard_count
+                    );
+                    let (setup, verifying_key) = prover.setup(record.program.clone()).await;
+                    drop(setup);
+                    let (main_commitment, real_heights) =
+                        prover.commit_shard_main_traces(record).await;
+                    println!(
+                        "event shard commitment completed: shard={}/{} elapsed={:.3}s",
+                        shard_index + 1,
+                        shard_count,
+                        started.elapsed().as_secs_f64()
+                    );
+                    (
+                        shard_index,
+                        EventShardBatchBinding {
+                            ranges,
+                            verifying_key,
+                            main_commitment,
+                            real_heights,
+                        },
+                    )
+                });
+                next_shard += 1;
+            }
+            let (shard_index, binding) = join_set
+                .join_next()
+                .await
+                .expect("event shard commitment task is missing")
+                .expect("event shard commitment task panicked");
+            assert!(unordered_bindings[shard_index].replace(binding).is_none());
+            completed_shards += 1;
+        }
+        let bindings = unordered_bindings
+            .into_iter()
+            .map(|binding| binding.expect("event shard commitment is missing"))
+            .collect::<Vec<_>>();
+        let shared_challenges =
+            derive_event_shard_batch_challenges(plan.global_counts, &bindings, beta_seed_dimension);
+        println!(
+            "event shard batch committed: shards={} jobs={} elapsed={:.3}s",
+            bindings.len(),
+            commit_jobs,
+            batch_commit_started.elapsed().as_secs_f64()
+        );
+
+        let mut artifacts = Vec::with_capacity(plan.shards.len());
+        let mut batch_residual = SP1ExtensionField::zero();
+        for ((shard, record), binding) in plan.shards.iter().zip(shard_records).zip(&bindings) {
+            let shard_index = shard.index;
+            let ranges = shard.ranges;
             let exact_shape =
                 prover.shape_from_record(&record).expect("VeriLLM machine has no shard shape");
             let exact_trace_area = exact_shape.preprocessed_area + exact_shape.main_area;
-            let exact_max_rows = estimate.max_rows().max(boundary_rows);
-            if exact_max_rows > plan.limits.max_rows()
-                || exact_trace_area > plan.limits.max_trace_area
-            {
-                let largest_event_range =
-                    event_count_fields(ranges.event_counts()).into_iter().max().unwrap_or_default();
-                assert!(
-                    largest_event_range > 1,
-                    "one scalar event cannot fit after adding global memory boundaries: \
-                     max_rows={exact_max_rows} trace_area={exact_trace_area}"
-                );
-                println!(
-                    "refining oversized event shard before proving: ranges={:?} \
-                     boundary_events={} max_rows={}/{} trace_area={}/{}",
-                    ranges,
-                    boundary_events,
-                    exact_max_rows,
-                    plan.limits.max_rows(),
-                    exact_trace_area,
-                    plan.limits.max_trace_area
-                );
-                record.global_memory_boundary_events.clear();
-                let child_ranges = bisect_event_ranges(ranges);
-                let child_programs =
-                    child_ranges.map(|child| Arc::new(program.with_event_ranges(child))).to_vec();
-                let child_records = record.into_event_shards(child_programs);
-                for (child_ranges, child_record) in
-                    child_ranges.into_iter().zip(child_records).rev()
-                {
-                    pending.push_front((
-                        child_ranges,
-                        estimate_verillm_trace(child_ranges.event_counts()),
-                        child_record,
-                    ));
-                }
-                continue;
-            }
-
-            let shard_index = artifacts.len();
-            record.index =
-                u32::try_from(shard_index).expect("too many independently provable event shards");
-            global_memory_accumulator
-                .iter_mut()
-                .zip(shard_accumulator)
-                .for_each(|(total, value)| *total += value);
-            total_boundary_events += boundary_events;
+            assert!(
+                shard.estimate.max_rows() <= plan.limits.max_rows()
+                    && exact_trace_area <= plan.limits.max_trace_area,
+                "planned event shard exceeds configured proof limits"
+            );
             let artifact_stem = arguments
                 .block
                 .map(|block| format!("{}_s{:03}", block_stem(block), shard_index))
                 .unwrap_or_else(|| format!("zkgpt_like_s{:03}", shard_index));
             println!(
-                "proving independent event shard {}: pending={} initial_plan={} \
-                 planned_max_rows={} planned_trace_area={} boundary_events={} \
-                 boundary_rows={} exact_trace_area={}",
+                "proving shared-lookup event shard {}/{}: planned_max_rows={} \
+                 planned_trace_area={} exact_trace_area={}",
                 shard_index + 1,
-                pending.len(),
-                initial_shard_count,
-                estimate.max_rows(),
-                estimate.total_area,
-                boundary_events,
-                boundary_rows,
+                plan.shards.len(),
+                shard.estimate.max_rows(),
+                shard.estimate.total_area,
                 exact_trace_area
-            );
-            println!(
-                "prepared shard memory boundary: events={} elapsed={:.3}s",
-                boundary_events,
-                boundary_started.elapsed().as_secs_f64()
             );
             let setup_started = Instant::now();
             let (pk, verifying_key) = prover.setup(record.program.clone()).await;
+            assert_eq!(
+                verifying_key, binding.verifying_key,
+                "event shard verifying key changed between batch phases"
+            );
             let pk = unsafe { pk.into_inner() };
             println!("shard setup: elapsed={:.3}s", setup_started.elapsed().as_secs_f64());
 
             let prove_started = Instant::now();
-            let shard_proof = prover.prove_shard(pk, record).await;
-            let real_heights = shard_proof
+            let shard_proof = prover
+                .prove_shard_with_logup_challenges(pk, record, shared_challenges.clone())
+                .await;
+            assert_eq!(
+                shard_proof.main_commitment, binding.main_commitment,
+                "event shard main commitment changed between batch phases"
+            );
+            let proof_heights = shard_proof
                 .opened_values
                 .chips
                 .iter()
@@ -1433,25 +1463,28 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
                     )
                 })
                 .collect::<Vec<_>>();
+            assert_eq!(
+                proof_heights, binding.real_heights,
+                "event shard real heights changed between batch phases"
+            );
             println!(
                 "shard proof generated: elapsed={:.3}s",
                 prove_started.elapsed().as_secs_f64()
             );
 
             let verify_started = Instant::now();
-            prover
-                .verify(&verifying_key, &MachineProof::from(vec![shard_proof.clone()]))
-                .expect("independent event shard proof must verify");
+            let local_residual = prover
+                .verify_shard_with_logup_challenges(
+                    &verifying_key,
+                    &shard_proof,
+                    &shared_challenges,
+                )
+                .expect("shared-lookup event shard proof must verify");
+            batch_residual += local_residual;
             println!(
                 "shard proof verified: elapsed={:.3}s",
                 verify_started.elapsed().as_secs_f64()
             );
-            bindings.push(EventShardBatchBinding {
-                ranges,
-                verifying_key: verifying_key.clone(),
-                main_commitment: shard_proof.main_commitment,
-                real_heights,
-            });
             let proof = write_event_shard_proof(
                 &arguments.output_dir,
                 &artifact_stem,
@@ -1517,14 +1550,15 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
             )
             .unwrap();
             writeln!(artifact, "      }},").unwrap();
-            writeln!(artifact, "      \"max_rows\": {},", estimate.max_rows()).unwrap();
-            writeln!(artifact, "      \"preprocessed_area\": {},", estimate.preprocessed_area)
-                .unwrap();
-            writeln!(artifact, "      \"main_area\": {},", estimate.main_area).unwrap();
-            writeln!(artifact, "      \"trace_area\": {},", estimate.total_area).unwrap();
-            writeln!(artifact, "      \"global_memory_boundary_events\": {boundary_events},")
-                .unwrap();
-            writeln!(artifact, "      \"global_memory_boundary_rows\": {boundary_rows},").unwrap();
+            writeln!(artifact, "      \"max_rows\": {},", shard.estimate.max_rows()).unwrap();
+            writeln!(
+                artifact,
+                "      \"preprocessed_area\": {},",
+                shard.estimate.preprocessed_area
+            )
+            .unwrap();
+            writeln!(artifact, "      \"main_area\": {},", shard.estimate.main_area).unwrap();
+            writeln!(artifact, "      \"trace_area\": {},", shard.estimate.total_area).unwrap();
             writeln!(
                 artifact,
                 "      \"exact_preprocessed_area\": {},",
@@ -1543,13 +1577,10 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
             artifacts.push(artifact);
         }
         assert!(
-            global_memory_accumulator.iter().all(Field::is_zero),
-            "event-shard global memory accumulators do not close"
+            batch_residual.is_zero(),
+            "event shard lookup residuals do not cancel under the shared batch challenges"
         );
-        println!(
-            "independent event shard proofs closed locally; global memory accumulator closed: \
-             boundary_events={total_boundary_events}"
-        );
+        println!("event shard shared lookup batch closed: residual=0");
         let block_transcript =
             event_shard_transcript(shape, arguments.block, plan.global_counts, &bindings);
         let manifest_path = arguments.output_dir.join("zkgpt_event_shards.manifest.json");
@@ -1557,8 +1588,7 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
         writeln!(manifest, "{{").unwrap();
         writeln!(manifest, "  \"version\": {EVENT_SHARD_PROTOCOL_VERSION},").unwrap();
         writeln!(manifest, "  \"stage\": \"zkgpt_event_shards\",").unwrap();
-        writeln!(manifest, "  \"lookup_protocol\": \"independent_global_memory_accumulator\",")
-            .unwrap();
+        writeln!(manifest, "  \"lookup_protocol\": \"shared_challenge_batch_v2\",").unwrap();
         writeln!(manifest, "  \"lookup_batch_closed\": true,").unwrap();
         writeln!(
             manifest,
@@ -1566,7 +1596,8 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
              \"global_event_counts_ordered_ranges_verifying_keys_main_trace_commitments_real_heights\","
         )
         .unwrap();
-        writeln!(manifest, "  \"global_memory_accumulator\": \"poseidon_vector_14\",").unwrap();
+        writeln!(manifest, "  \"beta_seed_dimension\": {beta_seed_dimension},").unwrap();
+        writeln!(manifest, "  \"commit_jobs\": {commit_jobs},").unwrap();
         writeln!(manifest, "  \"sequence_length\": {},", shape.sequence_length).unwrap();
         writeln!(manifest, "  \"hidden_size\": {},", shape.hidden_size).unwrap();
         writeln!(manifest, "  \"num_heads\": {},", shape.num_heads).unwrap();
