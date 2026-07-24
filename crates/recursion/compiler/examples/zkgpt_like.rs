@@ -1,6 +1,7 @@
 #![allow(clippy::print_stdout)]
 
 use std::{
+    collections::VecDeque,
     fmt::Write as _,
     fs::{self, File},
     path::{Path, PathBuf},
@@ -25,14 +26,14 @@ use sp1_recursion_compiler::{
     prelude::{Bf16ZkGptBlockParams, Builder, Felt},
 };
 use sp1_recursion_executor::{
-    Bf16AddSubEvent, Bf16DivEvent, Bf16MulEvent, Bf16UnaryEvent, Block, ExecutionRecord, Executor,
-    RecursionAirEventCount, RecursionEventRanges, RecursionProgram, DIGEST_SIZE, HASH_RATE,
-    PERMUTATION_WIDTH,
+    Bf16AddSubEvent, Bf16DivEvent, Bf16MulEvent, Bf16UnaryEvent, Block, EventRange,
+    ExecutionRecord, Executor, RecursionAirEventCount, RecursionEventRanges, RecursionProgram,
+    DIGEST_SIZE, HASH_RATE, PERMUTATION_WIDTH,
 };
 use sp1_recursion_machine::{
     chips::bf16::{NUM_BF16_ADD_SUB_EVENTS_PER_ROW, NUM_BF16_MUL_EVENTS_PER_ROW},
     chips::global_memory_boundary::prepare_event_shard_boundary,
-    sharding::{plan_event_shards, ShardLimits},
+    sharding::{estimate_verillm_trace, plan_event_shards, ShardLimits},
     RecursionAir,
 };
 
@@ -288,6 +289,47 @@ fn event_range_fields(ranges: RecursionEventRanges) -> [usize; 18] {
         ranges.bf16_add_sub.end,
         ranges.commit_pv_hash.start,
         ranges.commit_pv_hash.end,
+    ]
+}
+
+const fn bisect_event_range(range: EventRange) -> [EventRange; 2] {
+    let middle = range.start + range.len() / 2;
+    [EventRange { start: range.start, end: middle }, EventRange { start: middle, end: range.end }]
+}
+
+fn bisect_event_ranges(ranges: RecursionEventRanges) -> [RecursionEventRanges; 2] {
+    let mem_const = bisect_event_range(ranges.mem_const);
+    let mem_var = bisect_event_range(ranges.mem_var);
+    let base_alu = bisect_event_range(ranges.base_alu);
+    let poseidon2_wide = bisect_event_range(ranges.poseidon2_wide);
+    let bf16_mul = bisect_event_range(ranges.bf16_mul);
+    let bf16_unary = bisect_event_range(ranges.bf16_unary);
+    let bf16_div = bisect_event_range(ranges.bf16_div);
+    let bf16_add_sub = bisect_event_range(ranges.bf16_add_sub);
+    let commit_pv_hash = bisect_event_range(ranges.commit_pv_hash);
+    [
+        RecursionEventRanges {
+            mem_const: mem_const[0],
+            mem_var: mem_var[0],
+            base_alu: base_alu[0],
+            poseidon2_wide: poseidon2_wide[0],
+            bf16_mul: bf16_mul[0],
+            bf16_unary: bf16_unary[0],
+            bf16_div: bf16_div[0],
+            bf16_add_sub: bf16_add_sub[0],
+            commit_pv_hash: commit_pv_hash[0],
+        },
+        RecursionEventRanges {
+            mem_const: mem_const[1],
+            mem_var: mem_var[1],
+            base_alu: base_alu[1],
+            poseidon2_wide: poseidon2_wide[1],
+            bf16_mul: bf16_mul[1],
+            bf16_unary: bf16_unary[1],
+            bf16_div: bf16_div[1],
+            bf16_add_sub: bf16_add_sub[1],
+            commit_pv_hash: commit_pv_hash[1],
+        },
     ]
 }
 
@@ -1286,48 +1328,84 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
         );
         let prover = simple_prover(verifier);
 
-        let mut artifacts = Vec::with_capacity(plan.shards.len());
-        let mut bindings = Vec::with_capacity(plan.shards.len());
+        let initial_shard_count = plan.shards.len();
+        let mut pending = plan
+            .shards
+            .iter()
+            .zip(shard_records)
+            .map(|(shard, record)| (shard.ranges, shard.estimate, record))
+            .collect::<VecDeque<_>>();
+        let mut artifacts = Vec::with_capacity(initial_shard_count);
+        let mut bindings = Vec::with_capacity(initial_shard_count);
         let mut global_memory_accumulator = [SP1Field::zero(); 14];
         let mut total_boundary_events = 0usize;
-        for (shard, mut record) in plan.shards.iter().zip(shard_records) {
+        while let Some((ranges, estimate, mut record)) = pending.pop_front() {
             let boundary_started = Instant::now();
             let shard_accumulator = prepare_event_shard_boundary(&mut record);
-            global_memory_accumulator
-                .iter_mut()
-                .zip(shard_accumulator)
-                .for_each(|(total, value)| *total += value);
-            let artifact_stem = arguments
-                .block
-                .map(|block| format!("{}_s{:03}", block_stem(block), shard.index))
-                .unwrap_or_else(|| format!("zkgpt_like_s{:03}", shard.index));
             let boundary_events = record.global_memory_boundary_events.len();
-            total_boundary_events += boundary_events;
             let boundary_rows = boundary_events.next_multiple_of(32).max(16);
             let exact_shape =
                 prover.shape_from_record(&record).expect("VeriLLM machine has no shard shape");
             let exact_trace_area = exact_shape.preprocessed_area + exact_shape.main_area;
-            assert!(
-                boundary_rows <= plan.limits.max_rows(),
-                "event shard {} global boundary has {} rows, exceeding the configured {}-row limit",
-                shard.index,
-                boundary_rows,
-                plan.limits.max_rows()
-            );
-            if exact_trace_area > plan.limits.max_trace_area {
-                println!(
-                    "warning: event shard {} exact trace area {} exceeds planner target {} after \
-                     adding global memory boundaries",
-                    shard.index, exact_trace_area, plan.limits.max_trace_area
+            let exact_max_rows = estimate.max_rows().max(boundary_rows);
+            if exact_max_rows > plan.limits.max_rows()
+                || exact_trace_area > plan.limits.max_trace_area
+            {
+                let largest_event_range =
+                    event_count_fields(ranges.event_counts()).into_iter().max().unwrap_or_default();
+                assert!(
+                    largest_event_range > 1,
+                    "one scalar event cannot fit after adding global memory boundaries: \
+                     max_rows={exact_max_rows} trace_area={exact_trace_area}"
                 );
+                println!(
+                    "refining oversized event shard before proving: ranges={:?} \
+                     boundary_events={} max_rows={}/{} trace_area={}/{}",
+                    ranges,
+                    boundary_events,
+                    exact_max_rows,
+                    plan.limits.max_rows(),
+                    exact_trace_area,
+                    plan.limits.max_trace_area
+                );
+                record.global_memory_boundary_events.clear();
+                let child_ranges = bisect_event_ranges(ranges);
+                let child_programs =
+                    child_ranges.map(|child| Arc::new(program.with_event_ranges(child))).to_vec();
+                let child_records = record.into_event_shards(child_programs);
+                for (child_ranges, child_record) in
+                    child_ranges.into_iter().zip(child_records).rev()
+                {
+                    pending.push_front((
+                        child_ranges,
+                        estimate_verillm_trace(child_ranges.event_counts()),
+                        child_record,
+                    ));
+                }
+                continue;
             }
+
+            let shard_index = artifacts.len();
+            record.index =
+                u32::try_from(shard_index).expect("too many independently provable event shards");
+            global_memory_accumulator
+                .iter_mut()
+                .zip(shard_accumulator)
+                .for_each(|(total, value)| *total += value);
+            total_boundary_events += boundary_events;
+            let artifact_stem = arguments
+                .block
+                .map(|block| format!("{}_s{:03}", block_stem(block), shard_index))
+                .unwrap_or_else(|| format!("zkgpt_like_s{:03}", shard_index));
             println!(
-                "proving independent event shard {}/{}: planned_max_rows={} \
-                 planned_trace_area={} boundary_events={} boundary_rows={} exact_trace_area={}",
-                shard.index + 1,
-                plan.shards.len(),
-                shard.estimate.max_rows(),
-                shard.estimate.total_area,
+                "proving independent event shard {}: pending={} initial_plan={} \
+                 planned_max_rows={} planned_trace_area={} boundary_events={} \
+                 boundary_rows={} exact_trace_area={}",
+                shard_index + 1,
+                pending.len(),
+                initial_shard_count,
+                estimate.max_rows(),
+                estimate.total_area,
                 boundary_events,
                 boundary_rows,
                 exact_trace_area
@@ -1369,7 +1447,7 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
                 verify_started.elapsed().as_secs_f64()
             );
             bindings.push(EventShardBatchBinding {
-                ranges: shard.ranges,
+                ranges,
                 verifying_key: verifying_key.clone(),
                 main_commitment: shard_proof.main_commitment,
                 real_heights,
@@ -1382,72 +1460,68 @@ async fn materialize(arguments: &Arguments, expected: EventCounts) {
             );
             let mut artifact = String::new();
             writeln!(artifact, "    {{").unwrap();
-            writeln!(artifact, "      \"index\": {},", shard.index).unwrap();
+            writeln!(artifact, "      \"index\": {shard_index},").unwrap();
             writeln!(artifact, "      \"ranges\": {{").unwrap();
             writeln!(
                 artifact,
                 "        \"mem_const\": [{}, {}],",
-                shard.ranges.mem_const.start, shard.ranges.mem_const.end
+                ranges.mem_const.start, ranges.mem_const.end
             )
             .unwrap();
             writeln!(
                 artifact,
                 "        \"mem_var\": [{}, {}],",
-                shard.ranges.mem_var.start, shard.ranges.mem_var.end
+                ranges.mem_var.start, ranges.mem_var.end
             )
             .unwrap();
             writeln!(
                 artifact,
                 "        \"base_alu\": [{}, {}],",
-                shard.ranges.base_alu.start, shard.ranges.base_alu.end
+                ranges.base_alu.start, ranges.base_alu.end
             )
             .unwrap();
             writeln!(
                 artifact,
                 "        \"poseidon2_wide\": [{}, {}],",
-                shard.ranges.poseidon2_wide.start, shard.ranges.poseidon2_wide.end
+                ranges.poseidon2_wide.start, ranges.poseidon2_wide.end
             )
             .unwrap();
             writeln!(
                 artifact,
                 "        \"bf16_mul\": [{}, {}],",
-                shard.ranges.bf16_mul.start, shard.ranges.bf16_mul.end
+                ranges.bf16_mul.start, ranges.bf16_mul.end
             )
             .unwrap();
             writeln!(
                 artifact,
                 "        \"bf16_unary\": [{}, {}],",
-                shard.ranges.bf16_unary.start, shard.ranges.bf16_unary.end
+                ranges.bf16_unary.start, ranges.bf16_unary.end
             )
             .unwrap();
             writeln!(
                 artifact,
                 "        \"bf16_div\": [{}, {}],",
-                shard.ranges.bf16_div.start, shard.ranges.bf16_div.end
+                ranges.bf16_div.start, ranges.bf16_div.end
             )
             .unwrap();
             writeln!(
                 artifact,
                 "        \"bf16_add_sub\": [{}, {}],",
-                shard.ranges.bf16_add_sub.start, shard.ranges.bf16_add_sub.end
+                ranges.bf16_add_sub.start, ranges.bf16_add_sub.end
             )
             .unwrap();
             writeln!(
                 artifact,
                 "        \"commit_pv_hash\": [{}, {}]",
-                shard.ranges.commit_pv_hash.start, shard.ranges.commit_pv_hash.end
+                ranges.commit_pv_hash.start, ranges.commit_pv_hash.end
             )
             .unwrap();
             writeln!(artifact, "      }},").unwrap();
-            writeln!(artifact, "      \"max_rows\": {},", shard.estimate.max_rows()).unwrap();
-            writeln!(
-                artifact,
-                "      \"preprocessed_area\": {},",
-                shard.estimate.preprocessed_area
-            )
-            .unwrap();
-            writeln!(artifact, "      \"main_area\": {},", shard.estimate.main_area).unwrap();
-            writeln!(artifact, "      \"trace_area\": {},", shard.estimate.total_area).unwrap();
+            writeln!(artifact, "      \"max_rows\": {},", estimate.max_rows()).unwrap();
+            writeln!(artifact, "      \"preprocessed_area\": {},", estimate.preprocessed_area)
+                .unwrap();
+            writeln!(artifact, "      \"main_area\": {},", estimate.main_area).unwrap();
+            writeln!(artifact, "      \"trace_area\": {},", estimate.total_area).unwrap();
             writeln!(artifact, "      \"global_memory_boundary_events\": {boundary_events},")
                 .unwrap();
             writeln!(artifact, "      \"global_memory_boundary_rows\": {boundary_rows},").unwrap();

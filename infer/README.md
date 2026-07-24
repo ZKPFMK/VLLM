@@ -172,7 +172,10 @@ Block recursion circuit verifies every leaf proof independently, checks exact
 ordered event-range coverage, requires the coordinate-wise global accumulator
 sum to be zero, recomputes the ordered trace digest, and emits one Block wrapper
 proof. There is no all-leaf commitment barrier or shared LogUp challenge before
-leaf proving.
+leaf proving. Because boundary rows are only known after execution, each planned
+leaf is checked against its exact proof shape before proving; an oversized leaf
+is recursively bisected by event range until both the row and trace-area limits
+are satisfied.
 
 This format uses event-leaf protocol v3, Block-wrapper protocol v2, and
 Block-recursion protocol v3. Artifacts from the earlier shared-challenge format

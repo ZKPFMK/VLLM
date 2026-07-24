@@ -649,11 +649,15 @@ mod tests {
             bf16_unary: EventRange { start: 0, end: 1 },
             ..RecursionEventRanges::default()
         };
+        let parent_program =
+            Arc::new(program.with_event_ranges(RecursionEventRanges::full(program.event_counts)));
+        let parent_record = executor.record.into_event_shards(vec![parent_program]).pop().unwrap();
         let shard_programs = vec![
             Arc::new(program.with_event_ranges(first_ranges)),
             Arc::new(program.with_event_ranges(second_ranges)),
         ];
-        let mut records = executor.record.into_event_shards(shard_programs);
+        // Exercise the adaptive planner's ability to split an already-sharded record again.
+        let mut records = parent_record.into_event_shards(shard_programs);
         prepare_event_shard_boundaries(&mut records);
 
         assert_eq!(records[0].global_memory_boundary_events.len(), 1);

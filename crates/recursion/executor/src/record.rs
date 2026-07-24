@@ -255,9 +255,10 @@ impl<F: PrimeField32> MachineRecord for ExecutionRecord<F> {
 impl<F: Copy> ExecutionRecord<F> {
     /// Split one globally executed record into trace shards without changing event order.
     ///
-    /// Each supplied program must be a [`RecursionProgram::with_event_ranges`] view of this
-    /// record's global program. The ranges must be contiguous and cover every supported event
-    /// vector exactly once.
+    /// Each supplied program must be a [`RecursionProgram::with_event_ranges`] view of the same
+    /// global program. The ranges must be contiguous and cover this record's active event ranges
+    /// exactly once. Consequently an already-sharded record can be split again without
+    /// re-executing the recursion program.
     #[must_use]
     pub fn into_event_shards(self, programs: Vec<Arc<RecursionProgram<F>>>) -> Vec<Self> {
         fn take_exact<T>(events: &mut impl Iterator<Item = T>, len: usize) -> Vec<T> {
@@ -267,7 +268,7 @@ impl<F: Copy> ExecutionRecord<F> {
         }
 
         let Self {
-            program: _,
+            program,
             index: _,
             base_alu_events,
             ext_alu_events,
@@ -298,6 +299,9 @@ impl<F: Copy> ExecutionRecord<F> {
         assert!(select_events.is_empty());
         assert!(prefix_sum_checks_events.is_empty());
 
+        let parent_ranges = program
+            .event_ranges
+            .unwrap_or_else(|| RecursionEventRanges::full(program.event_counts));
         let mut base_alu = base_alu_events.into_iter();
         let mut mem_var = mem_var_events.into_iter();
         let mut poseidon2 = poseidon2_events.into_iter();
@@ -306,7 +310,44 @@ impl<F: Copy> ExecutionRecord<F> {
         let mut bf16_div = bf16_div_events.into_iter();
         let mut bf16_add_sub = bf16_add_sub_events.into_iter();
         let mut commit_pv_hash = commit_pv_hash_events.into_iter();
-        let mut expected = RecursionEventRanges::default();
+        let mut expected = RecursionEventRanges {
+            mem_const: EventRange {
+                start: parent_ranges.mem_const.start,
+                end: parent_ranges.mem_const.start,
+            },
+            mem_var: EventRange {
+                start: parent_ranges.mem_var.start,
+                end: parent_ranges.mem_var.start,
+            },
+            base_alu: EventRange {
+                start: parent_ranges.base_alu.start,
+                end: parent_ranges.base_alu.start,
+            },
+            poseidon2_wide: EventRange {
+                start: parent_ranges.poseidon2_wide.start,
+                end: parent_ranges.poseidon2_wide.start,
+            },
+            bf16_mul: EventRange {
+                start: parent_ranges.bf16_mul.start,
+                end: parent_ranges.bf16_mul.start,
+            },
+            bf16_unary: EventRange {
+                start: parent_ranges.bf16_unary.start,
+                end: parent_ranges.bf16_unary.start,
+            },
+            bf16_div: EventRange {
+                start: parent_ranges.bf16_div.start,
+                end: parent_ranges.bf16_div.start,
+            },
+            bf16_add_sub: EventRange {
+                start: parent_ranges.bf16_add_sub.start,
+                end: parent_ranges.bf16_add_sub.start,
+            },
+            commit_pv_hash: EventRange {
+                start: parent_ranges.commit_pv_hash.start,
+                end: parent_ranges.commit_pv_hash.start,
+            },
+        };
         let mut consumed_mem_const = 0usize;
 
         let records = programs
@@ -325,7 +366,15 @@ impl<F: Copy> ExecutionRecord<F> {
                 assert_eq!(ranges.bf16_div.start, expected.bf16_div.end);
                 assert_eq!(ranges.bf16_add_sub.start, expected.bf16_add_sub.end);
                 assert_eq!(ranges.commit_pv_hash.start, expected.commit_pv_hash.end);
-                expected = ranges;
+                expected.mem_const.end = ranges.mem_const.end;
+                expected.mem_var.end = ranges.mem_var.end;
+                expected.base_alu.end = ranges.base_alu.end;
+                expected.poseidon2_wide.end = ranges.poseidon2_wide.end;
+                expected.bf16_mul.end = ranges.bf16_mul.end;
+                expected.bf16_unary.end = ranges.bf16_unary.end;
+                expected.bf16_div.end = ranges.bf16_div.end;
+                expected.bf16_add_sub.end = ranges.bf16_add_sub.end;
+                expected.commit_pv_hash.end = ranges.commit_pv_hash.end;
                 consumed_mem_const += ranges.mem_const.len();
 
                 Self {
@@ -356,6 +405,10 @@ impl<F: Copy> ExecutionRecord<F> {
             .collect::<Vec<_>>();
 
         assert_eq!(consumed_mem_const, mem_const_count);
+        assert_eq!(
+            expected, parent_ranges,
+            "child event shards do not cover the parent record exactly"
+        );
         assert!(base_alu.next().is_none());
         assert!(mem_var.next().is_none());
         assert!(poseidon2.next().is_none());
